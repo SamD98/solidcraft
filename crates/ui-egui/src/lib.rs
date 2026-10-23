@@ -769,6 +769,7 @@ impl SolveApp {
         if let Some(a) = v.get("agent_cursor").and_then(|a| serde_json::from_value(a.clone()).ok()) {
             self.ui.agent_cursor = a;
         }
+        prefs::apply_revision_history(self);
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
