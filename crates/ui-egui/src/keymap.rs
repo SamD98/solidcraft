@@ -55,9 +55,9 @@ pub const RESERVED: &[&str] = &[
 pub struct Keymap {
     /// Command id → key (`""`: no key). Only the changed ones.
     pub custom: BTreeMap<String, String>,
-    /// Asks for the Keyboard Shortcuts page of Preferences (File and Help menus).
+    /// Asks for the Keyboard Shortcuts page of Preferences (File, Home and Help).
     pub open: bool,
-    /// Opened from Help: a list to read, not to edit.
+    /// Help opens a list to read. File and Home open the editor (`false`).
     pub read_only: bool,
     filter: String,
     /// The command waiting for a key press.
@@ -1160,5 +1160,32 @@ mod card_tests {
             assert!(scenario::handle_at(&format!("keymap:{action}:solid.extrude")).is_none());
         }
         assert_eq!(effective(&h.app, "solid.extrude").as_deref(), Some("E"));
+    }
+
+    /// Home › Keyboard shortcuts opens the editable page (#7409). Settings › Shortcuts stays editable.
+    #[test]
+    fn home_keyboard_shortcuts_open_the_editable_page() {
+        let mut h = Harness::new();
+        h.app.keymap.filter = "solid.extrude".into();
+        h.app.home.show(h.app.session.revision);
+        h.frames(3);
+        h.step(&json!({"click": {"handle": "home:shortcuts"}})).unwrap();
+        h.frames(3);
+        assert!(h.app.home.open, "shortcuts open over Home");
+        assert!(h.app.prefs_window.open && h.app.prefs_window.section == crate::prefs::PAGE_SHORTCUTS);
+        assert!(!h.app.keymap.read_only, "Home opens the editor, the same page as Settings › Shortcuts");
+        assert!(h.widget("Import…").is_some(), "Import… is on the editable page");
+        assert!(h.widget("Reset All").is_some(), "Reset All is on the editable page");
+        for action in ["capture", "clear", "reset"] {
+            assert!(scenario::handle_at(&format!("keymap:{action}:solid.extrude")).is_some(), "{action} can be used");
+        }
+
+        h.call("ui.prefs", json!({"button": "cancel"}));
+        assert!(!h.app.prefs_window.open && !h.app.keymap.read_only);
+        h.call("ui.prefs", json!({"open": "Keyboard Shortcuts"}));
+        h.frames(2);
+        assert!(h.app.prefs_window.open && h.app.prefs_window.section == crate::prefs::PAGE_SHORTCUTS && !h.app.keymap.read_only);
+        assert!(scenario::handle_at("keymap:capture:solid.extrude").is_some(), "Settings › Shortcuts stays editable");
+        assert!(h.widget("Import…").is_some());
     }
 }

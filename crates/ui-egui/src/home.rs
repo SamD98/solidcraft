@@ -1055,10 +1055,9 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, action: FileAction) {
             app.start("document.metadata");
         }
         FileAction::Settings => crate::prefs::open_at(app, 0),
-        FileAction::Shortcuts => {
-            app.keymap.open = true;
-            app.keymap.read_only = true;
-        }
+        // Same editable Shortcuts page as File › Keyboard Shortcuts. Home sits beside
+        // Settings, so this is the editor, not Help's read-only list.
+        FileAction::Shortcuts => crate::toolbar::FileAction::Shortcuts.run(app),
         FileAction::Crashes => crate::help::run(app, ctx, "crashes"),
         FileAction::About => crate::help::run(app, ctx, "about"),
         FileAction::Recovery(entry, recover) => crate::recovery_ui::apply(app, entry, recover),
