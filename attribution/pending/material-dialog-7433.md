@@ -1,0 +1,2 @@
+| docs/screenshots/7433-physical-material-before.png | SolidCraft contributors | screenshot of SolidCraft itself, unfixed parent 84a3a0c: a 40 x 30 x 20 mm box assigned Copper, light docked theme, software Vulkan, Physical Material dialog showing Steel and 7.85 g/cm³ | MIT OR Apache-2.0 |
+| docs/screenshots/7433-physical-material-after.png | SolidCraft contributors | screenshot of SolidCraft itself: the same 40 x 30 x 20 mm Copper box, light docked theme, software Vulkan, Physical Material dialog showing Copper and 8.96 g/cm³ | MIT OR Apache-2.0 |

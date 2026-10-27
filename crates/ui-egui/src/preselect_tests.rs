@@ -55,6 +55,67 @@ fn confirming_coplanar_body_faces_uses_one_atomic_extrusion() {
 use crate::SolveApp;
 use crate::dialogs::{Dialog, Kind, apply_commands};
 
+fn material_body(name: &str) -> Sel {
+    Sel::Body { name: name.into() }
+}
+
+/// #7433: reopening Physical Material shows the body's material, not the library's Steel row.
+#[test]
+fn material_dialog_opens_on_the_bodys_material() {
+    let mut app = app_with(json!([
+        {"command":"solid.box","params":{"length":10,"width":10,"height":10}},
+        {"command":"material.assign","params":{"bodies":["Body1"],"material":"Copper"}}
+    ]));
+    let before = app.session.doc.to_json();
+    for selection in [vec![material_body("Body1")], vec![Sel::Face { body: "Body1".into(), index: 0, point: Vec3::ZERO }]] {
+        app.session.selection = selection;
+        let d = Dialog::for_command(&app, "material.assign").unwrap();
+        let commands = apply_commands(&app, &d).unwrap();
+        assert_eq!(commands[0].1["material"], "Copper");
+        assert_eq!(commands[0].1["bodies"], json!(["Body1"]));
+        assert_eq!(app.session.doc.to_json(), before);
+    }
+    app.run("material.create", json!({"name":"Synthetic material","density_g_cm3":0.8})).unwrap();
+    app.run("material.assign", json!({"bodies":["Body1"],"material":"Synthetic material"})).unwrap();
+    app.session = Session::new(solidcraft_engine::doc::Document::from_json(&app.session.doc.to_json()).unwrap());
+    app.session.selection = vec![material_body("Body1")];
+    let d = Dialog::for_command(&app, "material.assign").unwrap();
+    assert_eq!(apply_commands(&app, &d).unwrap()[0].1["material"], "Synthetic material");
+    app.run("material.assign", json!({"bodies":["Body1"],"material":"Default"})).unwrap();
+    app.session.selection = vec![material_body("Body1")];
+    let d = Dialog::for_command(&app, "material.assign").unwrap();
+    assert_eq!(apply_commands(&app, &d).unwrap()[0].1["material"], "Default");
+}
+
+#[test]
+fn material_dialog_follows_targets_until_a_material_is_chosen() {
+    let mut app = app_with(json!([
+        {"command":"solid.box","params":{"length":10,"width":10,"height":10,"body_name":"Plate"}},
+        {"command":"solid.box","params":{"corner":[30,0,0],"length":10,"width":10,"height":10,"body_name":"Block"}},
+        {"command":"material.assign","params":{"bodies":["Plate"],"material":"Copper"}},
+        {"command":"material.assign","params":{"bodies":["Block"],"material":"Steel"}}
+    ]));
+    let before = app.session.doc.to_json();
+    app.session.selection = vec![];
+    assert!(apply_commands(&app, &Dialog::for_command(&app, "material.assign").unwrap()).is_err());
+    app.session.selection = vec![material_body("Plate"), material_body("Block")];
+    assert!(apply_commands(&app, &Dialog::for_command(&app, "material.assign").unwrap()).is_err());
+    app.session.selection = vec![material_body("Plate")];
+    let mut d = Dialog::for_command(&app, "material.assign").unwrap();
+    assert_eq!(apply_commands(&app, &d).unwrap()[0].1["material"], "Copper");
+    d.take_box(&app.session, vec![material_body("Block")], false);
+    assert_eq!(apply_commands(&app, &d).unwrap()[0].1["material"], "Steel");
+    d.take_box(&app.session, vec![material_body("Plate"), material_body("Block")], false);
+    assert!(apply_commands(&app, &d).is_err());
+    let Kind::Material { index, .. } = &mut d.kind else { panic!("material dialog") };
+    *index = app.session.doc.material_names().iter().position(|name| name == "Aluminum").unwrap();
+    d.take_box(&app.session, vec![material_body("Block")], false);
+    let commands = apply_commands(&app, &d).unwrap();
+    assert_eq!(commands[0].1["material"], "Aluminum");
+    assert_eq!(commands[0].1["bodies"], json!(["Block"]));
+    assert_eq!(app.session.doc.to_json(), before);
+}
+
 #[test]
 fn feature_mirror_and_patterns_reopen_as_feature_replays_even_for_body_creators() {
     for (cmd, params) in [

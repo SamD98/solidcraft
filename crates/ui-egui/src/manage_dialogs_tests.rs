@@ -144,6 +144,49 @@ fn physical_material_is_dense_and_keeps_assignment() {
     assert!(commands[0].1["material"].is_string());
 }
 
+/// #7433: opening Physical Material again shows Copper, and choosing another material still assigns it.
+#[test]
+fn physical_material_dialog_shows_the_bodys_material() {
+    let mut h = fixture();
+    h.app.run("material.assign", json!({"bodies":["Body1"],"material":"Copper"})).unwrap();
+    h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+    let doc = h.app.session.doc.clone();
+    let history = (h.app.session.undo.len(), h.app.session.redo.len());
+    h.app.start("material.assign");
+    h.frames(3);
+    let copper = h.app.session.doc.material_density("Copper").unwrap();
+    assert!(h.widget(&format!("Density: {copper} g/cm³")).is_some(), "the open dialog reviews Copper");
+    let commands = dialogs::apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands[0].1["material"], "Copper");
+    assert_eq!(commands[0].1["bodies"], json!(["Body1"]));
+    h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&doc, &h.app.session.doc));
+    assert_eq!(history, (h.app.session.undo.len(), h.app.session.redo.len()));
+    assert_eq!(h.app.run("component.properties", json!({})).unwrap()["bodies"][0]["material"], "Copper");
+
+    h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+    h.app.start("material.assign");
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"dialog:Material"}})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:Material:Aluminum"}})).unwrap();
+    h.frames(2);
+    let aluminum = h.app.session.doc.material_density("Aluminum").unwrap();
+    assert!(h.widget(&format!("Density: {aluminum} g/cm³")).is_some());
+    let undo = h.app.session.undo.len();
+    h.step(&json!({"click":{"handle":"dialog:ok"}})).unwrap();
+    assert!(h.app.dialog.is_none());
+    assert_eq!(h.app.session.doc.body_material("Body1"), "Aluminum");
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+    assert_eq!(h.app.run("component.properties", json!({})).unwrap()["bodies"][0]["material"], "Aluminum");
+
+    h.app.session.selection = vec![Sel::Body { name: "Body1".into() }];
+    h.app.start("material.assign");
+    h.frames(2);
+    assert_eq!(dialogs::apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1["material"], "Aluminum");
+    h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
+    assert_eq!(h.app.session.doc.body_material("Body1"), "Aluminum");
+}
+
 #[test]
 fn physical_material_panel_reviews_saved_si_card_without_changing_the_design() {
     let mut h = fixture();
