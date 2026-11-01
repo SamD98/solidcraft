@@ -2733,8 +2733,8 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
     for (i, inp) in d.inputs.iter().enumerate().skip(range.start).take(range.end.saturating_sub(range.start)) {
         let stored_reference = feature_pattern_reference_key(d, i).and_then(|key| d.extra.get(key)).filter(|_| inp.items.is_empty());
         // The name is part of the field: clicking "Face" or "Point" arms it, the same as the chip.
-        let arm_label = primitive_field_hint(&d.kind, inp.label).is_some();
-        if let Some(key) = primitive_field_hint(&d.kind, inp.label) {
+        let field_hint = primitive_field_hint(&d.kind, inp.label);
+        if let Some(key) = field_hint {
             ui.ctx().data_mut(|data| {
                 data.insert_temp(egui::Id::new("sc_selection_label_click"), true);
                 data.insert_temp(egui::Id::new("sc_selection_label_tip"), tr(key).to_string());
@@ -2775,7 +2775,7 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
                     });
                 }
                 let chip_rect = chip.rect;
-                let tooltip = if let Some(key) = primitive_field_hint(&d.kind, inp.label) {
+                let tooltip = if let Some(key) = field_hint {
                     tr(key).to_string()
                 } else if let Some(reference) = stored_reference {
                     reference.to_string()
@@ -2814,7 +2814,7 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
                 }
             });
         });
-        if arm_label {
+        if field_hint.is_some() {
             ui.ctx().data_mut(|data| {
                 data.remove_temp::<bool>(egui::Id::new("sc_selection_label_click"));
                 data.remove_temp::<String>(egui::Id::new("sc_selection_label_tip"));
@@ -2840,7 +2840,9 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
     }
     if let Some(i) = activate {
         d.active = i;
-        d.pick_armed = true;
+        // Only a primitive's Face, Reference, or Point keeps the keyboard off the first number.
+        // Hole uses the same rows, and a miss there still returns to Diameter (#10428).
+        d.pick_armed = d.inputs.get(i).and_then(|inp| primitive_field_hint(&d.kind, inp.label)).is_some();
     }
     if let Some(i) = clear {
         if let Some(key) = feature_pattern_reference_key(d, i) {
@@ -3507,8 +3509,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             ctx.memory_mut(|memory| memory.request_focus(id));
             // Pick rows are drawn before this editor, so they only see a focus mark made
             // already. Record it now, or the next pass still draws their accent ring beside
-            // the selected number (#10066).
-            ctx.data_mut(|data| data.insert_temp(egui::Id::new("sc_focused_editor"), id));
+            // the selected number (#10066). Primitive windows only: other dialogs keep the
+            // mark their own editor sets when it is drawn.
+            if matches!(d.kind, Kind::Primitive { .. }) {
+                ctx.data_mut(|data| data.insert_temp(egui::Id::new("sc_focused_editor"), id));
+            }
             if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
                 state
                     .cursor
@@ -3521,8 +3526,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         ctx.request_repaint();
     } else {
         let focused = ctx.memory(|memory| memory.focused()).filter(|id| value_fields.iter().any(|(field, _)| field == id));
-        // Clicking a number (Diameter, a distance) is the user leaving the pick field.
-        if focused.is_some() && ctx.input(|i| i.pointer.any_released()) {
+        // A number field has the keyboard, whether it was clicked or tabbed into.
+        if focused.is_some() {
             d.pick_armed = false;
         }
         d.value_focus = focused;

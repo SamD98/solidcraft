@@ -333,7 +333,7 @@ fn cylinder_pick_fields_explain_themselves_and_keep_a_click_in_the_view() {
     assert!(!keyboard_on(&h, "ui.diameter"), "filling Face does not jump back to Diameter");
 }
 
-/// #10428: Box and Torus Point. Clicking the name, then a point on the model, fills the placement.
+/// #10428: Box, Sphere, and Torus Point. Clicking the name, then a point on the model, fills the placement.
 #[test]
 fn point_fields_explain_themselves_and_take_a_click_on_the_model() {
     let mut h = plate();
@@ -376,6 +376,28 @@ fn point_fields_explain_themselves_and_take_a_click_on_the_model() {
         h.step(&json!({"widget": "Cancel"})).unwrap();
         h.frames(2);
     }
+}
+
+/// #10428: Hole still returns the keyboard to a number after a Reference click that misses.
+/// Click the face, arm Reference 1, click the face again (not an edge), then type. The 7 is
+/// entered. A primitive pick field would have kept the keyboard instead.
+#[test]
+fn a_missed_hole_reference_click_returns_the_keyboard_to_a_number() {
+    let mut h = plate();
+    h.app.preferences.value_boxes_in_view = false;
+    h.step(&json!({"start": "solid.hole"})).unwrap();
+    let at = screen(&mut h, Vec3::new(30.0, 25.0, 10.0));
+    h.step(&json!({"click": at})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click": {"handle": "dialog:Reference 1"}})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click": at})).unwrap();
+    h.frames(3);
+    assert!(picked_edge(&h, "Reference 1").is_none(), "a face is not an edge");
+    h.step(&json!({"text": "7"})).unwrap();
+    h.frames(2);
+    let Some(Kind::Hole { depth, diameter, .. }) = h.app.dialog.as_ref().map(|d| &d.kind) else { panic!("the hole dialog") };
+    assert!(depth.contains('7') || diameter.contains('7'), "the 7 was entered in a number field, not lost: depth {depth}, diameter {diameter}");
 }
 
 /// The hole's Face and Reference rows keep their own wording. The primitive prompts are not theirs.
