@@ -610,7 +610,8 @@ pub(crate) fn list_row(ui: &mut Ui, key: &str, text: &str) -> Response {
 /// How many picked rows stay on screen before the list scrolls inside itself.
 pub(crate) const PICKED_LIST_ROWS: usize = 6;
 
-/// Collapsed selection list. Closed, only the count and a disclosure show; open, each item is a
+/// Collapsed selection list. The count stays on the selection chip. This row only opens and
+/// closes the items: "Show items" while closed, "Hide items" while open. Open, each item is a
 /// [`list_row`] and a remove click returns that item's index. A longer list scrolls inside a
 /// fixed height so the dialog around it stays put.
 /// Tokens: `control_height, form_gap_y, form_section_icon_size, font_label, form_ink, form_dim, hover, radius_sm; list_row tokens`.
@@ -619,8 +620,7 @@ pub(crate) fn collapsible_picked_list(ui: &mut Ui, key: &str, open: &mut bool, l
         return None;
     }
     let t = Tokens::get();
-    let summary = crate::i18n::format("dialog.picked_summary", &[("count", &labels.len().to_string())]);
-    let tip = if *open { crate::i18n::tr("dialog.picked_hide") } else { crate::i18n::tr("dialog.picked_show") };
+    let summary = if *open { crate::i18n::tr("dialog.picked_hide") } else { crate::i18n::tr("dialog.picked_show") };
     let (rect, response) = ui.allocate_exact_size(vec2(dimension(ui.available_width()), row_height()), egui::Sense::click());
     if response.hovered() || response.has_focus() {
         ui.painter().rect_filled(rect.shrink2(vec2(0.0, 1.0)), t.radius_sm, t.hover);
@@ -633,7 +633,7 @@ pub(crate) fn collapsible_picked_list(ui: &mut Ui, key: &str, open: &mut bool, l
     super::disclosure(ui.painter(), icon_rect.center(), *open, ink);
     let text_rect = egui::Rect::from_min_max(egui::pos2((icon_rect.right() + t.form_gap_y).min(rect.right()), rect.top()), rect.max);
     paint_text(ui, text_rect, &summary, egui::FontId::proportional(t.font_label), t.form_ink, false);
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(summary);
     response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::CollapsingHeader, ui.is_enabled(), *open, &summary));
     scenario::publish_rect(&format!("dialog:list:{key}:summary"), rect);
     scenario::publish_handle(&format!("dialog:list:{key}:toggle"), rect.center());

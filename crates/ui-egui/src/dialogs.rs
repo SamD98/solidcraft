@@ -2763,9 +2763,9 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
                 }
             });
         });
-        // Sketch Mirror, Pattern, Offset and the other multi-pick sketch tools share one list:
-        // the count, closed until the disclosure is opened, so a long pick does not push the
-        // rest of the dialog away (#10098).
+        // Sketch Mirror, Pattern, Offset and the other multi-pick sketch tools share one list.
+        // The chip already says how many are picked. This row only reveals them, so a long pick
+        // does not push the rest of the dialog away (#10098).
         if matches!(d.kind, Kind::SketchModify(_)) && inp.multi && !inp.items.is_empty() {
             let store = ui.id().with(("picked_list", inp.label));
             let mut open = ui.data(|data| data.get_temp::<bool>(store)).unwrap_or(false);

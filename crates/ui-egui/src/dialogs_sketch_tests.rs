@@ -574,8 +574,9 @@ fn transform_handles_and_fields_scale_move_and_turn_the_picks() {
     assert!((top - 40.0).abs() < 1e-6, "one undo puts it back: {top}");
 }
 
-/// A long sketch pick starts as a count. Opening it lists the items, and still scrolls inside
-/// the list, and removing one drops that item. Mirror, both patterns and Offset share the list.
+/// A long sketch pick starts closed. The chip keeps the count; the row under it says "Show items".
+/// Opening it lists the items, and still scrolls inside the list, and removing one drops that item.
+/// Mirror, both patterns and Offset share the list.
 #[test]
 fn long_picked_list_stays_collapsed_and_a_remove_drops_one_item() {
     for command in ["sketch.mirror", "sketch.pattern.rectangular", "sketch.pattern.circular", "sketch.offset"] {
@@ -586,8 +587,10 @@ fn long_picked_list_stays_collapsed_and_a_remove_drops_one_item() {
         assert!(before > crate::ui_kit::PICKED_LIST_ROWS, "{command}");
         assert!(scenario::rect_of(&format!("dialog:list:{label}:summary")).is_some(), "{command}");
         assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_none(), "{command} lists every item while closed");
-        let summary = crate::i18n::format("dialog.picked_summary", &[("count", &before.to_string())]);
-        assert!(h.widget(&summary).is_some(), "{command}: {summary}");
+        let show = crate::i18n::tr("dialog.picked_show");
+        let hide = crate::i18n::tr("dialog.picked_hide");
+        assert!(h.widget(show).is_some(), "{command}: {show}");
+        assert!(h.widget(&format!("{before} selected")).is_none(), "{command}: the count is not repeated on the disclosure");
         let collapsed = scenario::count_of("dialog:body:content_height").unwrap();
         let row = f64::from(Tokens::get().control_height);
         let count = before as f64;
@@ -603,6 +606,8 @@ fn long_picked_list_stays_collapsed_and_a_remove_drops_one_item() {
         let next_rect = scenario::rect_of(next).unwrap_or_else(|| panic!("{command}: missing {next}"));
         assert!(body.intersects(next_rect), "{command}: {next} is still below the list {next_rect:?} / {body:?}");
         h.step(&json!({"click":{"handle":format!("dialog:list:{label}:toggle")}})).unwrap();
+        assert!(h.widget(hide).is_some(), "{command}: {hide}");
+        assert!(h.widget(show).is_none(), "{command}: still says show");
         assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_some(), "{command}");
         let viewport = scenario::rect_of(&format!("dialog:list:{label}:viewport")).unwrap_or_else(|| panic!("{command}: no inner scroll"));
         let shown = crate::ui_kit::PICKED_LIST_ROWS as f64;
@@ -615,8 +620,8 @@ fn long_picked_list_stays_collapsed_and_a_remove_drops_one_item() {
         let items = &h.app.dialog.as_ref().unwrap().inputs[0].items;
         assert_eq!(items.len(), before - 1, "{command}");
         assert!(!items.contains(&first), "{command}");
-        let after = crate::i18n::format("dialog.picked_summary", &[("count", &(before - 1).to_string())]);
-        assert!(h.widget(&after).is_some(), "{command}: {after}");
+        assert!(h.widget(hide).is_some(), "{command}: removing an item leaves the list open");
+        assert!(h.widget(&format!("{} selected", before - 1)).is_none(), "{command}: the new count is not a second row");
         assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_some(), "{command} closed itself on remove");
         h.step(&json!({"click":{"handle":format!("dialog:list:{label}:toggle")}})).unwrap();
         assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_none(), "{command} stayed open");
