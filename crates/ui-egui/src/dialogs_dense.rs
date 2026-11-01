@@ -186,6 +186,10 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
         ui_kit::text(ui, tr(key), ui_kit::Text::Hint("manage"));
     }
     placement_row(d, ui, app);
+    // Face, Reference 1, Reference 2 and Point say what a click in the view does (#10428).
+    if let Some(key) = primitive_active_hint(d) {
+        ui_kit::text(ui, tr(key), ui_kit::Text::Hint("primitive_pick"));
+    }
     if crate::hole_refs::takes(d) {
         // Each reference edge with its distance (#37, #6380).
         enter |= crate::hole_refs::input_rows(d, ui, &app.session, app.preferences.origin_plane_names);

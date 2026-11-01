@@ -479,6 +479,9 @@ pub struct Dialog {
     value_focus: Option<egui::Id>,
     /// A viewport press or click returns the keyboard after selection and canvas updates.
     pub(crate) restore_value_focus: bool,
+    /// The user clicked a pick field. A click in the view that does not land in a value editor
+    /// must not hand the keyboard to the first number and hide that field (#10428).
+    pick_armed: bool,
     /// Folded to its header (the shared disclosure chevron).
     pub collapsed: bool,
     reset_scroll: bool,
@@ -748,6 +751,7 @@ impl Dialog {
             focus: true,
             value_focus: None,
             restore_value_focus: false,
+            pick_armed: false,
             collapsed: false,
             reset_scroll: true,
             preview_enabled: true,
@@ -2344,6 +2348,35 @@ fn title(k: &Kind) -> &'static str {
     }
 }
 
+/// The explanation for one primitive pick field (`Face`, `Reference 1`, `Reference 2`, `Point`).
+/// The row keeps that name; the message says what a click in the view does (#10428). Hole uses
+/// the same row names for a different place, so this stays on the primitive dialogs.
+pub(crate) fn primitive_field_hint(kind: &Kind, label: &str) -> Option<&'static str> {
+    let Kind::Primitive { cmd, .. } = kind else { return None };
+    Some(match (*cmd, label) {
+        ("solid.cylinder", "Face") => "primitive.face_hint",
+        ("solid.cylinder", "Reference 1" | "Reference 2") => "primitive.reference_hint",
+        ("solid.box" | "solid.sphere" | "solid.torus", "Point") => "primitive.point_hint",
+        _ => return None,
+    })
+}
+
+/// The short prompt an empty primitive pick field shows in place of "Select".
+pub(crate) fn primitive_chip_prompt(kind: &Kind, label: &str) -> Option<&'static str> {
+    let Kind::Primitive { cmd, .. } = kind else { return None };
+    Some(match (*cmd, label) {
+        ("solid.cylinder", "Face") => "primitive.face_pick",
+        ("solid.cylinder", "Reference 1" | "Reference 2") => "primitive.edge_pick",
+        ("solid.box" | "solid.sphere" | "solid.torus", "Point") => "primitive.point_pick",
+        _ => return None,
+    })
+}
+
+/// The hint for whichever primitive pick field is active.
+pub(crate) fn primitive_active_hint(d: &Dialog) -> Option<&'static str> {
+    primitive_field_hint(&d.kind, d.active_input()?.label)
+}
+
 fn hint(inp: &SelInput) -> &'static str {
     let a = inp.accept;
     if a & PROFILES != 0 {
@@ -2699,6 +2732,14 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
     let shell_count = d.shell_faces(s).map(|faces| faces.len());
     for (i, inp) in d.inputs.iter().enumerate().skip(range.start).take(range.end.saturating_sub(range.start)) {
         let stored_reference = feature_pattern_reference_key(d, i).and_then(|key| d.extra.get(key)).filter(|_| inp.items.is_empty());
+        // The name is part of the field: clicking "Face" or "Point" arms it, the same as the chip.
+        let arm_label = primitive_field_hint(&d.kind, inp.label).is_some();
+        if let Some(key) = primitive_field_hint(&d.kind, inp.label) {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new("sc_selection_label_click"), true);
+                data.insert_temp(egui::Id::new("sc_selection_label_tip"), tr(key).to_string());
+            });
+        }
         form_row(ui, inp.label, |ui| {
             ui.horizontal(|ui| {
                 let active = i == d.active && !text_focus;
@@ -2717,21 +2758,26 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
                         crate::i18n::format("dialog.selected_count", &[("count", &count.to_string())])
                     })
                     .color(t.on_accent)
+                } else if let Some(key) = primitive_chip_prompt(&d.kind, inp.label) {
+                    RichText::new(tr(key)).color(t.text)
                 } else {
                     RichText::new(crate::i18n::tr("dialog.select")).color(t.text)
                 };
                 let selected_text = text.text().strip_prefix("↖ ").unwrap_or_else(|| text.text());
                 let prompt = if !filled && inp.label == "Edges" { tr("Select edges") } else { selected_text };
                 let chip = crate::ui_kit::selection_field(ui, prompt, crate::ui_kit::Selection { active, filled });
-                if matches!(d.kind, Kind::Shell { .. }) && i == 0 {
+                if (matches!(d.kind, Kind::Shell { .. }) && i == 0) || (!filled && primitive_chip_prompt(&d.kind, inp.label).is_some()) {
+                    let shown = prompt.to_string();
                     chip.widget_info(|| {
                         let mut info = egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tr(inp.label));
-                        info.current_text_value = Some(prompt.to_string());
+                        info.current_text_value = Some(shown.clone());
                         info
                     });
                 }
                 let chip_rect = chip.rect;
-                let tooltip = if let Some(reference) = stored_reference {
+                let tooltip = if let Some(key) = primitive_field_hint(&d.kind, inp.label) {
+                    tr(key).to_string()
+                } else if let Some(reference) = stored_reference {
                     reference.to_string()
                 } else if custom_axis {
                     if let Some(axis) = stored_revolve_axis(&d.kind) {
@@ -2768,6 +2814,16 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
                 }
             });
         });
+        if arm_label {
+            ui.ctx().data_mut(|data| {
+                data.remove_temp::<bool>(egui::Id::new("sc_selection_label_click"));
+                data.remove_temp::<String>(egui::Id::new("sc_selection_label_tip"));
+            });
+            if ui.ctx().data_mut(|data| data.remove_temp::<bool>(egui::Id::new("sc_selection_label_clicked"))).unwrap_or(false) {
+                activate = Some(i);
+                surrender_keyboard_focus(ui);
+            }
+        }
         if matches!(d.kind, Kind::SketchModify(_)) && inp.multi {
             for (index, item) in inp.items.iter().enumerate() {
                 if crate::ui_kit::list_row(ui, &format!("{}:{index}", inp.label), &selection_label(s, names, d, inp, item)).clicked() {
@@ -2784,6 +2840,7 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
     }
     if let Some(i) = activate {
         d.active = i;
+        d.pick_armed = true;
     }
     if let Some(i) = clear {
         if let Some(key) = feature_pattern_reference_key(d, i) {
@@ -3434,7 +3491,17 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let pointer_busy = ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released());
     if d.restore_value_focus && !pointer_busy {
         d.restore_value_focus = false;
-        let target = value_fields.iter().find(|(id, _)| Some(*id) == d.value_focus).or_else(|| value_fields.first());
+        let remembered = value_fields.iter().find(|(id, _)| Some(*id) == d.value_focus);
+        // No remembered editor, and the user just chose a pick field: leave the keyboard there.
+        // Falling back to the first number (Diameter, Length, …) hid the field and looked like
+        // the click had selected nothing (#10428).
+        let target = if remembered.is_some() {
+            remembered
+        } else if d.pick_armed {
+            None
+        } else {
+            value_fields.first()
+        };
         if let Some(&(id, length)) = target {
             d.focus = false;
             ctx.memory_mut(|memory| memory.request_focus(id));
@@ -3449,7 +3516,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if d.restore_value_focus {
         ctx.request_repaint();
     } else {
-        d.value_focus = ctx.memory(|memory| memory.focused()).filter(|id| value_fields.iter().any(|(field, _)| field == id));
+        let focused = ctx.memory(|memory| memory.focused()).filter(|id| value_fields.iter().any(|(field, _)| field == id));
+        // Clicking a number (Diameter, a distance) is the user leaving the pick field.
+        if focused.is_some() && ctx.input(|i| i.pointer.any_released()) {
+            d.pick_armed = false;
+        }
+        d.value_focus = focused;
     }
     // Each prompt draws only for its own dialog, so both run (`|`, not `||`).
     let preset_prompt = crate::hole_presets::name_prompt(ctx, &mut d, &mut app.preferences.hole_presets, &app.session.doc)

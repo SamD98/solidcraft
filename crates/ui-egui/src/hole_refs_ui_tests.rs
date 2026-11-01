@@ -271,3 +271,113 @@ fn a_cylinder_started_first_takes_its_face_then_its_edges() {
     let FeatureKind::Cylinder { references, .. } = &f.kind else { panic!("the last feature is a cylinder") };
     assert_eq!(references.len(), 2);
 }
+
+/// Whether the keyboard is in the value editor of the row whose id is `row` (`ui.diameter`).
+fn keyboard_on(h: &Harness, row: &str) -> bool {
+    let Some(rect) = crate::scenario::rect_of(&format!("dialog:control:{row}")) else { return false };
+    h.ctx.memory(|memory| memory.focused()).and_then(|id| h.ctx.read_response(id)).is_some_and(|response| rect.contains(response.rect.center()))
+}
+
+fn pick_active(label: &str) -> bool {
+    crate::scenario::count_of(&format!("dialog:selection:{label}:active")) == Some(1.0)
+}
+
+/// #10428: Face, Reference 1 and Reference 2 explain themselves, and clicking one then the model
+/// fills that field. With value boxes off, the window opens on Diameter; that must not steal the
+/// click back.
+#[test]
+fn cylinder_pick_fields_explain_themselves_and_keep_a_click_in_the_view() {
+    let mut h = plate();
+    h.app.preferences.value_boxes_in_view = false;
+    h.step(&json!({"start": "solid.cylinder"})).unwrap();
+    h.frames(3);
+    let face = crate::i18n::tr("primitive.face_hint");
+    let edge = crate::i18n::tr("primitive.reference_hint");
+    assert!(face.contains("existing body") && edge.contains("straight edge"), "{face} / {edge}");
+    assert!(h.widget(face).is_some(), "the open window says what Face is for");
+    assert!(h.widget(crate::i18n::tr("primitive.face_pick")).is_some(), "Face says to click a face");
+    assert!(h.widget(crate::i18n::tr("primitive.edge_pick")).is_some(), "a reference says to click an edge");
+    assert!(keyboard_on(&h, "ui.diameter"), "the size field starts with the keyboard, as the report shows");
+
+    // The name is part of the field: clicking "Reference 1", not only its chip, arms it.
+    let label = crate::scenario::rect_of("dialog:label:Reference 1").expect("Reference 1's name").center();
+    h.step(&json!({"click": [label.x, label.y]})).unwrap();
+    h.frames(2);
+    assert!(pick_active("Reference 1"), "Reference 1 is the pick field");
+    assert!(!keyboard_on(&h, "ui.diameter"), "arming a pick field takes the keyboard off Diameter");
+    assert!(h.widget(edge).is_some(), "the hint follows the field that was clicked");
+    // A click on the face, not on an edge, selects nothing and must not jump back to Diameter.
+    h.step(&json!({"click": {"world": [30, 25, 10]}})).unwrap();
+    h.frames(3);
+    assert!(picked_edge(&h, "Reference 1").is_none(), "a face is not an edge");
+    assert!(pick_active("Reference 1"), "the field stays armed so the next click can fill it");
+    assert!(!keyboard_on(&h, "ui.diameter"), "a miss does not hand the keyboard to Diameter");
+    // The edge under the cursor fills Reference 1.
+    h.step(&json!({"click": {"world": [0, 20, 10]}})).unwrap();
+    h.frames(3);
+    assert!(picked_edge(&h, "Reference 1").is_some_and(|p| p.x.abs() < 1e-6), "{:?}", picked_edge(&h, "Reference 1"));
+    assert!(!keyboard_on(&h, "ui.diameter"), "the edge click stays with the reference, not Diameter");
+
+    // Face, then the plate: the cylinder stands on that face.
+    h.step(&json!({"click": {"handle": "dialog:Face"}})).unwrap();
+    h.frames(2);
+    assert!(pick_active("Face"));
+    h.step(&json!({"click": {"world": [30, 25, 10]}})).unwrap();
+    h.frames(3);
+    let face_at = h.app.dialog.as_ref().and_then(|d| d.inputs.first()).and_then(|i| i.items.first());
+    assert!(matches!(face_at, Some(Sel::Face { .. })), "the face click filled Face, not nothing: {face_at:?}");
+    assert!(!keyboard_on(&h, "ui.diameter"), "filling Face does not jump back to Diameter");
+}
+
+/// #10428: Box and Torus Point. Clicking the name, then a point on the model, fills the placement.
+#[test]
+fn point_fields_explain_themselves_and_take_a_click_on_the_model() {
+    let mut h = plate();
+    h.app.preferences.value_boxes_in_view = false;
+    h.app.preferences.auto_operation = false;
+    for cmd in ["solid.box", "solid.torus", "solid.sphere"] {
+        h.step(&json!({"start": cmd})).unwrap();
+        h.frames(3);
+        assert!(h.widget(crate::i18n::tr("primitive.point_hint")).is_some(), "{cmd} explains Point");
+        assert!(h.widget(crate::i18n::tr("primitive.point_pick")).is_some(), "{cmd}");
+        let size = if cmd == "solid.box" {
+            "ui.length"
+        } else if cmd == "solid.torus" {
+            "ui.major_radius"
+        } else {
+            "ui.diameter"
+        };
+        assert!(keyboard_on(&h, size), "{cmd} opens on its first size");
+        let label = crate::scenario::rect_of("dialog:label:Point").unwrap_or_else(|| panic!("{cmd} Point")).center();
+        h.step(&json!({"click": [label.x, label.y]})).unwrap();
+        h.frames(2);
+        assert!(pick_active("Point"), "{cmd}");
+        assert!(!keyboard_on(&h, size), "{cmd}: Point keeps the keyboard");
+        h.step(&json!({"click": {"world": [25, 20, 10]}})).unwrap();
+        h.frames(3);
+        let point = h.app.dialog.as_ref().and_then(|d| d.extra.get("corner").or_else(|| d.extra.get("center")));
+        let coords = point.and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        let value = |i: usize| {
+            coords
+                .get(i)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|t| h.app.session.doc.eval(t, solidcraft_engine::doc::expr::Kind::Length).ok())
+                .unwrap_or(f64::NAN)
+        };
+        assert!((value(0) - 25.0).abs() < 0.5 && (value(1) - 20.0).abs() < 0.5 && (value(2) - 10.0).abs() < 0.5, "{cmd} placement {coords:?}");
+        assert!(!keyboard_on(&h, size), "{cmd}: the click did not jump back to the size");
+        h.step(&json!({"widget": "Cancel"})).unwrap();
+        h.frames(2);
+    }
+}
+
+/// The hole's Face and Reference rows keep their own wording. The primitive prompts are not theirs.
+#[test]
+fn a_hole_dialog_does_not_use_the_primitive_pick_wording() {
+    let mut h = plate();
+    h.step(&json!({"start": "solid.hole"})).unwrap();
+    h.frames(3);
+    assert!(h.widget(crate::i18n::tr("primitive.face_hint")).is_none());
+    assert!(h.widget(crate::i18n::tr("primitive.face_pick")).is_none());
+    assert!(h.widget("Face").is_some(), "the hole still names its face row");
+}

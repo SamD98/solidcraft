@@ -262,9 +262,23 @@ fn sized_row_body<R>(ui: &mut Ui, text: &str, height: f32, control: impl FnOnce(
     // Measuring takes the original text and prepares it the same way, so column and row agree.
     let label_width = label_column(ui, text, width);
     let label_rect = egui::Rect::from_min_size(rect.min, vec2(label_width, rect.height()));
+    let arm_label = ui.ctx().data(|data| data.get_temp::<bool>(egui::Id::new("sc_selection_label_click"))).unwrap_or(false);
+    let label_tip = ui.ctx().data(|data| data.get_temp::<String>(egui::Id::new("sc_selection_label_tip")));
+    let hover = label_tip.clone().unwrap_or_else(|| shown.clone());
+    if arm_label {
+        let hit = ui.interact(label_rect, ui.id().with((text, "arm_label")), egui::Sense::click());
+        if hit.clicked() {
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("sc_selection_label_clicked"), true));
+        }
+        hit.on_hover_text(hover.clone());
+    }
     ui.scope_builder(egui::UiBuilder::new().max_rect(label_rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
         // Left aligned in the label column, as in the design.
-        ui.add(egui::Label::new(RichText::new(shown.clone()).size(t.font_label).color(t.dialog_label)).truncate()).on_hover_text(shown);
+        let response =
+            ui.add(egui::Label::new(RichText::new(shown.clone()).size(t.font_label).color(t.dialog_label)).truncate()).on_hover_text(hover);
+        if arm_label && response.clicked() {
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("sc_selection_label_clicked"), true));
+        }
     });
     let control_rect = egui::Rect::from_min_max(egui::pos2((label_rect.right() + label_gap(ui, width)).min(rect.right()), rect.top()), rect.max);
     let result = ui
