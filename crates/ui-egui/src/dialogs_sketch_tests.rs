@@ -337,6 +337,8 @@ fn picked_list_removes_one_item_and_field_still_activates_input() {
     d.inputs[0].items.push(Sel::SketchCurve { id: second.clone(), sketch: None });
     h.app.dialog = Some(d);
     h.frames(4);
+    assert!(scenario::rect_of("dialog:list:Entities:0").is_none(), "the list starts closed");
+    h.step(&json!({"click":{"handle":"dialog:list:Entities:toggle"}})).unwrap();
     h.step(&json!({"click":{"handle":"dialog:list:Entities:0:remove"}})).unwrap();
     assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, vec![Sel::SketchCurve { id: second, sketch: None }]);
     h.step(&json!({"click":{"handle":"dialog:Base point"}})).unwrap();
@@ -570,4 +572,134 @@ fn transform_handles_and_fields_scale_move_and_turn_the_picks() {
     let sk = &state.sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch;
     let top = (0..sk.curves.len()).flat_map(|i| sk.polyline(i)).fold(f64::MIN, |m, p| m.max(p.x));
     assert!((top - 40.0).abs() < 1e-6, "one undo puts it back: {top}");
+}
+
+/// A long sketch pick starts as a count. Opening it lists the items, and still scrolls inside
+/// the list, and removing one drops that item. Mirror, both patterns and Offset share the list.
+#[test]
+fn long_picked_list_stays_collapsed_and_a_remove_drops_one_item() {
+    for command in ["sketch.mirror", "sketch.pattern.rectangular", "sketch.pattern.circular", "sketch.offset"] {
+        let mut h = many_lines();
+        open_long_list(&mut h, command);
+        let label = if command == "sketch.offset" { "Curves" } else { "Entities" };
+        let before = h.app.dialog.as_ref().unwrap().inputs[0].items.len();
+        assert!(before > crate::ui_kit::PICKED_LIST_ROWS, "{command}");
+        assert!(scenario::rect_of(&format!("dialog:list:{label}:summary")).is_some(), "{command}");
+        assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_none(), "{command} lists every item while closed");
+        let summary = crate::i18n::format("dialog.picked_summary", &[("count", &before.to_string())]);
+        assert!(h.widget(&summary).is_some(), "{command}: {summary}");
+        let collapsed = scenario::count_of("dialog:body:content_height").unwrap();
+        let row = f64::from(Tokens::get().control_height);
+        let count = before as f64;
+        let summary_rect = scenario::rect_of(&format!("dialog:list:{label}:summary")).unwrap();
+        assert!((f64::from(summary_rect.height()) - row).abs() < 1.0, "{command}: summary is one row");
+        let next = match command {
+            "sketch.mirror" => "dialog:row:Mirror line",
+            "sketch.offset" => "dialog:row:Distance",
+            "sketch.pattern.circular" => "dialog:row:Center",
+            _ => "dialog:row:Direction",
+        };
+        let body = scenario::rect_of("dialog:body:viewport").unwrap();
+        let next_rect = scenario::rect_of(next).unwrap_or_else(|| panic!("{command}: missing {next}"));
+        assert!(body.intersects(next_rect), "{command}: {next} is still below the list {next_rect:?} / {body:?}");
+        h.step(&json!({"click":{"handle":format!("dialog:list:{label}:toggle")}})).unwrap();
+        assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_some(), "{command}");
+        let viewport = scenario::rect_of(&format!("dialog:list:{label}:viewport")).unwrap_or_else(|| panic!("{command}: no inner scroll"));
+        let shown = crate::ui_kit::PICKED_LIST_ROWS as f64;
+        let cap = row * shown + f64::from(Tokens::get().form_gap_y) * (shown - 1.0) + 8.0;
+        assert!(f64::from(viewport.height()) <= cap, "{command}: list viewport {} taller than {cap}", viewport.height());
+        let expanded = scenario::count_of("dialog:body:content_height").unwrap();
+        assert!(expanded - collapsed < row * (count - 1.0), "{command}: opening grew the dialog by the whole list");
+        let first = h.app.dialog.as_ref().unwrap().inputs[0].items[0].clone();
+        h.step(&json!({"click":{"handle":format!("dialog:list:{label}:0:remove")}})).unwrap();
+        let items = &h.app.dialog.as_ref().unwrap().inputs[0].items;
+        assert_eq!(items.len(), before - 1, "{command}");
+        assert!(!items.contains(&first), "{command}");
+        let after = crate::i18n::format("dialog.picked_summary", &[("count", &(before - 1).to_string())]);
+        assert!(h.widget(&after).is_some(), "{command}: {after}");
+        assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_some(), "{command} closed itself on remove");
+        h.step(&json!({"click":{"handle":format!("dialog:list:{label}:toggle")}})).unwrap();
+        assert!(scenario::rect_of(&format!("dialog:list:{label}:0")).is_none(), "{command} stayed open");
+    }
+}
+
+/// Opt-in pictures of a long sketch selection list (`SOLIDCRAFT_SELECTION_SHOTS`).
+#[test]
+fn selection_list_shots() {
+    let Ok(dir) = std::env::var("SOLIDCRAFT_SELECTION_SHOTS") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tag = std::env::var("SOLIDCRAFT_SELECTION_SHOT_TAG").unwrap_or_else(|_| "shot".into());
+    for command in ["sketch.mirror", "sketch.pattern.rectangular", "sketch.pattern.circular", "sketch.offset"] {
+        let mut h = many_lines();
+        open_long_list(&mut h, command);
+        prepare_shot(&mut h);
+        let stem = command.trim_start_matches("sketch.").replace('.', "-");
+        let label = if command == "sketch.offset" { "Curves" } else { "Entities" };
+        let mut textures = std::collections::HashMap::new();
+        save_dialog(&mut h, &mut textures, &dir.join(format!("{stem}-{tag}-collapsed.png")));
+        let toggle = format!("dialog:list:{label}:toggle");
+        if scenario::handle_at(&toggle).is_some() {
+            h.step(&json!({"click":{"handle": toggle}})).unwrap();
+            save_dialog(&mut h, &mut textures, &dir.join(format!("{stem}-{tag}-expanded.png")));
+        }
+    }
+}
+
+fn many_lines() -> Harness {
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    for i in 0..18 {
+        let y = f64::from(i) * 3.0;
+        h.app.run("sketch.line", json!({"points":[[0.0, y],[30.0, y]],"ids":[format!("l{}", i + 1)]})).unwrap();
+    }
+    h.app.run("sketch.line", json!({"points":[[40.0, -4.0],[40.0, 58.0]],"ids":["axis"]})).unwrap();
+    h.frames(2);
+    h
+}
+
+fn open_long_list(h: &mut Harness, command: &str) {
+    let ids: Vec<String> =
+        h.app.session.doc.sketch(h.app.session.active_sketch.unwrap()).unwrap().curves.iter().map(|curve| curve.id.clone()).collect();
+    let mut d = Dialog::for_command(&h.app, command).unwrap();
+    let entities: Vec<Sel> = ids.iter().filter(|id| id.as_str() != "axis").map(|id| Sel::SketchCurve { id: id.clone(), sketch: None }).collect();
+    d.inputs[0].items = entities;
+    if command == "sketch.mirror" || command == "sketch.pattern.rectangular" {
+        d.inputs[1].items = vec![Sel::SketchCurve { id: "axis".into(), sketch: None }];
+    }
+    if command == "sketch.pattern.circular" {
+        d.inputs[1].items = vec![Sel::SketchPoint { id: "origin".into() }];
+    }
+    h.app.preferences.theme = "dark".into();
+    h.app.ui.dark = true;
+    h.app.dialog = Some(d);
+    h.frames(4);
+}
+
+fn prepare_shot(h: &mut Harness) {
+    h.ctx = crate::fonts::test_context();
+    h.ctx.enable_accesskit();
+    crate::theme::set_dark(true);
+    crate::theme::apply(&h.ctx);
+}
+
+fn save_dialog(h: &mut Harness, textures: &mut std::collections::HashMap<egui::TextureId, egui::ColorImage>, path: &std::path::Path) {
+    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+    let mut shapes = Vec::new();
+    let mut ppp = 1.0;
+    for frame in 0..4 {
+        let mut input = egui::RawInput { screen_rect: Some(bounds), time: Some(40.0 + f64::from(frame) / 60.0), focused: true, ..Default::default() };
+        h.app.raw_input_hook(&mut input);
+        let mut output = h.ctx.run_ui(input, |ui| {
+            h.app.logic(ui.ctx());
+            h.app.ui(ui);
+        });
+        crate::ui_kit::update_test_textures(textures, &output.textures_delta);
+        ppp = output.pixels_per_point;
+        shapes = std::mem::take(&mut output.shapes);
+        output.textures_delta.clear();
+    }
+    let card = scenario::rect_of("dialog:card").unwrap_or_else(|| panic!("no dialog card for {}", path.display()));
+    let image = crate::ui_kit::raster_ui(&h.ctx, shapes, ppp, card.expand(12.0), textures);
+    image.save(path).unwrap();
 }

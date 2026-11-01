@@ -607,6 +607,71 @@ pub(crate) fn list_row(ui: &mut Ui, key: &str, text: &str) -> Response {
     response
 }
 
+/// How many picked rows stay on screen before the list scrolls inside itself.
+pub(crate) const PICKED_LIST_ROWS: usize = 6;
+
+/// Collapsed selection list. Closed, only the count and a disclosure show; open, each item is a
+/// [`list_row`] and a remove click returns that item's index. A longer list scrolls inside a
+/// fixed height so the dialog around it stays put.
+/// Tokens: `control_height, form_gap_y, form_section_icon_size, font_label, form_ink, form_dim, hover, radius_sm; list_row tokens`.
+pub(crate) fn collapsible_picked_list(ui: &mut Ui, key: &str, open: &mut bool, labels: &[String]) -> Option<usize> {
+    if labels.is_empty() {
+        return None;
+    }
+    let t = Tokens::get();
+    let summary = crate::i18n::format("dialog.picked_summary", &[("count", &labels.len().to_string())]);
+    let tip = if *open { crate::i18n::tr("dialog.picked_hide") } else { crate::i18n::tr("dialog.picked_show") };
+    let (rect, response) = ui.allocate_exact_size(vec2(dimension(ui.available_width()), row_height()), egui::Sense::click());
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect.shrink2(vec2(0.0, 1.0)), t.radius_sm, t.hover);
+    }
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + t.form_section_icon_size / 2.0, rect.center().y),
+        vec2(t.form_section_icon_size, t.form_section_icon_size),
+    );
+    let ink = if response.hovered() || response.has_focus() { t.form_ink } else { t.form_dim };
+    super::disclosure(ui.painter(), icon_rect.center(), *open, ink);
+    let text_rect = egui::Rect::from_min_max(egui::pos2((icon_rect.right() + t.form_gap_y).min(rect.right()), rect.top()), rect.max);
+    paint_text(ui, text_rect, &summary, egui::FontId::proportional(t.font_label), t.form_ink, false);
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::CollapsingHeader, ui.is_enabled(), *open, &summary));
+    scenario::publish_rect(&format!("dialog:list:{key}:summary"), rect);
+    scenario::publish_handle(&format!("dialog:list:{key}:toggle"), rect.center());
+    if response.clicked() {
+        *open = !*open;
+    }
+    if !*open {
+        return None;
+    }
+    let draw = |ui: &mut Ui| {
+        let mut removed = None;
+        for (index, label) in labels.iter().enumerate() {
+            if list_row(ui, &format!("{key}:{index}"), label).clicked() {
+                removed = Some(index);
+            }
+        }
+        removed
+    };
+    if labels.len() > PICKED_LIST_ROWS {
+        let scroll = egui::ScrollArea::vertical()
+            .id_salt(("picked_list", key))
+            .max_height(picked_list_height(ui, PICKED_LIST_ROWS))
+            .min_scrolled_height(0.0)
+            .show(ui, draw);
+        scenario::publish_rect(&format!("dialog:list:{key}:viewport"), scroll.inner_rect);
+        scroll.inner
+    } else {
+        draw(ui)
+    }
+}
+
+/// Height of `rows` picked-item rows, including the form's gap between them.
+fn picked_list_height(ui: &Ui, rows: usize) -> f32 {
+    let gap = ui.spacing().item_spacing.y;
+    let rows = rows.max(1) as f32;
+    row_height() * rows + gap * (rows - 1.0)
+}
+
 /// Full-width rule; Tokens: dialog_rule. Use between groups without extra padding.
 /// Full-width rule without extra padding. Tokens: `dialog_rule`.
 pub(crate) fn divider(ui: &mut Ui, key: &str) {

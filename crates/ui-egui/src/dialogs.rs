@@ -2763,12 +2763,17 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
                 }
             });
         });
-        if matches!(d.kind, Kind::SketchModify(_)) && inp.multi {
-            for (index, item) in inp.items.iter().enumerate() {
-                if crate::ui_kit::list_row(ui, &format!("{}:{index}", inp.label), &selection_label(s, names, d, inp, item)).clicked() {
-                    remove = Some((i, index));
-                }
+        // Sketch Mirror, Pattern, Offset and the other multi-pick sketch tools share one list:
+        // the count, closed until the disclosure is opened, so a long pick does not push the
+        // rest of the dialog away (#10098).
+        if matches!(d.kind, Kind::SketchModify(_)) && inp.multi && !inp.items.is_empty() {
+            let store = ui.id().with(("picked_list", inp.label));
+            let mut open = ui.data(|data| data.get_temp::<bool>(store)).unwrap_or(false);
+            let labels: Vec<String> = inp.items.iter().map(|item| selection_label(s, names, d, inp, item)).collect();
+            if let Some(index) = crate::ui_kit::collapsible_picked_list(ui, inp.label, &mut open, &labels) {
+                remove = Some((i, index));
             }
+            ui.data_mut(|data| data.insert_temp(store, open));
         }
     }
     if let Some((input, index)) = remove

@@ -1,0 +1,7 @@
+{
+  "en": {
+    "dialog.picked_hide": "Hide the selected items",
+    "dialog.picked_show": "Show the selected items",
+    "dialog.picked_summary": "{count} selected"
+  }
+}

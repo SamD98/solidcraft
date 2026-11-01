@@ -1509,6 +1509,14 @@ const ELEMENTS: &[Element] = &[
     element!("list_row", "dialog:list:picked", Some("dialog:list:picked:remove"), |ui, _| {
         list_row(ui, "picked", "Point 1");
     }),
+    element!("collapsible_picked_list", "dialog:list:Entities:summary", Some("dialog:list:Entities:toggle"), |ui, _| {
+        let mut open = false;
+        collapsible_picked_list(ui, "Entities", &mut open, &["l1".into(), "l2".into(), "c1".into()]);
+    }),
+    element!("collapsible_picked_list_open", "dialog:list:Curves:0", Some("dialog:list:Curves:0:remove"), |ui, _| {
+        let mut open = true;
+        collapsible_picked_list(ui, "Curves", &mut open, &["c1".into(), "l4".into()]);
+    }),
     element!("value_pair", "dialog:row:Position", Some("dialog:Y"), |ui, s| {
         value_pair(ui, "Position", [&mut s.value, &mut s.second], ["X", "Y"], None);
     }),
