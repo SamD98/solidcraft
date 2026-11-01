@@ -3505,6 +3505,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         if let Some(&(id, length)) = target {
             d.focus = false;
             ctx.memory_mut(|memory| memory.request_focus(id));
+            // Pick rows are drawn before this editor, so they only see a focus mark made
+            // already. Record it now, or the next pass still draws their accent ring beside
+            // the selected number (#10066).
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("sc_focused_editor"), id));
             if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
                 state
                     .cursor

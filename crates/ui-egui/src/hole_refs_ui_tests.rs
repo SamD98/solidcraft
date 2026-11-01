@@ -294,10 +294,14 @@ fn cylinder_pick_fields_explain_themselves_and_keep_a_click_in_the_view() {
     let face = crate::i18n::tr("primitive.face_hint");
     let edge = crate::i18n::tr("primitive.reference_hint");
     assert!(face.contains("existing body") && edge.contains("straight edge"), "{face} / {edge}");
+    assert!(face.starts_with(crate::i18n::tr("primitive.face_pick")), "the Face hint starts with the chip: {face}");
+    assert!(edge.starts_with(crate::i18n::tr("primitive.edge_pick")), "the reference hint starts with the chip: {edge}");
     assert!(h.widget(face).is_some(), "the open window says what Face is for");
-    assert!(h.widget(crate::i18n::tr("primitive.face_pick")).is_some(), "Face says to click a face");
-    assert!(h.widget(crate::i18n::tr("primitive.edge_pick")).is_some(), "a reference says to click an edge");
+    assert!(h.widget(crate::i18n::tr("primitive.face_pick")).is_some(), "Face says to click a face or vertex");
+    assert!(crate::i18n::tr("primitive.face_pick").contains("vertex"), "the chip names every kind the hint names");
+    assert!(h.widget(crate::i18n::tr("primitive.edge_pick")).is_some(), "a reference says to click a straight edge");
     assert!(keyboard_on(&h, "ui.diameter"), "the size field starts with the keyboard, as the report shows");
+    assert!(!pick_active("Face"), "Diameter holds the keyboard, so Face does not also look active");
 
     // The name is part of the field: clicking "Reference 1", not only its chip, arms it.
     let label = crate::scenario::rect_of("dialog:label:Reference 1").expect("Reference 1's name").center();
@@ -338,8 +342,11 @@ fn point_fields_explain_themselves_and_take_a_click_on_the_model() {
     for cmd in ["solid.box", "solid.torus", "solid.sphere"] {
         h.step(&json!({"start": cmd})).unwrap();
         h.frames(3);
-        assert!(h.widget(crate::i18n::tr("primitive.point_hint")).is_some(), "{cmd} explains Point");
-        assert!(h.widget(crate::i18n::tr("primitive.point_pick")).is_some(), "{cmd}");
+        let point_hint = crate::i18n::tr("primitive.point_hint");
+        let point_chip = crate::i18n::tr("primitive.point_pick");
+        assert!(point_hint.starts_with(point_chip), "{cmd}: hint {point_hint} / chip {point_chip}");
+        assert!(h.widget(point_hint).is_some(), "{cmd} explains Point");
+        assert!(h.widget(point_chip).is_some(), "{cmd}");
         let size = if cmd == "solid.box" {
             "ui.length"
         } else if cmd == "solid.torus" {
