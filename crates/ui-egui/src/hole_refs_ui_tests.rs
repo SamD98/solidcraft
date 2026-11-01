@@ -391,13 +391,19 @@ fn a_missed_hole_reference_click_returns_the_keyboard_to_a_number() {
     h.frames(2);
     h.step(&json!({"click": {"handle": "dialog:Reference 1"}})).unwrap();
     h.frames(2);
+    let diameter_before = match h.app.dialog.as_ref().map(|d| &d.kind) {
+        Some(Kind::Hole { diameter, .. }) => diameter.clone(),
+        _ => panic!("the hole dialog"),
+    };
     h.step(&json!({"click": at})).unwrap();
     h.frames(3);
     assert!(picked_edge(&h, "Reference 1").is_none(), "a face is not an edge");
     h.step(&json!({"text": "7"})).unwrap();
     h.frames(2);
     let Some(Kind::Hole { depth, diameter, .. }) = h.app.dialog.as_ref().map(|d| &d.kind) else { panic!("the hole dialog") };
-    assert!(depth.contains('7') || diameter.contains('7'), "the 7 was entered in a number field, not lost: depth {depth}, diameter {diameter}");
+    assert_eq!(depth, "7", "the 7 replaced Depth, the first number field");
+    assert_eq!(diameter, &diameter_before, "Diameter is unchanged");
+    assert!(picked_edge(&h, "Reference 1").is_none(), "Reference 1 stays empty");
 }
 
 /// The hole's Face and Reference rows keep their own wording. The primitive prompts are not theirs.

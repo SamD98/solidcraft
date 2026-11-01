@@ -2841,7 +2841,7 @@ pub(crate) fn input_rows_range(d: &mut Dialog, ui: &mut egui::Ui, s: &Session, n
     if let Some(i) = activate {
         d.active = i;
         // Only a primitive's Face, Reference, or Point keeps the keyboard off the first number.
-        // Hole uses the same rows, and a miss there still returns to Diameter (#10428).
+        // Hole uses the same rows, and a miss there still returns to Depth, its first number (#10428).
         d.pick_armed = d.inputs.get(i).and_then(|inp| primitive_field_hint(&d.kind, inp.label)).is_some();
     }
     if let Some(i) = clear {
