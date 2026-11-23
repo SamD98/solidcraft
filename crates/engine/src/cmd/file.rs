@@ -6116,7 +6116,12 @@ mod tests {
         assert!(notice.contains("partially") && notice.contains("Round") && notice.contains("error"), "{notice}");
         let bytes = std::fs::read(&path).unwrap();
         assert!(solidcraft_io::DesignContainerReader::new(std::io::Cursor::new(&bytes)).unwrap().has_model_cache());
-        assert_eq!(solidcraft_io::read_design(&bytes).unwrap().to_json(), s.doc.to_json(), "the authoritative design is saved");
+        // Saving never rewrites live history (`s.doc`); the file carries the session's save count.
+        assert_eq!(
+            solidcraft_io::read_design(&bytes).unwrap().to_json(),
+            s.design_at(s.path.as_deref()).to_json(),
+            "the authoritative design is saved"
+        );
 
         let mut reopened = Session::default();
         reopened.execute("doc.open", &json!({"path":path})).unwrap();
