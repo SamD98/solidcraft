@@ -43,6 +43,7 @@ use solidcore::SolidError;
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Generated cases per run, whatever `--seeds` says (it can only raise this).
 pub const MIN_GENERATED: usize = 600;
@@ -1166,7 +1167,7 @@ fn gen_nsided(rng: &mut Rng) -> OpIn {
     let corners: Vec<[f64; 3]> = (0..k)
         .map(|i| {
             let a = std::f64::consts::TAU * i as f64 / k as f64 + rng.uniform(-0.1, 0.1);
-            [r * a.cos(), r * a.sin(), rng.uniform(-0.3, 0.3)]
+            [r * det::cos(a), r * det::sin(a), rng.uniform(-0.3, 0.3)]
         })
         .collect();
     let corner = |i: usize| corners.get(i % k).copied().unwrap_or([0.0; 3]);
@@ -1528,5 +1529,37 @@ impl UnitDiff for Runner {
 
     fn run_rust(&self, case: &Case) -> Result<Output, HarnessError> {
         rust(&case.parse()?)
+    }
+}
+
+/// #21383: the 7 `ExtEval` rows the G1R change moved. Each point is
+/// `eval_pt_derivs_unbounded` on a fresh G1R extension of a rational surface whose
+/// boundary weight ratios vary; `crate::g1r_cert::certify_unbounded` replays that
+/// extension step by step, certifies each step G1 across its side with its input kept bit
+/// for bit, and requires the replay to be the evaluator's surface bit for bit.
+#[cfg(test)]
+mod g1r_moved_rows {
+    use super::*;
+    use crate::g1r_cert::certify_unbounded;
+
+    const MOVED: [&str; 7] = ["gen0046", "gen0072", "gen0109", "gen0120", "gen0173", "gen0265", "gen0543"];
+
+    #[test]
+    fn each_moved_row_evaluates_a_certified_g1_extension() {
+        let ctx = CaseContext { root: crate::case::repo_root(), seeds: 16 };
+        let mut seen = 0;
+        for c in Runner.cases(&ctx).unwrap() {
+            if !MOVED.contains(&c.name.as_str()) {
+                continue;
+            }
+            seen += 1;
+            let i: Inputs = c.parse().unwrap();
+            let OpIn::ExtEval { uv } = i.op else { panic!("{}: not ExtEval", c.name) };
+            let this = this_of(i.this.as_ref().unwrap()).unwrap();
+            let nurb = this.gw_nurb().unwrap();
+            let mixed = certify_unbounded(nurb, uv[0], uv[1]).unwrap_or_else(|e| panic!("{}: {e}", c.name));
+            assert!(mixed > 0, "{}: no mixed-ratio step", c.name);
+        }
+        assert_eq!(seen, MOVED.len());
     }
 }

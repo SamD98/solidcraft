@@ -20,8 +20,8 @@
 //!   `AdjustTopology`) or hung (in `CreateExtendedSurface`) on every refused case. The
 //!   vertices an op makes are appended to the model's export in creation order on both
 //!   sides;
-//! - `analytic`: `MakeAnalyticCornerSurface` (its `SmBoolean`, a `SER` / `NER` status
-//!   read as `1`), on corners built for it (`gen_analytic`): a sphere octant of exact
+//! - `analytic`: `MakeAnalyticCornerSurface` (its `SmBoolean`; a `SER` / `NER` status,
+//!   which upstream reads as `1`, is `0`: no surface was added, WR-254), on corners built for it (`gen_analytic`): a sphere octant of exact
 //!   rational quarter arcs (one arc may be its chord), chamfers of lines (a plane or a
 //!   bilinear patch; a rail-rail arc on a target face is recomputed as the
 //!   intersection), four-sided rail-rail corners of two coaxial arcs and two lines (the
@@ -105,6 +105,7 @@ use super::topology_edgeuse_p1::{harness, sel, BrepIn};
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// A case on a corner of the 1x1 or 2x2 class, deleted with #2400 (directly, or through a
 /// case of unit `blend.fillet_corner_p1`): retired, as in that unit and
@@ -628,7 +629,7 @@ fn gen_corner(rng: &mut Rng) -> Inputs {
         0 => 1e-3 * scale,
         1 => 1e-6 * scale,
         2 => 0.0,
-        _ => scale * 10f64.powf(rng.uniform(-9.0, -2.0)),
+        _ => scale * det::powf(10f64, rng.uniform(-9.0, -2.0)),
     };
     let (mut model, tsects) = gen_nx2_model(rng, scale);
     let eu = |e: usize, w: usize| -> EuSel { [e, w] };
@@ -791,7 +792,7 @@ fn gen_analytic(rng: &mut Rng) -> Inputs {
     let tol = match rng.below(3) {
         0 => 1e-3 * scale,
         1 => 1e-6 * scale,
-        _ => scale * 10f64.powf(rng.uniform(-9.0, -2.0)),
+        _ => scale * det::powf(10f64, rng.uniform(-9.0, -2.0)),
     };
     let targets = vec![
         line([0.0, 0.0, 0.0], [0.0, 0.0, scale]),
@@ -822,7 +823,7 @@ fn gen_analytic(rng: &mut Rng) -> Inputs {
             let mut p: Vec<[f64; 3]> = (0..n)
                 .map(|i| {
                     let a = std::f64::consts::TAU * f64::from(i) / f64::from(n);
-                    at([a.cos(), a.sin(), rng.uniform(-0.3, 0.3)])
+                    at([det::cos(a), det::sin(a), rng.uniform(-0.3, 0.3)])
                 })
                 .collect();
             if rng.chance(0.2) {
@@ -876,7 +877,7 @@ fn gen_analytic(rng: &mut Rng) -> Inputs {
             let p: Vec<[f64; 3]> = (0..n)
                 .map(|i| {
                     let a = std::f64::consts::TAU * (i as f64) / (n as f64);
-                    at([a.cos(), a.sin(), 0.0])
+                    at([det::cos(a), det::sin(a), 0.0])
                 })
                 .collect();
             let mut edges = ring_edges(&p, |_, a, b| (1, Some(line(a, b))));

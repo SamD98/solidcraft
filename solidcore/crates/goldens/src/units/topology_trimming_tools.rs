@@ -85,6 +85,7 @@ use crate::cases::contract;
 use crate::cases::topology_entities::Reader;
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// The unit runner.
 pub struct Runner;
@@ -1319,14 +1320,14 @@ fn run_rust_geom(k: &mut Kernel, op: &OpIn) -> Result<Vec<f64>, Fail> {
 }
 
 /// The shim's `tt_sample_safe`.
-fn sample_safe(k: &Kernel, l: &CurveLoops, store: &[Curve], key: CurveKey, t: f64) -> Result<bool, Fail> {
+fn sample_safe(l: &CurveLoops, store: &[Curve], key: CurveKey, t: f64) -> Result<bool, Fail> {
     let c = store.get(key.0).ok_or_else(|| harness("key"))?;
     let d = c.natural_interval();
     let tol = d.length() / 1000.0;
     if d.contains_value(t, -tol) {
         return Ok(true);
     }
-    let adj = match l.find_adjacent_loop_curve(k, store, key, t) {
+    let adj = match l.find_adjacent_loop_curve(store, key, t) {
         Ok(a) => a,
         Err(e) if e.is_unported() => return Err(fail(&e)),
         Err(_) => 0,
@@ -1368,7 +1369,7 @@ fn run_rust_loops(
             }
             LoopOp::StartEnd { i } => {
                 o.push(2.0);
-                let r = l.loop_start_end(k, u(*i));
+                let r = l.loop_start_end(u(*i));
                 o.push(status(&r)?);
                 if let Ok((s, e)) = r {
                     o.extend([s as f64, e as f64]);
@@ -1376,7 +1377,7 @@ fn run_rust_loops(
             }
             LoopOp::Adjacent { key, t } => {
                 o.push(3.0);
-                let r = l.find_adjacent_loop_curve(k, &store, CurveKey(*key), *t);
+                let r = l.find_adjacent_loop_curve(&store, CurveKey(*key), *t);
                 o.push(status(&r)?);
                 if let Ok(a) = r {
                     o.push(a as f64);
@@ -1392,7 +1393,7 @@ fn run_rust_loops(
             }
             LoopOp::Sample { key, t } => {
                 o.push(5.0);
-                if !sample_safe(k, &l, &store, CurveKey(*key), *t)? {
+                if !sample_safe(&l, &store, CurveKey(*key), *t)? {
                     o.push(NULL_DEREF);
                     continue;
                 }
@@ -1416,7 +1417,7 @@ fn run_rust_loops(
                     o.push(NULL_DEREF);
                     continue;
                 };
-                if !sample_safe(k, &l, &store, CurveKey(*key), *t)? {
+                if !sample_safe(&l, &store, CurveKey(*key), *t)? {
                     o.push(NULL_DEREF);
                     continue;
                 }
@@ -2399,7 +2400,7 @@ fn gen_surface_net(rng: &mut Rng, closed_u: bool) -> SrfIn {
                         // a tube around z: rows go round, the last equals the first
                         let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
                         let r = 1.0 + 0.3 * j as f64;
-                        (r * a.cos(), r * a.sin(), j as f64)
+                        (r * det::cos(a), r * det::sin(a), j as f64)
                     } else {
                         (i as f64, j as f64, rng.uniform(-0.5, 0.5))
                     };
@@ -2458,8 +2459,8 @@ fn gen_frame(rng: &mut Rng) -> ([f64; 3], [f64; 3], [f64; 3], f64) {
         _ => {
             let a = rng.uniform(0.0, std::f64::consts::TAU);
             let b = rng.uniform(-1.2, 1.2);
-            let e1 = [a.cos(), a.sin(), 0.0];
-            let e2 = [-a.sin() * b.cos(), a.cos() * b.cos(), b.sin()];
+            let e1 = [det::cos(a), det::sin(a), 0.0];
+            let e2 = [-det::sin(a) * det::cos(b), det::cos(a) * det::cos(b), det::sin(b)];
             (e1, e2)
         }
     };
@@ -2549,7 +2550,7 @@ fn gen_loop(
         .map(|i| {
             let a = a0 + std::f64::consts::TAU * i as f64 / n as f64;
             let rr = r * rng.uniform(0.7, 1.0);
-            at(o, e1, e2, s, cx + rr * a.cos(), cy + rr * a.sin())
+            at(o, e1, e2, s, cx + rr * det::cos(a), cy + rr * det::sin(a))
         })
         .collect();
     let mut cs = Vec::new();

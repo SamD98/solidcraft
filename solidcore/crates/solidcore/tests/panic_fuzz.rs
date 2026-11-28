@@ -21,6 +21,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )] // test helpers
+use solidcore::math::det;
 
 #[path = "support/brep_pair.rs"]
 mod brep_pair;
@@ -516,7 +517,7 @@ fn planar_points(r: &mut Rng, p: f64) -> Vec<P> {
         0 => (0..n)
             .map(|i| {
                 let t = std::f64::consts::TAU * i as f64 / n as f64;
-                [s * t.cos(), s * t.sin(), 0.0]
+                [s * det::cos(t), s * det::sin(t), 0.0]
             })
             .collect(),
         1 => vec![[0.0, 0.0, 0.0], [s, s, 0.0], [s, 0.0, 0.0], [0.0, s, 0.0]],
@@ -1705,7 +1706,7 @@ fn part_brep(k: &Kernel, b: &Brep, ascii: bool) -> Option<Vec<u8>> {
         FileType::Binary
     };
     let mut all = Vec::new();
-    let mut data = BrepData::from_brep(b, &env, &mut all).ok()?;
+    let mut data = BrepData::from_brep(k, b, &env, &mut all).ok()?;
     // (makes the missing NURBs)
     data.write_to_file_with_nurbs(k, file_type).ok()?;
     let mut map = std::collections::BTreeSet::new();

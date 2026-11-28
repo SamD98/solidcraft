@@ -10,6 +10,7 @@ use solidcore::blend::fillet_section::section::{GnSectionFsg, GN_THUMBWEIGHT_EQU
 use solidcore::blend::fillet_section::smooth_interior::correction_kernels;
 use solidcore::blend::fillet_section::smooth_interior_plan::SmoothInteriorPlan;
 use solidcore::kernel::Kernel;
+use solidcore::math::det;
 use solidcore::math::{Point2, Point3, Vec3};
 use solidcore::nurbs::b_spline_curve::{BSplineCurve, KnotType};
 use solidcore::nurbs::b_spline_surface::{
@@ -52,8 +53,7 @@ fn fixture(curved: bool) -> (Kernel, ProceduralBlend) {
 }
 
 fn fixture_order(curved: bool, order: u32) -> (Kernel, ProceduralBlend) {
-    let mut k = Kernel::default();
-    k.fixes.fillet_round_as_definition = true;
+    let k = Kernel::default();
     let wall = Surface::from(
         BSplineSurface::create_bilinear_surface(
             Point3::ZERO,
@@ -137,7 +137,7 @@ fn normal(d: &[Vec<Vec3>]) -> Vec3 {
 fn normal_jump(a: &[Vec<Vec3>], b: &[Vec<Vec3>]) -> f64 {
     // atan2 retains accuracy near zero; acos(dot) loses the 1e-9 gate.
     let (a, b) = (normal(a), normal(b));
-    a.cross(b).length().atan2(a.dot(b))
+    det::atan2(a.cross(b).length(), a.dot(b))
 }
 
 fn s_curvature(d: &[Vec<Vec3>]) -> f64 {
@@ -174,8 +174,8 @@ fn frozen_plan_keeps_original_widths_and_full_sided_jumps() {
 }
 
 #[test]
-fn preparation_refuses_invalid_partitions_and_missing_opt_ins() {
-    let (mut k, pb) = fixture(false);
+fn preparation_refuses_invalid_partitions() {
+    let (k, pb) = fixture(false);
     for ss in [
         vec![],
         vec![0.0],
@@ -192,9 +192,6 @@ fn preparation_refuses_invalid_partitions_and_missing_opt_ins() {
         stations[0].parameter() + stations[0].lambda()
             < stations[1].parameter() - stations[1].lambda()
     );
-    k.fixes.fillet_round_as_definition = false;
-    assert!(plan.jump_at(&k, 0, 0.5).is_err());
-    assert!(SmoothInteriorPlan::prepare(&k, &pb, &[0.0, 0.5, 1.0]).is_err());
 }
 
 #[test]

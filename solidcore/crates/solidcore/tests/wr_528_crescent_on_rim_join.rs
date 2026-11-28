@@ -1,7 +1,7 @@
 //! Regression test for WR-528 (the fork's tangency-labs/smlib@e881cdb, capi test
 //! `booleans crescent_on_rim_join`): a crescent prism standing against a cylinder,
-//! its r 10 wall on the cylinder's wall, united with it. With
-//! `Kernel::fixes.close_loop_relates_only_coincident_edges`, the cylinder's rim
+//! its r 10 wall on the cylinder's wall, united with it. With the fix (the only
+//! path since its flag was retired), the cylinder's rim
 //! split at the crescent's corners is no longer related to the crescent's r 6 arc,
 //! and the join is a valid solid of the exact volume, both across the cylinder's
 //! seam and clear of it.
@@ -17,6 +17,7 @@ use solidcore::boolean::api_brep::boolean_union;
 use solidcore::curve::curve::Curve;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::primitive::api_curves::create_arc;
 use solidcore::primitive::api_primitives::create_cylinder;
 use solidcore::sweep::api_brep::create_linear_sweep;
@@ -33,11 +34,11 @@ const HEIGHT: f64 = 10.0;
 fn crescent_prism(k: &mut Kernel, angle_deg: f64) -> Brep {
     // the circles meet at x = 8.2, y = +-sqrt(32.76) in the frame of the crescent
     let y = (R * R - 8.2 * 8.2).sqrt();
-    let big = y.atan2(8.2).to_degrees();
-    let small = y.atan2(8.2 - R).to_degrees();
+    let big = det::atan2(y, 8.2).to_degrees();
+    let small = det::atan2(y, 8.2 - R).to_degrees();
     let centre = Vec3::new(
-        R * angle_deg.to_radians().cos(),
-        R * angle_deg.to_radians().sin(),
+        R * det::cos(angle_deg.to_radians()),
+        R * det::sin(angle_deg.to_radians()),
         0.0,
     );
     let inner = Curve::from(
@@ -58,8 +59,8 @@ fn crescent_prism(k: &mut Kernel, angle_deg: f64) -> Brep {
 /// The volume of the cylinder and the crescent prism.
 fn exact_volume() -> f64 {
     let (d, r) = (R, R_CRESCENT);
-    let lens = r * r * ((d * d + r * r - R * R) / (2.0 * d * r)).acos()
-        + R * R * ((d * d + R * R - r * r) / (2.0 * d * R)).acos()
+    let lens = r * r * det::acos((d * d + r * r - R * R) / (2.0 * d * r))
+        + R * R * det::acos((d * d + R * R - r * r) / (2.0 * d * R))
         - 0.5 * ((-d + r + R) * (d + r - R) * (d - r + R) * (d + r + R)).sqrt();
     let crescent = std::f64::consts::PI * r * r - lens;
     (std::f64::consts::PI * R * R + crescent) * HEIGHT
@@ -71,7 +72,6 @@ fn crescent_on_rim_join_is_exact_with_the_fix() {
     // across the cylinder's seam, and clear of it
     for angle in [0.0, 90.0] {
         let mut k = Kernel::default();
-        k.fixes.close_loop_relates_only_coincident_edges = true;
         let cylinder = create_cylinder(&mut k, Vec3::new(0.0, 0.0, 0.0), R, HEIGHT).unwrap();
         let prism = crescent_prism(&mut k, angle);
         let mut joined = boolean_union(&mut k, cylinder, prism).unwrap();

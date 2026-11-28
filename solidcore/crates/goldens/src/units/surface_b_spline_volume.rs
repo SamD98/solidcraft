@@ -28,7 +28,6 @@ use solidcore::geom::extent3d::Extent3d;
 use solidcore::geom::pseudo_box::PseudoBox;
 use solidcore::geom::transform::Transform;
 use solidcore::geom::vector3d::Vec3;
-use solidcore::kernel::Kernel;
 use solidcore::nurbs::math::CPoint;
 use solidcore::nurbs::spiral::allocate_nurb_volume;
 use solidcore::surface::b_spline_volume::{BSplineVolume, VolumeParam, VolumeParams};
@@ -39,6 +38,7 @@ use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::util::v3;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// The runner.
 pub struct Runner;
@@ -468,7 +468,7 @@ fn rust(i: &Inputs) -> Result<Output, HarnessError> {
         } => {
             let v = build(vol)?;
             let in_pt = tri!(o, v.is_point_in_param_domain_simple(v3(*p)));
-            let in_line = tri!(o, v.is_line_in_param_domain_simple(&Kernel::default(), v3(*a), v3(*e)));
+            let in_line = tri!(o, v.is_line_in_param_domain_simple(v3(*a), v3(*e)));
             let pbox = Extent3d::from_points(v3(*a), v3(*e));
             let mut trim = Extent3d::from_points(v3(*c), v3(*d));
             let r = v.trim_param_bounding_box_simple(&pbox, &mut trim);
@@ -499,7 +499,7 @@ fn gen_transform(rng: &mut Rng) -> Tf {
         0 => [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         1 => {
             let a = rng.uniform(-3.2, 3.2);
-            let (s, c) = a.sin_cos();
+            let (s, c) = det::sin_cos(a);
             [coord(rng, 5.0), [c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]]
         }
         2 => {
@@ -710,7 +710,7 @@ fn gen_case(rng: &mut Rng) -> Inputs {
                 ([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
             } else {
                 let a = rng.uniform(-3.2, 3.2);
-                let (s, c) = a.sin_cos();
+                let (s, c) = det::sin_cos(a);
                 (coord(rng, 5.0), [c, s, 0.0], [-s, c, 0.0])
             };
             let scale = match rng.below(3) {

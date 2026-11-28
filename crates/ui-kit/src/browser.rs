@@ -28,7 +28,7 @@ use egui::{Key, Modifiers, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use solidcraft_theme::Tokens;
 
 use crate::BackingTooltipExt as _;
-use crate::menu::{Item, Menu, MenuItem};
+use crate::menu::{Item, Menu};
 use crate::{Row, RowResp, eye_drag_id, tree_row, tree_row_rect};
 
 /// A row's identity, chosen by the host and stable from frame to frame.
@@ -362,6 +362,9 @@ pub struct BrowserState {
     keys: Vec<KeyRow>,
     cursor: Option<NodeId>,
     focused: bool,
+    /// With [`Browser::events_per_row`]: the keyboard's events this frame, each handed to its row
+    /// as the row is drawn (the host reacts to rows, not to the frame).
+    held: Vec<Event>,
 }
 
 impl BrowserState {
@@ -602,6 +605,9 @@ impl<'s> Browser<'s> {
             state.previous = std::mem::take(&mut state.order);
         }
         let mut events = if keyboard { keys(ui, state) } else { Vec::new() };
+        if per_row {
+            state.held = std::mem::take(&mut events);
+        }
         let eye_before = ui.data(|d| d.get_temp::<bool>(eye_drag_id())).is_some();
         let eye_foreign = eye_before && !state.eye_gesture;
         let (now, mods, pressed) = ui.input(|i| (i.time, i.modifiers, i.pointer.any_pressed()));
@@ -876,28 +882,18 @@ impl Rows<'_> {
                 self.done.events.push(Event::Menu { id, at });
             }
         }
-        if let (NodeMenu::Items(items), Some(response)) = (menu, out.resp.as_ref()) {
-            let mut chosen = None;
-            Menu::context(response, |ui| {
-                for item in items() {
-                    if item.is_sep() {
-                        Menu::separator(ui);
-                        continue;
-                    }
-                    if item.is_heading() {
-                        Menu::heading(ui, &item.label);
-                        continue;
-                    }
-                    let entry = MenuItem::from_item(&item, false).show(ui);
-                    solidcraft_ui_registry::publish_handle(&format!("browser:menu:{}", item.id), entry.rect.center());
-                    if entry.clicked() && item.enabled {
-                        chosen = Some((item.id.clone(), item.params.clone()));
-                        ui.close();
-                    }
-                }
-            });
-            if let Some((action, params)) = chosen {
-                self.done.events.push(Event::Action { id, action, params });
+        if let (NodeMenu::Items(items), Some(response)) = (menu, out.resp.as_ref())
+            && Menu::context_active(response)
+        {
+            let entries = items()
+                .into_iter()
+                .map(|mut item| {
+                    item.aliases.push(format!("browser:menu:{}", item.id));
+                    item
+                })
+                .collect::<Vec<_>>();
+            if let Some(picked) = Menu::context_items(response, &entries) {
+                self.done.events.push(Event::Action { id, action: picked.id, params: picked.params });
             }
         }
         let mut drag_started = false;
@@ -922,7 +918,16 @@ impl Rows<'_> {
         if editing {
             self.editor(id, &out, handle);
         }
-        let events = if self.per_row { self.done.events.split_off(first_event.min(self.done.events.len())) } else { Vec::new() };
+        let mut events = if self.per_row { self.done.events.split_off(first_event.min(self.done.events.len())) } else { Vec::new() };
+        if self.per_row {
+            let target = |event: &Event| match event {
+                Event::Select { id: to, .. } | Event::Fold { id: to, .. } | Event::Open(to) | Event::RenameRequested(to) => *to == id,
+                _ => false,
+            };
+            let (mine, rest): (Vec<Event>, Vec<Event>) = std::mem::take(&mut self.state.held).into_iter().partition(target);
+            self.state.held = rest;
+            events.extend(mine);
+        }
         RowOut {
             rect: out.rect,
             label_rect: out.label_rect,

@@ -28,12 +28,17 @@
 //! at the chain's widest wedge, bounded from above by enclosures of the faces' normals along
 //! each edge (`blend::chamfer_side::widest_wedge_bound`), not by samples. The sizes drift. A rim whose wedge runs from 63.4 to
 //! 116.6 degrees, asked 1 and 2, is measured at 86.4 and has setbacks from 0.01 to 1.95 and
-//! from 1.73 to 2.61. Setbacks that hold at every station are another definition. Edges
-//! between planes of different wedges have no one pair: each keeps its own.
+//! from 1.73 to 2.61. Setbacks that hold at every station are another definition, a record
+//! kind not built yet (`record::ChamferKindRecord::Setbacks`, its station in
+//! `blend::fillet_section::setback_station`). Edges between planes of different wedges have
+//! no one pair. A chain of equal setbacks uses the local wedge on the intervening curved
+//! supports: if the signed unit normals at the feet have dot product q, the common offset is
+//! d sqrt((1 + q) / (1 - q)).
 //!
 //! Not upstream (solidcore's, #2486). Deviations: none. No recursion.
 
 use crate::error::{Result, SolidError};
+use crate::math::det;
 use crate::math::PI;
 
 const OP: &str = "surface::procedural_blend::chamfer";
@@ -63,6 +68,8 @@ pub struct ChamferDefinition {
     /// The angle between the supports at the edge, inside the wedge the chamfer cuts
     /// across, `0 < wedge < pi`.
     pub wedge: f64,
+    /// The two offsets follow the local wedge to preserve an equal setback on the supports.
+    stationwise: bool,
 }
 
 fn positive(x: f64) -> bool {
@@ -70,6 +77,33 @@ fn positive(x: f64) -> bool {
 }
 
 impl ChamferDefinition {
+    /// Not upstream (#20158): writes every field of this chamfer definition into `d`.
+    pub(crate) fn content(&self, d: &mut crate::geom::content::Digest) {
+        let Self {
+            size,
+            wedge,
+            stationwise,
+        } = self;
+        match size {
+            ChamferSize::Distances([a, b]) => {
+                d.tag(1);
+                d.f64(*a);
+                d.f64(*b);
+            }
+            ChamferSize::DistanceAngle { distance, angle } => {
+                d.tag(2);
+                d.f64(*distance);
+                d.f64(*angle);
+            }
+            ChamferSize::Chord(c) => {
+                d.tag(3);
+                d.f64(*c);
+            }
+        }
+        d.f64(*wedge);
+        d.bool(*stationwise);
+    }
+
     /// The sizes at the wedge `wedge`, checked: every size finite and positive, the wedge
     /// and the angle inside their ranges.
     ///
@@ -78,13 +112,25 @@ impl ChamferDefinition {
     /// `InvalidInput` for a size that is not finite and positive, a wedge outside
     /// `(0, pi)`, or an angle outside `(0, pi - wedge)`.
     pub fn new(size: ChamferSize, wedge: f64) -> Result<Self> {
+        let definition = Self {
+            size,
+            wedge,
+            stationwise: false,
+        };
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    /// Check the public size and wedge against the kind of chamfer being stored.
+    pub(super) fn validate(&self) -> Result<()> {
+        let wedge = self.wedge;
         if !(wedge.is_finite() && wedge > 0.0 && wedge < PI) {
             return Err(SolidError::invalid_input(
                 OP,
                 "a chamfer's wedge angle is between 0 and pi",
             ));
         }
-        let sizes_ok = match size {
+        let sizes_ok = match self.size {
             ChamferSize::Distances([a, b]) => positive(a) && positive(b),
             ChamferSize::DistanceAngle { distance, angle } => {
                 positive(distance) && positive(angle) && angle + wedge < PI
@@ -97,7 +143,30 @@ impl ChamferDefinition {
                 "a chamfer's sizes are finite and positive, its angle less than pi less the wedge's",
             ));
         }
-        Ok(Self { size, wedge })
+        if self.stationwise && !matches!(self.size, ChamferSize::Distances([a, b]) if a == b) {
+            return Err(SolidError::invalid_input(
+                OP,
+                "a local wedge needs equal positive setbacks",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Hold the same setback in the tangent planes at every pair of support feet.
+    /// The stored wedge describes the reference section for reporting the sizes.
+    pub(crate) fn at_every_station(mut self) -> Result<Self> {
+        self.stationwise = true;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The setback that fixes the rolling radius at each station, if specified.
+    #[must_use]
+    pub(crate) fn constant_setback(self) -> Option<f64> {
+        match self.size {
+            ChamferSize::Distances([d, _]) if self.stationwise => Some(d),
+            _ => None,
+        }
     }
 
     /// The sizes of the chamfer of `offsets` at `wedge`: its two setbacks.
@@ -108,7 +177,7 @@ impl ChamferDefinition {
     /// not be).
     pub fn of_offsets(offsets: [f64; 2], wedge: f64) -> Result<Self> {
         let [r1, r2] = offsets;
-        let (s, c) = wedge.sin_cos();
+        let (s, c) = det::sin_cos(wedge);
         Self::new(
             ChamferSize::Distances([(r2 + r1 * c) / s, (r1 + r2 * c) / s]),
             wedge,
@@ -122,10 +191,10 @@ impl ChamferDefinition {
             ChamferSize::Distances(d) => d,
             ChamferSize::DistanceAngle { distance, angle } => [
                 distance,
-                distance * angle.sin() / (self.wedge + angle).sin(),
+                distance * det::sin(angle) / det::sin(self.wedge + angle),
             ],
             ChamferSize::Chord(c) => {
-                let d = c / (2.0 * (0.5 * self.wedge).sin());
+                let d = c / (2.0 * det::sin(0.5 * self.wedge));
                 [d, d]
             }
         }
@@ -139,7 +208,7 @@ impl ChamferDefinition {
     /// would leave the wedge; a second distance at most the first's `cos(wedge)`).
     pub fn offsets(&self) -> Result<[f64; 2]> {
         let [d1, d2] = self.setbacks();
-        let (s, c) = self.wedge.sin_cos();
+        let (s, c) = det::sin_cos(self.wedge);
         let r = [(d2 - d1 * c) / s, (d1 - d2 * c) / s];
         if !(positive(r[0]) && positive(r[1])) {
             return Err(SolidError::invalid_input(
@@ -158,7 +227,7 @@ impl ChamferDefinition {
         };
         let [d1, d2] = self.setbacks();
         // the conversion's rounding: a few operations on the setbacks, over sin(wedge)
-        let room = 64.0 * f64::EPSILON * (d1.abs() + d2.abs()) / self.wedge.sin();
+        let room = 64.0 * f64::EPSILON * (d1.abs() + d2.abs()) / det::sin(self.wedge);
         r.iter().zip(offsets).all(|(&a, b)| (a - b).abs() <= room)
     }
 
@@ -177,6 +246,7 @@ impl ChamferDefinition {
         Self {
             size,
             wedge: self.wedge,
+            stationwise: self.stationwise,
         }
     }
 }
@@ -233,7 +303,7 @@ mod tests {
             0.5 * PI,
         )
         .unwrap();
-        assert!(close(c.setbacks()[1], 3.0 * (PI / 6.0).tan()));
+        assert!(close(c.setbacks()[1], 3.0 * det::tan(PI / 6.0)));
     }
 
     #[test]

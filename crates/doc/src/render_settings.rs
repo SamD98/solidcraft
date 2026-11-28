@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use solidcore_record::Vec3;
 use solidcraft_render::{BackendId, RenderFormat, RenderLimits, RenderMode};
-use solidcraft_viewport::{Camera, UpAxis};
+use solidcraft_viewport::{Camera, UpAxis, ViewFrame};
 
 pub use crate::render_job::{CpuJob, GpuJob, RenderJob, SkyEnvironment};
 use crate::{DocError, Result};
@@ -63,6 +63,8 @@ struct SavedCamera {
     fov: f64,
     #[serde(default)]
     up: UpAxis,
+    #[serde(default, deserialize_with = "solidcraft_viewport::frame_or_none")]
+    frame: Option<ViewFrame>,
 }
 
 impl Default for RenderSetup {
@@ -424,13 +426,28 @@ mod tests {
         let cloned = settings.clone();
         assert!(std::ptr::eq(settings.resources.required(&id).unwrap().bytes().as_ptr(), cloned.resources.required(&id).unwrap().bytes().as_ptr()));
         let document = Document { render: Arc::new(settings), ..Default::default() };
-        let reopened = Document::from_json(&document.to_json()).unwrap();
+        // Never written as text: an empty `data`. An older plain JSON design's base64 reads the same,
+        // and so does a container's part handed to the reader as bytes.
+        let saved: serde_json::Value = serde_json::from_str(&document.to_json()).unwrap();
+        assert_eq!(saved["render"]["resources"][id.to_string()]["data"], "");
+        assert!(Document::from_json(&saved.to_string()).unwrap_err().to_string().contains("has no data"), "no part, no file");
+        let mut older = saved.clone();
+        older["render"]["resources"][id.to_string()]["data"] =
+            crate::canvas::base64_encode(document.render.resources.required(&id).unwrap().bytes()).into();
+        let reopened = Document::from_json(&older.to_string()).unwrap();
         assert_eq!(document, reopened);
+        let mut parts = crate::render_resources::ContainerParts::default();
+        parts.hdr.insert(id, document.render.resources.required(&id).unwrap().bytes().to_vec());
+        // Every decode in the read gets the part: a newer file is checked a section at a time first.
+        let (from_part, again) = crate::render_resources::with_container_parts(parts, || {
+            (Document::from_json(&saved.to_string()), Document::from_json(&saved.to_string()))
+        });
+        assert_eq!((document.clone(), document.clone()), (from_part.unwrap(), again.unwrap()));
         assert_eq!(reopened.render.resources.len(), 1);
         let legacy: RenderSettings = serde_json::from_str(r#"{"setups":{"Old":{}}}"#).unwrap();
         assert!(legacy.resources.is_empty());
         assert!(legacy.setups["Old"].job.is_none());
-        let mut missing = serde_json::to_value(&document).unwrap();
+        let mut missing = older.clone();
         missing["render"]["resources"] = serde_json::json!({});
         assert!(Document::from_json(&missing.to_string()).unwrap_err().to_string().contains("missing embedded HDR"));
     }
@@ -441,11 +458,12 @@ mod tests {
         use serde_json::json;
         let source = HdrResource::new(hdr_fixture(128)).unwrap();
         let id = source.id().to_string();
-        let valid = serde_json::to_value(&source).unwrap();
+        let mut valid = serde_json::to_value(&source).unwrap();
+        valid["data"] = crate::canvas::base64_encode(source.bytes()).into();
         for (key, value) in [
             ("kind", json!("png")),
             ("data", json!("")),
-            ("data", json!(format!("{}\n", source.base64().unwrap()))),
+            ("data", json!(format!("{}\n", crate::canvas::base64_encode(source.bytes())))),
             ("data", json!("AA==")),
             ("path", json!("original.hdr")),
             ("hdr_blob", json!("blobs/not-in-plain-json.hdr")),
@@ -462,7 +480,7 @@ mod tests {
         let mut many = serde_json::Map::new();
         for pixel in 0..64 {
             let resource = HdrResource::new(hdr_fixture(pixel)).unwrap();
-            many.insert(resource.id().to_string(), json!(resource));
+            many.insert(resource.id().to_string(), json!({"kind":"radiance_hdr","data":crate::canvas::base64_encode(resource.bytes())}));
         }
         assert!(serde_json::from_value::<HdrResources>(serde_json::Value::Object(many.clone())).is_ok());
         many.insert("f".repeat(64), json!({"kind":"radiance_hdr","data":"invalid"}));
@@ -474,13 +492,13 @@ mod tests {
 
     #[test]
     fn embedded_hdr_parser_debits_aggregate_before_decoding_the_next_source() {
-        use crate::render_resources::{HdrId, HdrResources, MAX_HDR_BYTES, encode_hdr_base64};
+        use crate::render_resources::{HdrId, HdrResources, MAX_HDR_BYTES};
         use serde::de::value::{Error, MapDeserializer};
         // One borrowed base64 buffer supplies distinct valid prefixes: this exercises the
         // real aggregate visitor without constructing a >100 MiB JSON value/string tree.
         let mut bytes = hdr_fixture(128);
         bytes.resize(MAX_HDR_BYTES - 1, 0);
-        let encoded = encode_hdr_base64(&bytes).unwrap();
+        let encoded = crate::canvas::base64_encode(&bytes);
         assert!(!encoded.ends_with('='));
         let sources: Vec<_> = (0..5)
             .map(|i| {
@@ -499,10 +517,10 @@ mod tests {
         use crate::render_resources::{HdrResource, MAX_HDR_BYTES};
         let source = HdrResource::new(hdr_fixture(128)).unwrap();
         let id = source.id().to_string();
-        let encoded = source.base64().unwrap();
+        let encoded = crate::canvas::base64_encode(source.bytes());
         let escaped = format!("\\u{:04x}{}", encoded.as_bytes()[0], &encoded[1..]);
         let mut document = serde_json::to_value(Document::default()).unwrap();
-        document["render"] = serde_json::json!({"setups":{},"resources":{(id.clone()):source}});
+        document["render"] = serde_json::json!({"setups":{},"resources":{(id.clone()):{"kind":"radiance_hdr","data":encoded}}});
         let wire = document.to_string().replacen(&encoded, &escaped, 1);
         assert_eq!(Document::from_json(&wire).unwrap().render.resources.len(), 1, "legal bounded JSON escapes retain the same payload");
         // One escape makes deserialize_str require owned scratch. The borrowed RawValue
@@ -1294,7 +1312,7 @@ mod saved_coat_tests {
             let old_value: Value = serde_json::from_str(&old).unwrap();
             assert!(old_value["render"]["setups"]["Coated"].get("coats").is_none());
             assert_eq!(Document::from_json(&old).unwrap().to_json(), old);
-            let coat = CoatMaterial { weight: -0.0, roughness: 0.22, ior: 1.74 };
+            let coat = CoatMaterial { weight: -0.0, roughness: 0.22, ior: 1.74, flakes: None };
             Arc::make_mut(&mut doc.render).setups.get_mut("Coated").unwrap().coats.set(SavedCoat { target: target(1), coat }, false).unwrap();
             let encoded = doc.to_json();
             let loaded = Document::from_json(&encoded).unwrap();
@@ -1313,6 +1331,54 @@ mod saved_coat_tests {
             assert!(setup.coats.remove(&target(1)));
             assert_eq!(doc.to_json(), old, "removing the only coat restores exact legacy document bytes");
         }
+    }
+    #[test]
+    fn saved_coat_flakes_roundtrip_refuse_bad_numbers_and_leave_flakeless_coats_unchanged() {
+        use crate::render_coat::FlakeMaterial;
+        let mut doc = document(true);
+        Arc::make_mut(&mut doc.render)
+            .setups
+            .get_mut("Coated")
+            .unwrap()
+            .coats
+            .set(SavedCoat { target: target(1), coat: Default::default() }, false)
+            .unwrap();
+        let plain = doc.to_json();
+        let plain_value: Value = serde_json::from_str(&plain).unwrap();
+        assert!(plain_value["render"]["setups"]["Coated"]["coats"][0]["coat"].get("flakes").is_none(), "a coat without flakes saves as before");
+        let flakes = FlakeMaterial { coverage: 0.35, size_mm: 0.08, spread: 0.6, depth: 0.25, color: [240, 220, 200], metallic: 1.0, roughness: 0.2 };
+        let coat = CoatMaterial { flakes: Some(flakes), ..Default::default() };
+        Arc::make_mut(&mut doc.render).setups.get_mut("Coated").unwrap().coats.set(SavedCoat { target: target(1), coat }, true).unwrap();
+        let encoded = doc.to_json();
+        let loaded = Document::from_json(&encoded).unwrap();
+        assert_eq!(loaded.render.setups["Coated"].coats.iter().next().unwrap().coat, coat);
+        let layer = coat.flake_layer().unwrap().unwrap();
+        assert!((layer.coverage() - 0.35).abs() < 1e-4 && (layer.size_mm() - 0.08).abs() < 1e-6);
+        assert_eq!(CoatMaterial { flakes: Some(FlakeMaterial { coverage: 0.0, ..flakes }), ..coat }.flake_layer().unwrap(), None);
+        let base: Value = serde_json::from_str(&encoded).unwrap();
+        for (key, value) in [
+            ("coverage", json!(1.01)),
+            ("size_mm", json!(0.001)),
+            ("size_mm", json!(10.5)),
+            ("spread", json!(-0.1)),
+            ("depth", json!(2)),
+            ("metallic", json!(1.5)),
+            ("roughness", json!(0.01)),
+            ("color", json!([300, 0, 0])),
+            ("unknown", json!(true)),
+        ] {
+            let mut bad = base.clone();
+            bad["render"]["setups"]["Coated"]["coats"][0]["coat"]["flakes"][key] = value;
+            assert!(Document::from_json(&bad.to_string()).is_err(), "invalid flake {key}");
+        }
+        Arc::make_mut(&mut doc.render)
+            .setups
+            .get_mut("Coated")
+            .unwrap()
+            .coats
+            .set(SavedCoat { target: target(1), coat: Default::default() }, true)
+            .unwrap();
+        assert_eq!(doc.to_json(), plain, "removing the flakes restores the coat's earlier bytes");
     }
     #[test]
     fn malformed_saved_coats_refuse_through_the_full_document_loader() {

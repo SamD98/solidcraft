@@ -42,6 +42,7 @@ use solidcore::SolidError;
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Generated cases per run, whatever `--seeds` says (it can only raise this).
 pub const MIN_GENERATED: usize = 1200;
@@ -217,7 +218,7 @@ fn rotation(axis: [f64; 3], angle: f64) -> [f64; 9] {
     }
     let (x, y, z) = (ax / l, ay / l, az / l);
     let a = angle * PI / 180.0;
-    let (s, c) = a.sin_cos();
+    let (s, c) = det::sin_cos(a);
     let t = 1.0 - c;
     [
         t * x * x + c,
@@ -332,6 +333,16 @@ fn status(e: &SolidError) -> f64 {
 }
 
 /// Builds the cone (the `surface.cone_p1` constructions).
+/// The cone a `surface.cone_p2` case's `inputs` builds (before its op), for replay tests.
+///
+/// # Errors
+///
+/// A [`HarnessError`] when `inputs` is not a case of this unit.
+pub fn case_cone(k: &Kernel, inputs: &Value) -> Result<solidcore::Result<Cone>, HarnessError> {
+    let i: Inputs = serde_json::from_value(inputs.clone()).map_err(|e| harness(e.to_string()))?;
+    Ok(rust_cone(k, &i.cone))
+}
+
 fn rust_cone(k: &Kernel, c: &ConeIn) -> solidcore::Result<Cone> {
     let (o, x, y) = (v3(c.origin), v3(c.x), v3(c.y));
     let a2p = Axis2Placement::new(o, x, y);
@@ -572,8 +583,8 @@ fn offset_defined(k: &Kernel, s: &Cone, dist: f64, tol: f64) -> solidcore::Resul
     let (origin, x_axis, y_axis, z_axis) = (pos.origin(), pos.x_axis(), pos.y_axis(), pos.z_axis());
     let height = s.height(k)?;
     let semi = s.semi_angle_deg();
-    let sin = (semi * PI / 180.0).sin();
-    let cos = (semi * PI / 180.0).cos();
+    let sin = det::sin(semi * PI / 180.0);
+    let cos = det::cos(semi * PI / 180.0);
     let off_z = -sin * sign * dist;
     let off_r = cos * sign * dist;
     let old_bot = s.bot_radius();
@@ -1061,17 +1072,17 @@ fn gen_trim(rng: &mut Rng, c: &ConeIn, scale: f64) -> OpIn {
         0.0
     } else {
         let t = rng.uniform(-max_tan, max_tan).clamp(-5.0, 5.0);
-        t.atan()
+        det::atan(t)
     };
-    let t = slope * phi.tan();
+    let t = slope * det::tan(phi);
     let one_t2 = 1.0 - t * t;
     let xc = -rr * t / one_t2;
     let ax = rr / one_t2;
     let b = rr / one_t2.sqrt();
-    let (sp, cp) = phi.sin_cos();
+    let (sp, cp) = det::sin_cos(phi);
     let a = ax / cp;
     // local center (xc, 0, h0 - xc tan(phi)), major axis (cos phi, 0, -sin phi)
-    let lc = [xc, 0.0, h0 - xc * phi.tan()];
+    let lc = [xc, 0.0, h0 - xc * det::tan(phi)];
     let lu = [cp, 0.0, -sp];
     let to_world = |p: [f64; 3]| {
         let [px, py, pz] = p;
@@ -1312,39 +1323,54 @@ mod tests {
         }
     }
 
-    /// The #713 fixtures keep pinned behavior by default and exercise the
-    /// existing opt-in independently of the unpatched C++ oracle.
+    /// The #713 fixtures (WR-385): a cylinder rebuilt from near-equal radii keeps a
+    /// zero semi-angle; a taper is refused before the analytic state changes.
     #[test]
-    fn issue713_fixtures_exercise_both_behaviors() {
+    fn issue713_fixtures_keep_cylinders() {
         let fixtures: Value = serde_json::from_str(include_str!(
             "../../../../fixtures/surface.cone_p2/issue713.json"
         ))
         .unwrap();
         let cases = fixtures["cases"].as_array().unwrap();
         assert_eq!(cases.len(), 24);
-        for enabled in [false, true] {
-            let mut k = Kernel::default();
-            k.fixes.cylinder_rebuild_mean_radius = enabled;
-            for case in cases {
-                let i: Inputs = serde_json::from_value(case["inputs"].clone()).unwrap();
-                let name = case["name"].as_str().unwrap();
-                let mut cone = rust_cone(&k, &i.cone).unwrap();
-                let before = cone.clone();
-                let mut record = Vec::new();
-                rust_op(&k, &mut cone, &i.op, &mut record).unwrap();
-                assert!(cone.is_cylinder_class(), "{name}");
-                if enabled && name.contains("taper_") {
-                    assert_eq!(record.first(), Some(&SM_ERR), "{name}");
-                    assert_eq!(cone.base_radius(), before.base_radius());
-                    assert_eq!(cone.semi_angle_deg(), before.semi_angle_deg());
-                } else {
-                    assert_eq!(record.first(), Some(&SUCCESS), "{enabled} {name}");
-                    if enabled {
-                        assert_eq!(cone.semi_angle_deg(), 0.0, "{name}");
-                    } else if !name.contains("unchanged_") {
-                        assert_ne!(cone.semi_angle_deg(), 0.0, "{name}");
-                    }
-                }
+        let k = Kernel::default();
+        for case in cases {
+            let i: Inputs = serde_json::from_value(case["inputs"].clone()).unwrap();
+            let name = case["name"].as_str().unwrap();
+            // The edit's radius change against the rebuild's limit
+            // SM_EFF_ZERO_SQRT (1 + r) = 1e-5 for r 9: a taper's scale 1 ± 2.2222e-6 makes
+            // it 1.99999999998e-5, just under twice the limit (asserted >= 1.99x); the
+            // "rounded" fixtures' 1 ± 5.5556e-7 make it 5.0000000004e-6, just over half
+            // (asserted <= 0.51x); the others are far below.
+            let ModeIn::CylBounded { radius, .. } = &i.cone.mode else {
+                panic!("{name}: not a bounded cylinder");
+            };
+            let OpIn::Rebuild {
+                edit: EditIn::ScaleLastXy { f },
+            } = &i.op
+            else {
+                panic!("{name}: not a scale_last_xy rebuild");
+            };
+            let (radius, f) = (*radius, *f);
+            let gap = (radius * f - radius).abs();
+            let limit = solidcore::math::EFF_ZERO_SQRT * (1.0 + radius);
+            if name.contains("taper_") {
+                assert!(gap >= 1.99 * limit, "{name}: {gap} vs {limit}");
+            } else {
+                assert!(gap <= 0.51 * limit, "{name}: {gap} vs {limit}");
+            }
+            let mut cone = rust_cone(&k, &i.cone).unwrap();
+            let before = cone.clone();
+            let mut record = Vec::new();
+            rust_op(&k, &mut cone, &i.op, &mut record).unwrap();
+            assert!(cone.is_cylinder_class(), "{name}");
+            if name.contains("taper_") {
+                assert_eq!(record.first(), Some(&SM_ERR), "{name}");
+                assert_eq!(cone.base_radius(), before.base_radius());
+                assert_eq!(cone.semi_angle_deg(), before.semi_angle_deg());
+            } else {
+                assert_eq!(record.first(), Some(&SUCCESS), "{name}");
+                assert_eq!(cone.semi_angle_deg(), 0.0, "{name}");
             }
         }
     }

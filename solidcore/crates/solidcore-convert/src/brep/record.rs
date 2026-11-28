@@ -8,7 +8,8 @@
 //!   proved (`lies_on`); a plane by its placement, its parameters its kernel ones times its
 //!   scales. Nothing is sampled. A curve or surface with no NURBS form (an offset) is refused.
 //!   A blend face goes as its definition and its net ([`face_definition`]: a procedural blend, a
-//!   round of an exact class whose net has no analytic label); a use with no UV trim gets one the
+//!   round of an exact class whose net has no analytic label), and so does a screw-swept wall
+//!   ([`face_sweep`]); a use with no UV trim gets one the
 //!   kernel makes by fitting.
 //! - **Pcurves:** every use's pcurve is the kernel's own UV trim (made first where a use has
 //!   none, by the kernel's fit), its knots on the edge record's interval ([`record_trim`]). A face's parameters in
@@ -36,11 +37,12 @@ use solidcore::geom::extent1d::Extent1d;
 use solidcore::kernel::Kernel;
 use solidcore::surface::face_surface::record_face;
 use solidcore::surface::procedural_blend::convert::face_definition;
+use solidcore::surface::procedural_sweep::record::face_sweep;
+use solidcore::topology::brep::create_missing_uv_trim_curves;
 use solidcore::topology::brep::outer_shells::outer_shells;
 use solidcore::topology::brep::p1 as bl;
 use solidcore::topology::brep_data::{BrepData, NO_OBJECT, UNDEF_ULONG};
 use solidcore::topology::brep_data_write::{data_regions, FromBrepEnv};
-use solidcore::topology::edgeuse::{p1 as eu1, p3 as eu3};
 use solidcore::topology::loopuse::notify_ref;
 use solidcore::topology::topology::NotifyRecords;
 use solidcore::topology::EdgeuseId;
@@ -50,10 +52,10 @@ use solidcore_record::brep as r;
 
 use super::{Order, Unsupported, R};
 
-/// A blend face's record: its definition as its label and its net as its NURBS form (the form the
-/// face was written with, or its surface when that is the net itself), when the kernel reads a
-/// definition off it ([`face_definition`]) and the net is a NURBS surface; otherwise the face as
-/// written.
+/// A blend or screw-swept face's record: its definition as its label and its net as its NURBS
+/// form (the form the face was written with, or its surface when that is the net itself), when
+/// the kernel reads a definition off it ([`face_definition`], [`face_sweep`]) and the net is a
+/// NURBS surface; otherwise the face as written.
 fn with_definition(
     k: &Kernel,
     surface: &solidcore::surface::surface::Surface,
@@ -67,12 +69,22 @@ fn with_definition(
     ) {
         return Ok((label, form));
     }
-    let Some(definition) = face_definition(k, surface)? else {
-        return Ok((label, form));
-    };
-    let net = form.unwrap_or(label);
-    let definition = Box::new(crate::blend::record_blend(definition));
-    Ok((r::Surface::Blend { definition }, Some(net)))
+    if let Some(definition) = face_definition(k, surface)? {
+        let net = form.unwrap_or(label);
+        let definition = Box::new(crate::blend::record_blend(definition));
+        return Ok((r::Surface::Blend { definition }, Some(net)));
+    }
+    // A screw-swept wall's net: its definition as its label.
+    if let Some(definition) = face_sweep(k, surface)
+        .ok()
+        .flatten()
+        .and_then(|d| crate::sweep::record_sweep(&d))
+    {
+        let net = form.unwrap_or(label);
+        let definition = Box::new(definition);
+        return Ok((r::Surface::Sweep { definition }, Some(net)));
+    }
+    Ok((label, form))
 }
 
 fn index(i: usize) -> R<u32> {
@@ -128,12 +140,7 @@ struct Edge {
 /// step the kernel refuses; [`Unsupported::Invalid`] for kernel data that does not hold
 /// together or a record that does not validate.
 pub fn to_record(k: &mut Kernel, b: &mut Brep) -> R<(r::Brep, Order)> {
-    for eu in solidcore::topology::brep::p2::edgeuses(b, None)? {
-        if eu1::faceuse(b, eu)?.is_none() || eu1::uv_trim_curve_pointer(b, eu)?.is_some() {
-            continue;
-        }
-        eu3::get_or_create_uv_trim_curve(k, b, eu, false, false, true)?.status?;
-    }
+    create_missing_uv_trim_curves(k, b)?;
     let b: &Brep = b;
     let store = AttributeStore::default();
     let records = NotifyRecords::new();
@@ -145,7 +152,7 @@ pub fn to_record(k: &mut Kernel, b: &mut Brep) -> R<(r::Brep, Order)> {
         uv_curve_key: &|_: EdgeuseId| ObjectKey(0),
         surface_key: &|_: FaceId| ObjectKey(0),
     };
-    let bd = BrepData::from_brep(b, &env, &mut Vec::new())?;
+    let bd = BrepData::from_brep(k, b, &env, &mut Vec::new())?;
     let face_ids = bl::faces(b, None)?;
     let edge_ids = bl::edges(b, None)?;
     let vertex_ids = bl::vertices(b, None)?;
@@ -460,6 +467,7 @@ pub fn to_record(k: &mut Kernel, b: &mut Brep) -> R<(r::Brep, Order)> {
             .iter()
             .map(|&v| at(&vertex_ids, v).copied())
             .collect::<R<_>>()?,
+        split_edges: order.split_edges,
     };
     Ok((brep, kernel))
 }
@@ -766,6 +774,8 @@ struct Sources {
     faces: Vec<usize>,
     edges: Vec<usize>,
     vertices: Vec<usize>,
+    /// Data edges split because only sheet faces use them more than twice (each once).
+    split_edges: usize,
 }
 
 /// The record in canonical order: faces in first appearance through the shells, edges
@@ -788,7 +798,7 @@ fn canonical(
     } = parts;
     let (mut edge_source, vertex_source) =
         split_shared(&mut faces, &mut edges, &shells, &sheets, n_vertices)?;
-    split_touching(&mut faces, &mut edges, &mut edge_source, &radial)?;
+    let split_edges = split_touching(&mut faces, &mut edges, &mut edge_source, &radial)?;
     let n_vertices = vertex_source.len();
     let mut face_new: Vec<Option<u32>> = vec![None; faces.len()];
     let (mut face_order, mut direction) = (Vec::new(), Vec::new());
@@ -982,6 +992,7 @@ fn canonical(
     brep.validate_built()
         .map_err(|e| Unsupported::Invalid(e.0))?;
     let sources = Sources {
+        split_edges,
         faces: face_order.iter().map(|&f| f as usize).collect(),
         edges: edge_order
             .iter()
@@ -1119,7 +1130,7 @@ fn split_touching(
     edges: &mut Vec<Edge>,
     edge_source: &mut Vec<usize>,
     radial: &Radial,
-) -> R<()> {
+) -> R<usize> {
     // The data edgeuses using each edge, and where each is: (face, loop, position).
     let mut records_of: Vec<Vec<usize>> = vec![Vec::new(); edges.len()];
     let mut place: HashMap<usize, (usize, usize, usize)> = HashMap::new();
@@ -1169,8 +1180,45 @@ fn split_touching(
     let after = |rec: usize| -> R<bool> { Ok(material_same(rec)? != top_entry(rec)?) };
     let before = |rec: usize| -> R<bool> { Ok(material_same(rec)? == top_entry(rec)?) };
 
+    // The original edges split because only sheet faces use them (each once).
+    let mut split_sheets = 0;
     for e in crowded {
         let mine = records_of.get(e).cloned().unwrap_or_default();
+        // An edge only sheet faces use (no material on either side of any of them) has no
+        // sectors to pair across: the first two uses keep it, every further use gets a copy
+        // of its own, so the sheet stays one open body with the extra uses as boundary edges.
+        let only_sheets = mine.iter().all(|rec| {
+            face_of(*rec)
+                .ok()
+                .and_then(|f| radial.material_same.get(f).copied())
+                .is_some_and(|m| m.is_none())
+        });
+        if only_sheets {
+            split_sheets += 1;
+            for &rec in mine.iter().skip(2) {
+                let made = edges.len();
+                let original = edges.get(e).ok_or(Unsupported::Invalid("edge"))?.clone();
+                edges.push(original);
+                edge_source.push(*at(edge_source, e)?);
+                let (f, li, p) = place
+                    .get(&rec)
+                    .copied()
+                    .ok_or(Unsupported::Invalid("edgeuse"))?;
+                let slot = faces
+                    .get_mut(f)
+                    .and_then(|face| face.loops.get_mut(li))
+                    .and_then(|l| {
+                        if let Loop::Edges(u) = l {
+                            u.get_mut(p)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or(Unsupported::Invalid("edgeuse"))?;
+                slot.0 = index(made)?;
+            }
+            continue;
+        }
         let start = *mine.first().ok_or(Unsupported::Invalid("edge"))?;
         // The edge's radial list from one of its uses, keeping this edge's.
         let mut cycle = Vec::new();
@@ -1256,5 +1304,5 @@ fn split_touching(
             }
         }
     }
-    Ok(())
+    Ok(split_sheets)
 }

@@ -22,6 +22,7 @@ use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::geom::extent2d::Extent2d;
 use solidcore::kernel::KernelOptions;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point2, Point3, Vec2, Vec3};
 use solidcore::nurbs::b_spline_curve::BSplineCurve;
 use solidcore::primitive::api_primitives::create_box;
@@ -34,7 +35,7 @@ use solidcore::{Brep, Kernel};
 /// The section between the planes z = 0 and x = 0 for the ball of radius r centred at
 /// (r, y, r), in (x, z): `T1(u) = (u r, 0)`, `T2(u) = (0, u r)`.
 fn closed_form(n: usize, w: f64, r: f64, t: f64) -> (f64, f64) {
-    let (a, b) = ((1.0 - t).powi(n as i32 + 1), t.powi(n as i32 + 1));
+    let (a, b) = (det::powi(1.0 - t, n as i32 + 1), det::powi(t, n as i32 + 1));
     let f = a / (a + b);
     let p1 = t / (1.0 - w + w * t);
     let p2 = t * (1.0 - w) / (1.0 - w * t);
@@ -106,10 +107,11 @@ fn corner_surface(
             },
         )
         .unwrap();
-    // (a plain B-spline without `fillet_round_as_definition`)
-    let solidcore::surface::surface::SurfaceKind::BSpline(s) = s.into_kind() else {
-        panic!("the G^n section is a B-spline without the definition flag");
+    // the round is its definition; its net is the G^n section's B-spline
+    let solidcore::surface::surface::SurfaceKind::ProceduralBlend(s) = s.into_kind() else {
+        panic!("the G^n section is not its definition");
     };
+    let s = s.net().copy();
     (g, s)
 }
 
@@ -237,7 +239,7 @@ fn box_edge_order_2_round_takes_off_the_section_s_area() {
 /// this blend within 3.9e-6 on 227 spans, off the exact blend by 1.75e-7.
 ///
 /// Ignored by default: its certificate takes about 15 minutes in a debug build (run it with
-/// `cargo test --release --test wr685_gn_section -- --ignored`).
+/// `cargo test --release --test blend -- --ignored wr685_gn_section::`).
 #[test]
 #[ignore = "slow in a debug build: a 227-span certificate"]
 fn boss_root_order_2_round_adds_the_section_s_turned_area() {

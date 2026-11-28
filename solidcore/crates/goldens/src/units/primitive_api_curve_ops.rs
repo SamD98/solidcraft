@@ -29,6 +29,7 @@ use solidcore::SolidError;
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Generated cases per run, whatever `--seeds` says (it can only raise this).
 pub const MIN_GENERATED: usize = 600;
@@ -269,7 +270,7 @@ fn param_method(code: u32) -> Option<ParamMethod> {
 }
 
 fn rust(i: &In) -> Result<Output, HarnessError> {
-    let k = Kernel::default();
+    let k = crate::runner_kernel();
     // the one curve of an offset or continuity case, else the case's record
     let one = |c: &Crv| -> Result<Result<Curve, Box<Output>>, HarnessError> {
         let mut v = Vec::new();
@@ -542,7 +543,7 @@ fn gen_case(rng: &mut Rng) -> In {
                     let corners: Vec<[f64; 3]> = (0..n)
                         .map(|i| {
                             let a = core::f64::consts::TAU * i as f64 / n as f64;
-                            [c[0] + r * a.cos(), c[1] + r * a.sin(), 0.0]
+                            [c[0] + r * det::cos(a), c[1] + r * det::sin(a), 0.0]
                         })
                         .collect();
                     polygon_loop(rng, &corners)

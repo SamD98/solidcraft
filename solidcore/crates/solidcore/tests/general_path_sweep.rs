@@ -36,6 +36,7 @@ use solidcore::topology::brep::p1;
 use solidcore::topology::face;
 use solidcore::{Brep, Kernel};
 
+use solidcore::math::det;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The balance wire's fit points: straights joined by R2 rounds, in mm.
@@ -295,8 +296,8 @@ fn a_circle_along_an_arc_is_the_exact_torus() {
                         / 23.0,
             );
             let p = sweep.definition().evaluate_definition_point(uv).unwrap();
-            let ring = p.x.hypot(p.y);
-            let minor = (ring - 10.0).hypot(p.z);
+            let ring = det::hypot(p.x, p.y);
+            let minor = det::hypot(ring - 10.0, p.z);
             assert!((minor - RADIUS).abs() <= 1e-12, "{minor}");
             assert!(p.x >= -1e-12 && p.y >= -1e-12, "{p:?}");
         }
@@ -632,6 +633,26 @@ fn issue_2572_every_path_wall_is_a_definition_or_in_the_ledger() {
     );
     let wire = Curve::from(wire_path(&k));
     let closed = Curve::from(create_arc(Point3::new(0.0, 0.0, 0.0), 10.0, 0.0, 360.0).unwrap());
+    // Closed general splines still lack a certified frame. The circle above now
+    // has an exact definition because its transported frame closes.
+    let closed_spline = Curve::from(
+        BSplineCurve::interpolate_points(
+            &[
+                Vec3::new(10.0, 0.0, 0.0),
+                Vec3::new(0.0, 10.0, 2.0),
+                Vec3::new(-10.0, 0.0, 0.0),
+                Vec3::new(0.0, -10.0, -1.0),
+                Vec3::new(10.0, 0.0, 0.0),
+            ],
+            None,
+            3,
+            None,
+            None,
+            true,
+            ParamMethod::ChordLength,
+        )
+        .unwrap(),
+    );
     // (the kind its bare walls are listed as, the body)
     let cases: Vec<(&str, Brep)> = vec![
         (
@@ -688,6 +709,10 @@ fn issue_2572_every_path_wall_is_a_definition_or_in_the_ledger() {
         (
             "path-closed",
             create_pipe_sweep(&mut k, RADIUS, Some(&closed), false).unwrap(),
+        ),
+        (
+            "path-closed",
+            create_pipe_sweep(&mut k, RADIUS, Some(&closed_spline), false).unwrap(),
         ),
     ];
     let ledger = path_ledger();
@@ -947,4 +972,475 @@ fn the_definitions_partials_at_a_faces_ends_are_its_own_sides() {
         }
     }
     assert!(checked >= 20, "{checked}");
+}
+
+/// Equal profile and corner radii make each inner arc rail stationary. The old G1
+/// skin rescales its derivatives using that zero travel and corrupts the net.
+#[test]
+fn closed_rounded_rectangle_has_no_internal_pole() {
+    use solidcore::curve::composite_curve::CompositeCurve;
+    use solidcore::nurbs::b_spline_surface::BSplineSurface;
+    use solidcore::surface::surface::assert_valid::has_internal_pole;
+    let mut k = Kernel::default();
+    // Match the application's pole, closure and exact-trim handling.
+    k.fixes.closed_smooth_pole_tangent_limit = true;
+    k.fixes.keep_exact_pcurves = true;
+    let mut curves = Vec::new();
+    for (cx, cy, angle) in [
+        (8.0, 2.0, -90.0),
+        (8.0, 8.0, 0.0),
+        (2.0, 8.0, 90.0),
+        (2.0, 2.0, 180.0),
+    ] {
+        let arc = create_arc(Vec3::new(cx, cy, 0.0), 2.0, angle, angle + 90.0).unwrap();
+        let end = arc.evaluate_point(arc.natural_interval().max()).unwrap();
+        curves.push(Curve::from(arc));
+        let next = match angle as i32 {
+            -90 => Vec3::new(10.0, 8.0, 0.0),
+            0 => Vec3::new(2.0, 10.0, 0.0),
+            90 => Vec3::new(0.0, 2.0, 0.0),
+            _ => Vec3::new(8.0, 0.0, 0.0),
+        };
+        curves.push(Curve::from(
+            BSplineCurve::create_line_segment(3, end, next).unwrap(),
+        ));
+    }
+    let path = CompositeCurve::build_composites_from_curves(&k, curves, 1e-6, 0.0)
+        .unwrap()
+        .composites[0]
+        .make_composite_nurb()
+        .unwrap();
+    let profile = BSplineCurve::create_circle_segment(
+        3,
+        &Axis2Placement::new(Vec3::ZERO, Vec3::Y, Vec3::Z),
+        2.0,
+        0.0,
+        360.0,
+        NurbCircleParam::Quadratic,
+    )
+    .unwrap();
+    let net = BSplineSurface::create_sweep_surface(&profile, &path, None, false, 1e-6).unwrap();
+    let surface = Surface::from(net.clone());
+    let points = net.control_point_net().unwrap();
+    assert!(points
+        .points
+        .iter()
+        .all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite()));
+    assert!(!has_internal_pole(&k, &surface, &net, 1e-6).unwrap());
+    let domain = net.natural_uv_domain();
+    let mut radial_error = 0.0_f64;
+    let mut closure_gap = 0.0_f64;
+    for i in 0..128 {
+        let t = domain.u_interval().evaluate((f64::from(i) + 0.37) / 128.0);
+        let center = path.evaluate_point(t).unwrap();
+        for j in 0..16 {
+            let v = domain.v_interval().evaluate((f64::from(j) + 0.23) / 16.0);
+            let point = net.evaluate_point(Point2::new(t, v)).unwrap();
+            radial_error = radial_error.max((point.distance(center) - 2.0).abs());
+            closure_gap = closure_gap.max(
+                net.evaluate_point(Point2::new(domain.min().x, v))
+                    .unwrap()
+                    .distance(net.evaluate_point(Point2::new(domain.max().x, v)).unwrap()),
+            );
+        }
+    }
+    eprintln!("radial error {radial_error:e}, closure gap {closure_gap:e}");
+    assert!(radial_error < 2e-5, "{radial_error}");
+    assert!(closure_gap < 1e-10, "{closure_gap}");
+    let path = Curve::from(path);
+    // -270 degrees places the second seam at +90 while keeping both endpoint
+    // angles inside the circle constructor's supported range.
+    for (cap, start) in [(false, 0.0), (true, 0.0), (false, -270.0), (true, -270.0)] {
+        let profile = Curve::from(
+            BSplineCurve::create_circle_segment(
+                3,
+                &Axis2Placement::new(Vec3::ZERO, Vec3::Y, Vec3::Z),
+                2.0,
+                start,
+                start + 360.0,
+                NurbCircleParam::Quadratic,
+            )
+            .unwrap(),
+        );
+        let options = SweepOptions {
+            cap_ends: cap,
+            ..pipe_options()
+        };
+        let mut swept = create_curve_sweep(
+            &mut k,
+            &[Some(&profile)],
+            Some(&path),
+            None,
+            None,
+            Some(&options),
+        )
+        .unwrap()
+        .brep;
+        let all = walls(&swept);
+        assert!(!all.is_empty());
+        eprintln!("cap {cap}, seam {start}: constructed {} faces", all.len());
+        for wall in &all {
+            let mut reports = solidcore::geom::assert_array::AssertArray::new();
+            let valid = wall
+                .assert_valid(
+                    &k,
+                    Some(&mut reports),
+                    0,
+                    solidcore::geom::assert_array::ObjectKey(0),
+                )
+                .unwrap();
+            let failed: Vec<_> = reports.reports().iter().filter(|r| !r.ok).collect();
+            assert!(valid, "{failed:?}");
+        }
+        let area =
+            solidcore::mass::integrator::properties::brep_area(&k, &mut swept, 1e-6).unwrap();
+        let expected = 96.0 * std::f64::consts::PI + 16.0 * det::powi(std::f64::consts::PI, 2);
+        eprintln!(
+            "cap {cap}, seam {start}: faces {}, area {area}, expected {expected}",
+            all.len()
+        );
+        assert!((area - expected).abs() < 1e-3, "{area}");
+        if cap {
+            assert!(solidcore::topology::brep::p2::is_manifold_solid(&swept).unwrap());
+            let volume =
+                solidcore::mass::integrator::properties::brep_volume_default(&k, &mut swept, 1e-6)
+                    .unwrap();
+            eprintln!("volume {volume}, expected {expected}");
+            assert!((volume - expected).abs() < 1e-3, "{volume}");
+        }
+    }
+}
+
+/// The arc from `start` through `through` to `end` (less than a whole turn), as an
+/// application's three-point arc is made: its centre, axis and angle from the points.
+fn arc_through(k: &Kernel, start: Point3, through: Point3, end: Point3) -> BSplineCurve {
+    use solidcore::curve::arc::ArcDefinition;
+    let (ab, ac) = (through - start, end - start);
+    let n = ab.cross(ac);
+    let centre = start + (n.cross(ab) * ac.dot(ac) + ac.cross(n) * ab.dot(ab)) * (0.5 / n.dot(n));
+    let radius = (start - centre).length();
+    let axis = (start - centre).cross(through - centre);
+    let axis = axis * (1.0 / axis.length());
+    let x = (start - centre) * (1.0 / radius);
+    let to = end - centre;
+    let mut angle = det::atan2(to.dot(axis.cross(x)), to.dot(x));
+    if angle <= 0.0 {
+        angle += std::f64::consts::TAU;
+    }
+    let arc = ArcDefinition {
+        centre,
+        axis,
+        reference: x,
+        radius,
+        start: 0.0,
+        end: angle,
+    };
+    Ellipse::arc(k, &arc).unwrap().base().clone()
+}
+
+/// #16959: a circle along line, half turn, line, quarter turn, line, the two arcs in
+/// perpendicular planes and the joints off tangent by the rounding of four decimals (so
+/// the path takes the fitted sweep). The frame's z turns along one of the arcs whatever
+/// the start, and the skin of that arc took its end sections' turn from a finite
+/// difference reaching onto the long line next to it: a fraction of the rate, so the
+/// net's inner rows ran backwards at the arc's ends. Every row and column of the net now
+/// goes one way, and every wall passes the surface check.
+#[test]
+fn a_circle_along_arcs_in_perpendicular_planes_has_a_net_that_does_not_double_back() {
+    use solidcore::nurbs::b_spline_surface::BSplineSurface;
+    use solidcore::primitive::primitive_creation::p3::prepare_curve_sweep;
+    use solidcore::surface::surface::assert_valid::grid_has_non_monotonic_points_to_rounding;
+    use solidcore::sweep::api_brep::create_curve_sweep_with_placements;
+    let mut k = Kernel {
+        fixes: solidcore::kernel::UpstreamFixes::all(),
+        ..Kernel::default()
+    };
+    let p = Point3::new;
+    let line = |a: Point3, b: Point3| BSplineCurve::create_line_segment(3, a, b).unwrap();
+    let mut parts = vec![
+        line(p(-6.9065, -30.0, -1.2499), p(-6.6363, -30.0, -0.2871)),
+        arc_through(
+            &k,
+            p(-6.6363, -30.0, -0.2871),
+            p(-8.4718, -30.0, 2.9803),
+            p(-11.7392, -30.0, 1.1448),
+        ),
+        line(p(-11.7392, -30.0, 1.1448), p(-20.9248, -30.0, -31.5909)),
+        arc_through(
+            &k,
+            p(-20.9248, -30.0, -31.5909),
+            p(-21.689, -28.8284, -34.3141),
+            p(-22.0055, -26.0, -35.4421),
+        ),
+        line(p(-22.0055, -26.0, -35.4421), p(-22.0055, -20.0, -35.4421)),
+    ];
+    let path = BSplineCurve::create_by_joining(&mut parts, None).unwrap();
+    let start = path.evaluate_point(path.natural_interval().min()).unwrap();
+    let across = Vec3::new(0.9628139453425012, 0.0, -0.2701653320728017);
+    let profile = Curve::from(
+        BSplineCurve::create_circle_segment(
+            3,
+            &Axis2Placement::new(start, across, Vec3::Y),
+            1.8,
+            0.0,
+            360.0,
+            NurbCircleParam::Quadratic,
+        )
+        .unwrap(),
+    );
+    let options = SweepOptions {
+        cap_ends: true,
+        profile_at_path_start: true,
+        ..SweepOptions::default()
+    };
+    // The net as the sweep builds it, before it is split into faces.
+    let prepared = prepare_curve_sweep(
+        &k,
+        &[Some(profile.clone())],
+        &path,
+        None,
+        None,
+        options,
+        false,
+    )
+    .unwrap();
+    let net = BSplineSurface::create_sweep_surface(
+        &prepared.profiles[0],
+        &prepared.path,
+        None,
+        false,
+        solidcore::geom::tol::ZONE_TOL_3D,
+    )
+    .unwrap();
+    let points = net.control_point_net().unwrap();
+    assert!(
+        !grid_has_non_monotonic_points_to_rounding(&points.points, points.v_count, false, false)
+            .unwrap(),
+        "the net doubles back"
+    );
+    let swept = create_curve_sweep_with_placements(
+        &mut k,
+        &[Some(&profile)],
+        Some(&Curve::from(path)),
+        None,
+        None,
+        Some(&options),
+    )
+    .unwrap()
+    .sweep
+    .brep;
+    let all = walls(&swept);
+    assert!(!all.is_empty());
+    for wall in &all {
+        let mut reports = solidcore::geom::assert_array::AssertArray::new();
+        let valid = wall
+            .assert_valid(
+                &k,
+                Some(&mut reports),
+                0,
+                solidcore::geom::assert_array::ObjectKey(0),
+            )
+            .unwrap();
+        let failed: Vec<_> = reports.reports().iter().filter(|r| !r.ok).collect();
+        assert!(valid, "{failed:?}");
+    }
+}
+
+/// A circular pipe swept along contiguous and nearly contiguous tangent 3D arcs in
+/// perpendicular/tilted planes (bend radius 50 mm, pipe radius 3 mm), including a short
+/// 0.0009 mm straight bridge whose 6-decimal rounded endpoints tilt its chord tangent by
+/// ~7e-4 rad (so `reach * kink > bridge_len`). Previously, evaluating the bridge's frame
+/// from its tilted chord and averaging mismatched boundary rows in `join` folded the
+/// control net back on itself (`SmBSplineSurface` test #5). The sweep now produces a
+/// monotone net, a valid closed manifold B-rep passing Level 2 checks, and the analytic
+/// volume `pi * r^2 * L`.
+#[test]
+fn a_circle_along_tangent_3d_arcs_with_tiny_rounded_bridge_does_not_double_back() {
+    use solidcore::mass::integrator::properties::brep_volume_default;
+    use solidcore::nurbs::b_spline_surface::BSplineSurface;
+    use solidcore::primitive::primitive_creation::p3::prepare_curve_sweep;
+    use solidcore::surface::surface::assert_valid::grid_has_non_monotonic_points_to_rounding;
+    use solidcore::sweep::api_brep::create_curve_sweep_with_placements;
+    use solidcore::topology::brep::p2::is_manifold_solid;
+    use solidcore::topology::brep::validation::{check_brep, CheckLevel};
+
+    let round6 = |v: Point3| {
+        Point3::new(
+            (v.x * 1e6).round() / 1e6,
+            (v.y * 1e6).round() / 1e6,
+            (v.z * 1e6).round() / 1e6,
+        )
+    };
+    let mut k = Kernel::default();
+    let bend_r = 50.0_f64;
+    let pipe_r = 3.0_f64;
+    let ang1 = 53.0_f64.to_radians();
+    let ang2 = 60.0_f64.to_radians();
+    let ang3 = 45.0_f64.to_radians();
+    let lead = 20.0_f64;
+    let bridge_len = 0.0009_f64;
+
+    let p0 = Point3::ZERO;
+    let p1_start = Point3::new(lead, 0.0, 0.0);
+    let c1 = Point3::new(lead, bend_r, 0.0);
+    let p1_mid = c1
+        + Vec3::new(
+            bend_r * (ang1 * 0.5).sin(),
+            -bend_r * (ang1 * 0.5).cos(),
+            0.0,
+        );
+    let p1_end = c1 + Vec3::new(bend_r * ang1.sin(), -bend_r * ang1.cos(), 0.0);
+    let t1 = Vec3::new(ang1.cos(), ang1.sin(), 0.0);
+
+    let p2_start = p1_end + t1 * bridge_len;
+    let n2 = Vec3::Z;
+    let p2_mid =
+        p2_start + t1 * (bend_r * (ang2 * 0.5).sin()) + n2 * (bend_r * (1.0 - (ang2 * 0.5).cos()));
+    let p2_end = p2_start + t1 * (bend_r * ang2.sin()) + n2 * (bend_r * (1.0 - ang2.cos()));
+    let t2 = t1 * ang2.cos() + n2 * ang2.sin();
+
+    // Third arc directly contiguous (no straight segment) in a plane perpendicular to the first two.
+    let n3 = Vec3::new(-ang1.sin(), ang1.cos(), 0.0);
+    let p3_mid =
+        p2_end + t2 * (bend_r * (ang3 * 0.5).sin()) + n3 * (bend_r * (1.0 - (ang3 * 0.5).cos()));
+    let p3_end = p2_end + t2 * (bend_r * ang3.sin()) + n3 * (bend_r * (1.0 - ang3.cos()));
+    let t3 = t2 * ang3.cos() + n3 * ang3.sin();
+    let p_out = p3_end + t3 * lead;
+
+    let line = |a: Point3, b: Point3| BSplineCurve::create_line_segment(3, a, b).unwrap();
+    let (a1, m1, b1) = (round6(p1_start), round6(p1_mid), round6(p1_end));
+    let (a2, m2, b2) = (round6(p2_start), round6(p2_mid), round6(p2_end));
+    let (m3, b3) = (round6(p3_mid), round6(p3_end));
+    let mut parts = vec![
+        line(p0, a1),
+        arc_through(&k, a1, m1, b1),
+        line(b1, a2),
+        arc_through(&k, a2, m2, b2),
+        arc_through(&k, b2, m3, b3),
+        line(b3, round6(p_out)),
+    ];
+    let path = BSplineCurve::create_by_joining(&mut parts, None).unwrap();
+    let profile = Curve::from(
+        BSplineCurve::create_circle_segment(
+            3,
+            &Axis2Placement::new(p0, Vec3::Y, Vec3::Z),
+            pipe_r,
+            0.0,
+            360.0,
+            NurbCircleParam::Quadratic,
+        )
+        .unwrap(),
+    );
+    let options = SweepOptions {
+        cap_ends: true,
+        profile_at_path_start: true,
+        ..SweepOptions::default()
+    };
+    let prepared = prepare_curve_sweep(
+        &k,
+        &[Some(profile.clone())],
+        &path,
+        None,
+        None,
+        options,
+        false,
+    )
+    .unwrap();
+    let net = BSplineSurface::create_sweep_surface(
+        &prepared.profiles[0],
+        &prepared.path,
+        None,
+        false,
+        solidcore::geom::tol::ZONE_TOL_3D,
+    )
+    .unwrap();
+    let points = net.control_point_net().unwrap();
+    assert!(
+        !grid_has_non_monotonic_points_to_rounding(&points.points, points.v_count, false, false)
+            .unwrap(),
+        "the swept net doubles back"
+    );
+    let mut swept = create_curve_sweep_with_placements(
+        &mut k,
+        &[Some(&profile)],
+        Some(&Curve::from(path)),
+        None,
+        None,
+        Some(&options),
+    )
+    .unwrap()
+    .sweep
+    .brep;
+    assert!(is_manifold_solid(&swept).unwrap());
+    let report = check_brep(&mut k, &mut swept, CheckLevel::Level2).unwrap();
+    assert!(report.is_valid(), "{:?}", report.lines());
+
+    let total_len = lead + bend_r * (ang1 + ang2 + ang3) + bridge_len + lead;
+    let expected_vol = std::f64::consts::PI * pipe_r * pipe_r * total_len;
+    let vol = brep_volume_default(&k, &mut swept, 1e-6).unwrap();
+    assert!(
+        (vol - expected_vol).abs() <= 1e-3 * expected_vol,
+        "volume {vol} vs expected {expected_vol}"
+    );
+}
+
+/// A genuine tight bend (bend radius smaller than pipe radius) must still produce a
+/// folding control net that fails test #5.
+#[test]
+fn a_tight_bend_smaller_than_pipe_radius_still_doubles_back() {
+    use solidcore::nurbs::b_spline_surface::BSplineSurface;
+    use solidcore::primitive::primitive_creation::p3::prepare_curve_sweep;
+    use solidcore::surface::surface::assert_valid::grid_has_non_monotonic_points_to_rounding;
+
+    let k = Kernel::default();
+    let line = |a: Point3, b: Point3| BSplineCurve::create_line_segment(3, a, b).unwrap();
+    let bend_r = 2.0_f64;
+    let pipe_r = 4.0_f64;
+    let half = std::f64::consts::FRAC_PI_4;
+    let mut parts = vec![
+        line(Point3::ZERO, Point3::new(10.0, 0.0, 0.0)),
+        arc_through(
+            &k,
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::new(10.0 + bend_r * half.sin(), bend_r * (1.0 - half.cos()), 0.0),
+            Point3::new(10.0 + bend_r, bend_r, 0.0),
+        ),
+        line(
+            Point3::new(10.0 + bend_r, bend_r, 0.0),
+            Point3::new(10.0 + bend_r, bend_r + 10.0, 0.0),
+        ),
+    ];
+    let path = BSplineCurve::create_by_joining(&mut parts, None).unwrap();
+    let profile = Curve::from(
+        BSplineCurve::create_circle_segment(
+            3,
+            &Axis2Placement::new(Point3::ZERO, Vec3::Y, Vec3::Z),
+            pipe_r,
+            0.0,
+            360.0,
+            NurbCircleParam::Quadratic,
+        )
+        .unwrap(),
+    );
+    let options = SweepOptions {
+        cap_ends: true,
+        profile_at_path_start: true,
+        ..SweepOptions::default()
+    };
+    let prepared =
+        prepare_curve_sweep(&k, &[Some(profile)], &path, None, None, options, false).unwrap();
+    let net = BSplineSurface::create_sweep_surface(
+        &prepared.profiles[0],
+        &prepared.path,
+        None,
+        false,
+        solidcore::geom::tol::ZONE_TOL_3D,
+    )
+    .unwrap();
+    let points = net.control_point_net().unwrap();
+    assert!(
+        grid_has_non_monotonic_points_to_rounding(&points.points, points.v_count, false, false)
+            .unwrap(),
+        "a bend tighter than the pipe radius must still fold its control net"
+    );
 }

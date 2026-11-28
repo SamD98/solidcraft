@@ -11,14 +11,14 @@
 //! - 3ae7bfa (no flag: `CurveExtension` is the fork's own corner rule, WR-520's area): a
 //!   drafted arc's wall is its exact cone (`sm_DraftCone`), not the B-spline ruled between
 //!   its ends, and its seams' pcurves are cut at the cone's spans.
-//! - dda881f (`cover_wraps_across_closed_seam`, WR-599): the union's cover reads the
+//! - dda881f (WR-599's cover across a closed seam): the union's cover reads the
 //!   closure of a surface whose NURBS swaps u and v (the cones) in the step's direction, so
 //!   it takes the disc's cone face over the bar's and the two are one face; the vertex
 //!   V = (40, 10 tan 5, 10) where the front top edge meets the concave arc has three edges.
 //!
 //! Two more cases of 3ae7bfa (#2497): a draft that leans off its profile's plane builds, its
-//! arc's wall the ruled B-spline on its oblique cone; and with `keep_exact_pcurves` a seam
-//! that crosses a span end of its cone keeps its pcurve as built, cut at the crossing.
+//! arc's wall the ruled B-spline on its oblique cone; and a seam that crosses a span end of
+//! its cone keeps its pcurve as built, cut at the crossing (WR-722).
 //!
 //! Volumes in closed form (the capi test's): each wall leans in by t tan 5 at height t, so
 //! the bar's section at height t is the rectangle x in [d, 40], y in [d, 16 - d] and the half
@@ -43,6 +43,7 @@ use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::geom::axis2_placement::Axis2Placement;
 use solidcore::geom::extent1d::Extent1d;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point2, Point3, Vec3};
 use solidcore::nurbs::b_spline_surface::p1::SurfParamType;
 use solidcore::query::api_queries::{get_edges, get_faces};
@@ -59,7 +60,7 @@ use solidcore::{Brep, Kernel};
 const PI: f64 = core::f64::consts::PI;
 
 fn tan5() -> f64 {
-    5.0_f64.to_radians().tan()
+    det::tan(5.0_f64.to_radians())
 }
 
 fn line(a: Point3, b: Point3) -> Curve {
@@ -167,7 +168,7 @@ fn cone_faces(k: &Kernel, b: &Brep) -> Vec<(f64, f64)> {
                 let u = dom.u_min() + (dom.u_max() - dom.u_min()) * f64::from(i) / 10.0;
                 let v = dom.v_min() + (dom.v_max() - dom.v_min()) * f64::from(j) / 10.0;
                 let q = s.evaluate_point(k, Point2::new(u, v)).unwrap();
-                let rho = (q.x - 40.0).hypot(q.y - 8.0);
+                let rho = det::hypot(q.x - 40.0, q.y - 8.0);
                 worst = worst.max((rho - (8.0 - q.z * tan5())).abs());
             }
         }
@@ -200,14 +201,11 @@ fn check(k: &mut Kernel, b: &mut Brep) {
     assert!(lines.is_empty(), "check_brep: {lines:?}");
 }
 
-/// The kernel of the peg's union: WR-599's cover across a closed seam (`cover`) and
-/// WR-598's seam iso-curve join (`delete_vertex_joins_seam_iso_curve`), which merges the seam's vertex the cover leaves on the
+/// The kernel of the peg's union. WR-598's seam iso-curve join and WR-599's cover across a
+/// closed seam are both always on: the join merges the seam's vertex the cover leaves on the
 /// bar's bottom arc (the fork's counts need both).
-fn peg_kernel(cover: bool) -> Kernel {
-    let mut k = Kernel::default();
-    k.fixes.cover_wraps_across_closed_seam = cover;
-    k.fixes.delete_vertex_joins_seam_iso_curve = true;
-    k
+fn peg_kernel() -> Kernel {
+    Kernel::default()
 }
 
 fn peg(k: &mut Kernel) -> Brep {
@@ -261,7 +259,7 @@ fn the_bars_arc_wall_is_its_exact_cone() {
 /// closed-form volume.
 #[test]
 fn the_drafted_peg_has_one_cone_face() {
-    let mut k = peg_kernel(true);
+    let mut k = peg_kernel();
     let mut b = peg(&mut k);
     assert_eq!(counts(&b), (7, 15, 10));
     let cones = cone_faces(&k, &b);
@@ -275,18 +273,6 @@ fn the_drafted_peg_has_one_cone_face() {
     // (the fork at dda881f: 8291.612193902547 at accuracy 1e-10; here 1e-6, to keep the test
     // quick)
     assert!((v - want).abs() <= 1e-7 * want, "volume {v} want {want}");
-}
-
-/// WR-599's cover off (upstream refuses every crossing of a seam): the two cone walls stay
-/// apart, four edges at V, as the fork before dda881f.
-#[test]
-fn without_the_cover_the_cone_walls_stay_two_faces() {
-    let mut k = peg_kernel(false);
-    let mut b = peg(&mut k);
-    assert_eq!(counts(&b).0, 8);
-    assert_eq!(cone_faces(&k, &b).len(), 2);
-    assert_eq!(edges_at(&b, v_point()), Some(4));
-    check(&mut k, &mut b);
 }
 
 /// `int_0^1 g`, composite Simpson over 2000 panels (to rounding for the smooth integrands
@@ -335,7 +321,7 @@ fn grid(k: &Kernel, s: &Surface) -> Vec<Point3> {
 #[test]
 fn an_oblique_drafted_wall_is_ruled_on_its_oblique_cone() {
     let a = 5.0_f64.to_radians();
-    let e2 = Vec3::new(0.0, a.cos(), a.sin());
+    let e2 = Vec3::new(0.0, det::cos(a), det::sin(a));
     let m = Vec3::X.cross(e2);
     let o = Point3::new(0.0, 0.0, 0.0);
     let mut k = Kernel::default();
@@ -349,7 +335,7 @@ fn an_oblique_drafted_wall_is_ruled_on_its_oblique_cone() {
     assert_eq!(counts(&b), (4, 6, 4));
     assert!(cone_faces(&k, &b).is_empty());
     let h = Vec3::new(0.0, 0.0, 10.0);
-    let e = 10.0 * tan5() * a.cos();
+    let e = 10.0 * tan5() * det::cos(a);
     let apex = o + (8.0 / e) * h;
     // each face's surface: a cap, the chord's wall or the arc's wall
     let (mut caps, mut chord, mut cone) = (0, 0, 0);
@@ -395,7 +381,7 @@ fn an_oblique_drafted_wall_is_ruled_on_its_oblique_cone() {
     check(&mut k, &mut b);
     let segment = |f: f64| {
         let (rho, c) = (8.0 - f * e, f * e);
-        rho * rho * (c / rho).acos() - c * (rho * rho - c * c).sqrt()
+        rho * rho * det::acos(c / rho) - c * (rho * rho - c * c).sqrt()
     };
     let want = h.dot(m) * simpson(segment);
     let v = volume(&k, &mut b, 1e-10);
@@ -429,15 +415,14 @@ fn cone_pcurve_gap(k: &Kernel, b: &Brep) -> f64 {
 }
 
 /// A 240 degree segment of R 8 about the origin, from -90 degrees counterclockwise to 150,
-/// closed by its chord, drafted `deg` with `keep_exact_pcurves`.
+/// closed by its chord, drafted `deg`.
 fn segment_240(deg: f64) -> (Kernel, Brep) {
     let mut k = Kernel::default();
-    k.fixes.keep_exact_pcurves = true;
     let o = Point3::new(0.0, 0.0, 0.0);
     let x = Vec3::new(0.0, -1.0, 0.0);
     let at = |deg: f64| {
         let t = deg.to_radians();
-        Point3::new(8.0 * t.cos(), 8.0 * t.sin(), 0.0)
+        Point3::new(8.0 * det::cos(t), 8.0 * det::sin(t), 0.0)
     };
     let cs = [arc(&k, o, 8.0, x, 240.0), line(at(150.0), at(-90.0))];
     let TaperExtrude::Solid(b) = draft(&mut k, &cs, deg) else {
@@ -446,7 +431,7 @@ fn segment_240(deg: f64) -> (Kernel, Brep) {
     (k, b)
 }
 
-/// #2497: with `keep_exact_pcurves`, a seam that crosses a span end of its drafted cone
+/// #2497: a seam that crosses a span end of its drafted cone
 /// keeps its pcurve as built, cut at the crossing.
 ///
 /// The 240 degree segment drafted `deg` degrees: the arc's wall is the cone about Z of
@@ -469,7 +454,7 @@ fn a_seam_cut_at_a_span_end_keeps_its_exact_pcurve() {
         let (mut k, mut b) = segment_240(deg);
         assert_eq!(counts(&b), (4, 6, 4), "{deg}");
         check(&mut k, &mut b);
-        let tan = deg.to_radians().tan();
+        let tan = det::tan(deg.to_radians());
         let cone = get_faces(&b)
             .unwrap()
             .into_iter()
@@ -496,7 +481,7 @@ fn a_seam_cut_at_a_span_end_keeps_its_exact_pcurve() {
         );
         let off = grid(&k, s)
             .into_iter()
-            .map(|q| (q.x.hypot(q.y) - (8.0 - q.z * tan)).abs())
+            .map(|q| (det::hypot(q.x, q.y) - (8.0 - q.z * tan)).abs())
             .fold(0.0, f64::max);
         assert!(off < 1e-12, "{deg}: off the cone by {off:e}");
         let gap = cone_pcurve_gap(&k, &b);
@@ -538,7 +523,7 @@ fn a_seam_cut_at_a_span_end_keeps_its_exact_pcurve() {
             let want = 10.0
                 * simpson(|f| {
                     let (rho, c) = (8.0 - f * e, 4.0 - f * e);
-                    rho * rho * (-c / rho).acos() + c * (rho * rho - c * c).sqrt()
+                    rho * rho * det::acos(-c / rho) + c * (rho * rho - c * c).sqrt()
                 });
             let v = volume(&k, &mut b, 1e-10);
             assert!((v - want).abs() <= 1e-11 * want, "volume {v} want {want}");
@@ -561,19 +546,19 @@ fn a_seam_cut_at_a_span_end_keeps_its_exact_pcurve() {
 fn a_large_arcs_drafted_wall_keeps_its_seams() {
     let r = 746.6148;
     let half = 17.4_f64.to_radians();
-    let d = r * half.cos();
+    let d = r * det::cos(half);
     let o = Point3::new(0.0, 0.0, 0.0);
     for deg in [15.0_f64, -15.0] {
         let mut k = Kernel::default();
-        let at = |t: f64| Point3::new(r * t.cos(), r * t.sin(), 0.0);
-        let from = Vec3::new(half.cos(), -half.sin(), 0.0);
+        let at = |t: f64| Point3::new(r * det::cos(t), r * det::sin(t), 0.0);
+        let from = Vec3::new(det::cos(half), -det::sin(half), 0.0);
         let cs = [arc(&k, o, r, from, 2.0 * 17.4), line(at(half), at(-half))];
         let TaperExtrude::Solid(mut b) = draft(&mut k, &cs, deg) else {
             panic!("the {deg} degree draft is refused");
         };
         assert_eq!(counts(&b), (4, 6, 4), "{deg}");
         check(&mut k, &mut b);
-        let tan = deg.to_radians().tan();
+        let tan = det::tan(deg.to_radians());
         let cones: Vec<Surface> = get_faces(&b)
             .unwrap()
             .into_iter()
@@ -591,7 +576,7 @@ fn a_large_arcs_drafted_wall_keeps_its_seams() {
         );
         let off = grid(&k, &cones[0])
             .into_iter()
-            .map(|q| (q.x.hypot(q.y) - (r - q.z * tan)).abs())
+            .map(|q| (det::hypot(q.x, q.y) - (r - q.z * tan)).abs())
             .fold(0.0, f64::max);
         assert!(off < 1e-9, "{deg}: off the cone by {off:e}");
         let gap = cone_pcurve_gap(&k, &b);
@@ -615,7 +600,7 @@ fn a_large_arcs_drafted_wall_keeps_its_seams() {
             let off = pts
                 .iter()
                 .map(|q| {
-                    let cone = q.x.hypot(q.y) - (r - q.z * tan);
+                    let cone = det::hypot(q.x, q.y) - (r - q.z * tan);
                     let plane = q.x - (d + q.z * tan);
                     cone.abs().max(plane.abs())
                 })
@@ -627,7 +612,7 @@ fn a_large_arcs_drafted_wall_keeps_its_seams() {
         let want = 10.0
             * simpson(|f| {
                 let (rho, c) = (r - f * e, d + f * e);
-                rho * rho * (c / rho).acos() - c * (rho * rho - c * c).sqrt()
+                rho * rho * det::acos(c / rho) - c * (rho * rho - c * c).sqrt()
             });
         // (measured 1.1e-7 and 1.9e-8 short: the volume is taken over the faces' trims, and two
         // planar faces' pcurves are fits up to 8.8e-6 off their edges; the same segment of
@@ -638,4 +623,101 @@ fn a_large_arcs_drafted_wall_keeps_its_seams() {
             "{deg}: volume {v} want {want}"
         );
     }
+}
+
+/// A horn whose tip is where its line touches its arc builds (tangency-labs/solidcraft#16003).
+///
+/// The issue's window: the arc of radius r = 746.6148 about c = (-340.6148, 0) touches the
+/// line x = 406 at t = (c + r, 0), and the app splits the region there into two horns. The
+/// lower one, as the app passes it: the arc clockwise from t to s = (371.9150, -223.0132), the
+/// line from s to (406, s.y) and up to t, leaning by k = (t.x - 406) / -s.y (-7e-11, the
+/// tip's rounding), drafted 15 degrees inward over 10. At the tip the curves touch at 0
+/// degrees; drafted, the line's wall x = 406 + k (y - s.y) - z tan 15 cuts the cone
+/// R = r + z tan 15 near y = -sqrt(R^2 - (r - z tan 15)^2) = -2 sqrt(r z tan 15), so the tip's
+/// seam rises from t into the horn. The section at the fraction f of the height,
+/// e = 10 f tan 15, runs from y0 = s.y + e to that crossing y1, between the circle and the
+/// line: `w (y1 - y0) + k ((y1 - s.y)^2 - (y0 - s.y)^2) / 2 - [G]_y0^y1`, w = 406 - e - c,
+/// G(y) = (y sqrt(R^2 - y^2) + R^2 asin(y / R)) / 2, and the volume is `10 int_0^1 S(f) df`,
+/// taken over f = q^2 (the crossing goes as the square root of f). Before, the line and the
+/// circle crossed at the tip with a discriminant of -2.2e-11 against terms of 5e4, rounding's
+/// sign, so the draft was refused (`Apart`) at (406, -223.0132).
+#[test]
+fn a_horn_drafted_from_its_touching_tip_builds() {
+    let c = Point3::new(-340.614_824_473_321_73, 0.0, 0.0);
+    let r = 746.614_824_457_444_7;
+    let t = Point3::new(405.999_999_984_122_95, 0.0, 0.0);
+    let s = Point3::new(371.915_036_667_901_5, -223.013_212_796_215_44, 0.0);
+    let corner = Point3::new(406.0, s.y, 0.0);
+    let mut k = Kernel::default();
+    // as the app builds the arc: from x about -Z over its sweep in degrees
+    let sweep = 0.303_329_283_634_688_53 * 180.0 / PI;
+    let cs = [
+        arc_in(&k, c, r, Vec3::X, Vec3::new(0.0, -1.0, 0.0), sweep),
+        line(s, corner),
+        line(corner, t),
+    ];
+    let mut b = match draft(&mut k, &cs, 15.0) {
+        TaperExtrude::Solid(b) => b,
+        TaperExtrude::Refused(r) => panic!("the lower horn's draft is refused: {r:?}"),
+    };
+    assert_eq!(counts(&b), (5, 9, 6));
+    check(&mut k, &mut b);
+    let cones = get_faces(&b)
+        .unwrap()
+        .into_iter()
+        .filter(|&f| {
+            matches!(
+                face::surface(&b, f).unwrap().unwrap().kind(),
+                SurfaceKind::Cone(_)
+            )
+        })
+        .count();
+    assert_eq!(cones, 1);
+    // the tip keeps its vertex, where the bottom arc, the bottom line and the seam meet
+    assert_eq!(edges_at(&b, t), Some(3));
+    let tan = det::tan(15.0_f64.to_radians());
+    let lean = (t.x - 406.0) / -s.y;
+    let area = |f: f64| {
+        let e = 10.0 * f * tan;
+        let big = r + e;
+        let w = 406.0 - e - c.x;
+        let y0 = s.y + e;
+        // the crossing with the upright line, then with the leaning one
+        let y = -(big * big - w * w).max(0.0).sqrt();
+        let x1 = w + lean * (y - s.y);
+        let y1 = -(big * big - x1 * x1).max(0.0).sqrt();
+        let g = |y: f64| 0.5 * (y * (big * big - y * y).sqrt() + big * big * det::asin(y / big));
+        let strip = w * (y1 - y0) + 0.5 * lean * (det::powi(y1 - s.y, 2) - det::powi(y0 - s.y, 2));
+        strip - (g(y1) - g(y0))
+    };
+    let want = 10.0 * simpson(|q| 2.0 * q * area(q * q));
+    let v = volume(&k, &mut b, 1e-10);
+    assert!((v - want).abs() <= 1e-11 * want, "volume {v} want {want}");
+}
+
+/// The upper half of a crescent between two circles touching inside each other at
+/// (1e8, 0), radii 1e8 and 1e8 - 1 with centres 1 apart, drafted 5 degrees inward over 1e-3:
+/// the tip's seam has parallel end tangents and a middle off its chord, which no conic fits,
+/// so the draft is refused rather than failing on the tangents' crossing.
+#[test]
+fn a_large_crescent_drafted_from_its_touching_tip_is_refused() {
+    let mut k = Kernel::default();
+    let (ra, rb) = (1e8, 99_999_999.0);
+    let a = Point3::new(-ra, 0.0, 0.0);
+    let b = Point3::new(1.0 - rb, 0.0, 0.0);
+    let cs = [
+        arc_in(&k, Point3::new(0.0, 0.0, 0.0), ra, Vec3::X, Vec3::Y, 180.0),
+        line(a, b),
+        arc_in(&k, Point3::new(1.0, 0.0, 0.0), rb, -Vec3::X, Vec3::Y, 180.0),
+    ];
+    let refs: Vec<Option<&Curve>> = cs.iter().map(Some).collect();
+    let out = create_taper_extrude_with_corner(
+        &mut k,
+        &refs,
+        1e-3,
+        5.0,
+        3,
+        OffsetCornerType::CurveExtension,
+    );
+    assert!(matches!(out, Ok(TaperExtrude::Refused(_))), "{out:?}");
 }

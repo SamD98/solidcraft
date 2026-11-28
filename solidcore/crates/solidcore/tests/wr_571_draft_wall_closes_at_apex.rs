@@ -23,6 +23,7 @@ use solidcore::curve::line::Line;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::kernel::{Kernel, KernelOptions};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::sweep::api_brep::{
     create_taper_extrude_with_corner, OffsetCornerType, TaperExtrude,
 };
@@ -62,14 +63,8 @@ fn slotted_square() -> Vec<Curve> {
 }
 
 /// The draft of `curves` over a height of 2 (positive degrees inward).
-fn draft(
-    tangent: bool,
-    curves: &[Curve],
-    draft_deg: f64,
-    corner: OffsetCornerType,
-) -> (Kernel, TaperExtrude) {
+fn draft(curves: &[Curve], draft_deg: f64, corner: OffsetCornerType) -> (Kernel, TaperExtrude) {
     let mut k = Kernel::new(&KernelOptions::default());
-    k.fixes.taper_tangent_corner_planes = tangent;
     let refs: Vec<Option<&Curve>> = curves.iter().map(Some).collect();
     let result =
         create_taper_extrude_with_corner(&mut k, &refs, 2.0, draft_deg, 3, corner).unwrap();
@@ -101,18 +96,18 @@ fn assert_rel(a: f64, b: f64, rel: f64) {
 const WEDGE_VOLUME: f64 = 72.883_284_979_193;
 
 fn slot_volume() -> f64 {
-    let t = 10.0_f64.to_radians().tan();
-    ((10.0 + 4.0 * t).powi(3) - 1000.0) / (6.0 * t) - 0.08 / t
+    let t = det::tan(10.0_f64.to_radians());
+    (det::powi(10.0 + 4.0 * t, 3) - 1000.0) / (6.0 * t) - 0.08 / t
 }
 
 #[test]
 fn wr_571_the_wedge_tip_closes_into_a_ridge() {
-    let (k, result) = draft(false, &wedge(), 5.0, OffsetCornerType::CurveExtension);
+    let (k, result) = draft(&wedge(), 5.0, OffsetCornerType::CurveExtension);
     let (faces, v) = solid(&k, result);
     assert_eq!(faces, 6);
     assert_rel(v, WEDGE_VOLUME, 1e-8);
     // the tangent rule (lines: the same walls)
-    let (k, result) = draft(true, &wedge(), 5.0, OffsetCornerType::LinearExtension);
+    let (k, result) = draft(&wedge(), 5.0, OffsetCornerType::LinearExtension);
     let (faces, v) = solid(&k, result);
     assert_eq!(faces, 6);
     assert_rel(v, WEDGE_VOLUME, 1e-8);
@@ -120,12 +115,7 @@ fn wr_571_the_wedge_tip_closes_into_a_ridge() {
 
 #[test]
 fn wr_571_the_slot_closes_face_to_face() {
-    let (k, result) = draft(
-        false,
-        &slotted_square(),
-        -10.0,
-        OffsetCornerType::CurveExtension,
-    );
+    let (k, result) = draft(&slotted_square(), -10.0, OffsetCornerType::CurveExtension);
     let (faces, v) = solid(&k, result);
     assert_eq!(faces, 10);
     assert_rel(v, slot_volume(), 1e-8);

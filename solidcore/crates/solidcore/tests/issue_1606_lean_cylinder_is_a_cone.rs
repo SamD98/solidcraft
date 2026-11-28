@@ -1,6 +1,7 @@
 //! Regression test for tangency-labs/solidcore#1606: `Cone::lean_cylinder` kept the clone's
-//! `SmCylinder` flag. With `cylinder_rebuild_mean_radius` on, the rebuild refused every leaned
-//! cylinder (`SM_ERR`); with it off, the leaned surface still reported itself a cylinder.
+//! `SmCylinder` flag, so the rebuild's equal-radii rule for cylinders (WR-385) refused every
+//! leaned cylinder (`SM_ERR`); without that rule, the leaned surface still reported itself a
+//! cylinder.
 //!
 //! The case is SolidCraft's `draft_a_curved_face`: the side of a cylinder of radius 5 about +Z
 //! from the origin, heights 0 to 10, drafted by 0.1 rad about z = 0 (leaning in). Its solid is
@@ -15,6 +16,7 @@
 
 use solidcore::geom::axis2_placement::Axis2Placement;
 use solidcore::geom::extent2d::Extent2d;
+use solidcore::math::det;
 use solidcore::surface::cone::Cone;
 use solidcore::{Kernel, Point2, Point3, Vec3};
 
@@ -37,7 +39,7 @@ fn cylinder(k: &Kernel, origin: Point3) -> Cone {
 /// whose analytic data and NURB both bound the frustum's volume.
 fn check_draft(k: &Kernel) {
     let cylinder = cylinder(k, Point3::new(0.0, 0.0, 0.0));
-    let slope = -(0.1f64).tan();
+    let slope = -det::tan(0.1f64);
     let cone = cylinder
         .lean_cylinder(k, slope, 0.0)
         .expect("a leaned cylinder rebuilds as a cone");
@@ -47,12 +49,12 @@ fn check_draft(k: &Kernel) {
 
     let canonical = cone.canonical();
     assert!((canonical.radius - 5.0).abs() < 1e-9);
-    assert!((canonical.semi_angle_deg - slope.atan().to_degrees()).abs() < 1e-9);
+    assert!((canonical.semi_angle_deg - det::atan(slope).to_degrees()).abs() < 1e-9);
 
     // The analytic cone's frustum over heights 0 to 10.
     let h = 10.0;
     let big = canonical.radius;
-    let small = big + h * canonical.semi_angle_deg.to_radians().tan();
+    let small = big + h * det::tan(canonical.semi_angle_deg.to_radians());
     let analytic = std::f64::consts::PI * h * (big * big + big * small + small * small) / 3.0;
     assert!(rel_close(analytic, VOLUME), "{analytic} vs {VOLUME}");
 
@@ -76,23 +78,15 @@ fn check_draft(k: &Kernel) {
 }
 
 #[test]
-fn lean_cylinder_is_a_cone_with_the_mean_radius_fix() {
-    let mut k = Kernel::default();
-    k.fixes.cylinder_rebuild_mean_radius = true;
-    check_draft(&k);
-}
-
-#[test]
-fn lean_cylinder_is_a_cone_without_the_mean_radius_fix() {
+fn lean_cylinder_is_a_cone() {
     check_draft(&Kernel::default());
 }
 
 /// The frame and slopes of the unit test (frame at (1, 2, 3), neutral height 4), both signs,
-/// are no longer refused under `cylinder_rebuild_mean_radius`.
+/// are not refused by the cylinder rebuild's equal-radii rule.
 #[test]
-fn leaned_cylinders_are_not_refused_with_the_mean_radius_fix() {
-    let mut k = Kernel::default();
-    k.fixes.cylinder_rebuild_mean_radius = true;
+fn leaned_cylinders_are_not_refused() {
+    let k = Kernel::default();
     let cylinder = cylinder(&k, Point3::new(1.0, 2.0, 3.0));
     for slope in [0.1, -0.1, 1e-3, -0.4] {
         let cone = cylinder

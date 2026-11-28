@@ -14,6 +14,7 @@
     clippy::print_stdout,
     clippy::disallowed_methods
 )] // test: the closed forms use trigonometry
+use solidcore::math::det;
 
 mod common;
 
@@ -27,14 +28,9 @@ fn slab_less_loft() -> f64 {
     900.0 * 480.0 * 160.0 - 4.0 / 6.0 * (top + 4.0 * middle + bottom)
 }
 
-/// SolidCraft's set: every fix but one.
+/// SolidCraft's set: every fix.
 fn fixes() {
-    let off = ["fillet_round_ends_on_outline"];
-    let on = solidcore::kernel::UpstreamFixes::NAMES
-        .iter()
-        .copied()
-        .filter(|n| !off.contains(n));
-    session::set_thread_fixes(on).unwrap();
+    session::set_thread_fixes(solidcore::kernel::UpstreamFixes::NAMES.iter().copied()).unwrap();
 }
 
 fn operand() -> Body {
@@ -73,9 +69,9 @@ const TOL: f64 = 2e-10;
 fn the_floor_edges_of_the_long_sides_take_their_closed_forms() {
     fixes();
     let v = slab_less_loft();
-    let phi = (4.0_f64 / 9.5).atan();
-    let round = 80.0 * 64.0 * ((phi / 2.0).tan() - phi / 2.0);
-    let chamfer = 80.0 * 32.0 * phi.sin();
+    let phi = det::atan(4.0_f64 / 9.5);
+    let round = 80.0 * 64.0 * (det::tan(phi / 2.0) - phi / 2.0);
+    let chamfer = 80.0 * 32.0 * det::sin(phi);
     for y in [418.84, 338.84] {
         let p = [450.0, y, 156.0];
         let r = blended(Blend::Round, p);
@@ -112,9 +108,9 @@ fn the_rest_of_the_rim_builds() {
 fn the_cut_from_a_pocket_floor_takes_the_same_closed_forms() {
     fixes();
     let v = volume(&beside_a_hole());
-    let phi = (4.0_f64 / 9.5).atan();
-    let round = 80.0 * 64.0 * ((phi / 2.0).tan() - phi / 2.0);
-    let chamfer = 80.0 * 32.0 * phi.sin();
+    let phi = det::atan(4.0_f64 / 9.5);
+    let round = 80.0 * 64.0 * (det::tan(phi / 2.0) - phi / 2.0);
+    let chamfer = 80.0 * 32.0 * det::sin(phi);
     for y in [-61.16, -141.16] {
         for (kind, added) in [(Blend::Round, round), (Blend::Chamfer, chamfer)] {
             let b = beside_a_hole();

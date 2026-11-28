@@ -43,6 +43,7 @@ use solidcore::topology::{
     VertexId, VertexuseId,
 };
 use solidcore::{EntityRef, SolidError};
+use solidcore::math::det;
 
 /// Runner for `topology.brep_p6`.
 pub struct Runner;
@@ -222,7 +223,7 @@ impl UnitDiff for Runner {
             })
             .map_err(harness)?;
         destination.set_infinite_region_record(Some(infinite));
-        let mut k = Kernel::default();
+        let mut k = crate::runner_kernel();
         let mut marks = Marks::default();
         let mut outer = if i.lock_mask == 0 {
             None
@@ -841,7 +842,7 @@ fn build_net(
 /// build's or read's error.
 fn own_fixture(i: &Inputs) -> Result<Option<Result<Brep, SolidError>>, HarnessError> {
     use crate::own_builder::{build_as, finish, in_new_brep, Built};
-    let mut k = Kernel::default();
+    let mut k = crate::runner_kernel();
     let built = if let Some(net) = &i.net {
         let edges = net
             .edges
@@ -899,7 +900,7 @@ fn make_faces_rust(i: &Inputs) -> Result<Output, HarnessError> {
     let resolved = resolve(i, &b)?;
     let mut records = seeded_records(&b);
     let mut attributes = AttributeStore::default();
-    let mut k = Kernel::default();
+    let mut k = crate::runner_kernel();
     let mut marks = Marks::default();
     let before = MARKS.map(|mt| k.context.current_mark(mt));
     let mut calls = Vec::new();
@@ -1054,7 +1055,7 @@ fn plain_face(surface: SrfIn, cycles: &[&[usize]]) -> FaceIn {
 /// loop vertex), shared edges, open boxes, flat and saddle B-spline patches, at
 /// random scales and offsets, with random flags and orientations.
 fn gen_faces(rng: &mut Rng) -> Inputs {
-    let s = 10f64.powf(rng.uniform(-4.0, 3.0));
+    let s = det::powf(10f64, rng.uniform(-4.0, 3.0));
     let (x, y, z) = (
         rng.uniform(-2.0, 2.0) * s,
         rng.uniform(-2.0, 2.0) * s,

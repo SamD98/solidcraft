@@ -48,6 +48,7 @@ use solidcore::SolidError;
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Most points of a chain case.
 const MAX_ITEMS: usize = 20_000;
@@ -519,7 +520,7 @@ fn run_op(k: &Kernel, i: &Inputs, o: &mut Vec<f64>) -> Result<(), Fail> {
             let mut p = pt_in(pt)?;
             let mut off = DropOffset::new(*offset, *singularities);
             let r = p.set_properties(k, &s, &mut off, *singularities, *tol, &ext(*domain), *adjust);
-            match st(r)? {
+            match st(r.map(crate::output::point_outcome_status))? {
                 Ok(c) => o.push(code(c)),
                 Err(c) => o.push(c),
             }
@@ -577,7 +578,7 @@ fn run_op(k: &Kernel, i: &Inputs, o: &mut Vec<f64>) -> Result<(), Fail> {
                 *end_t,
                 &mut end,
             );
-            match st(r)? {
+            match st(r.map(crate::output::point_outcome_status))? {
                 Ok(c) => o.push(code(c)),
                 Err(c) => o.push(c),
             }
@@ -1043,7 +1044,7 @@ fn tangent(rng: &mut Rng, su: [f64; 3], sv: [f64; 3], n: [f64; 3], s: f64) -> [f
         1 => scale3(n, s),
         2 => {
             let a = pick(rng, &[0.5_f64, 2.9, 3.1, 10.0], 2.9).to_radians();
-            add3(scale3(n, a.cos() * s), scale3(norm3(su), a.sin() * s))
+            add3(scale3(n, det::cos(a) * s), scale3(norm3(su), det::sin(a) * s))
         }
         3 => scale3(unit_dir(rng), s),
         4 => scale3(sv, pick(rng, &[1.0, -1.0], 1.0)),

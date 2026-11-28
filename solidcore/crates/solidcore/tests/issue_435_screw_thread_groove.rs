@@ -13,8 +13,7 @@
 //! Upstream (the C++ reference gives the same reports on the same body): the flank/end-face
 //! curves cross the rim at a grazing angle, two edges end 1.46e-5 from their vertices
 //! (`SmBrep` test #0) and two faces fail test #34. solidcore fits the edges' ends to their
-//! proto vertices (WR-452): with or without the opt-in
-//! `Kernel::fixes.imprint_extends_edge_to_proto_vertex` (WR-453) the result passes the whole
+//! proto vertices (WR-452, WR-453): the result passes the whole
 //! check, and its volume is Pappus's. That needs the boolean's edge uses to own their UV trim
 //! curves under the result's names: a merge left those it made under its own namespace's
 //! keys, so the port's check reported `SmEdgeuse` test #6 on them, which upstream never does.
@@ -30,6 +29,7 @@ use solidcore::boolean::api_brep::boolean_difference;
 use solidcore::curve::curve::Curve;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::Point3;
 use solidcore::primitive::api_curves::create_line_segment;
 use solidcore::primitive::api_primitives::create_cylinder;
@@ -52,7 +52,7 @@ fn profile() -> [(f64, f64); 4] {
     let root = RADIUS - depth();
     let outer = RADIUS + 0.05;
     let half_root = PITCH / 8.0;
-    let half_outer = half_root + (outer - root) * 30.0_f64.to_radians().tan();
+    let half_outer = half_root + (outer - root) * det::tan(30.0_f64.to_radians());
     [
         (root, -half_root),
         (outer, -half_outer),
@@ -69,7 +69,7 @@ fn screw_groove(k: &mut Kernel, z0: f64, turns: f64, per_turn: usize) -> Brep {
     let mut curves = Vec::new();
     for i in 0..=n {
         let turn = i as f64 / per_turn as f64;
-        let (s, c) = (2.0 * PI * turn).sin_cos();
+        let (s, c) = det::sin_cos(2.0 * PI * turn);
         let pts: Vec<Point3> = prof
             .iter()
             .map(|&(r, z)| Point3::new(r * c, r * s, z0 + z + PITCH * turn))
@@ -87,9 +87,8 @@ fn screw_groove(k: &mut Kernel, z0: f64, turns: f64, per_turn: usize) -> Brep {
 }
 
 /// Case 1250: the shaft minus the groove, run a pitch past each end.
-fn threaded_shaft(extend: bool) -> (Kernel, Brep) {
+fn threaded_shaft() -> (Kernel, Brep) {
     let mut k = Kernel::default();
-    k.fixes.imprint_extends_edge_to_proto_vertex = extend;
     let shaft = create_cylinder(&mut k, Point3::new(0.0, 0.0, 0.0), RADIUS, LENGTH).unwrap();
     let turns = (LENGTH + 2.0 * PITCH) / PITCH;
     let groove = screw_groove(&mut k, -PITCH, turns, 16);
@@ -116,7 +115,7 @@ fn volume(k: &Kernel, b: &mut Brep) -> f64 {
 fn analytic_volume() -> f64 {
     let d = depth();
     let a = PITCH / 4.0;
-    let b = a + 2.0 * d * 30.0_f64.to_radians().tan();
+    let b = a + 2.0 * d * det::tan(30.0_f64.to_radians());
     let area = d * (a + b) / 2.0;
     let centroid = RADIUS - d + d * (a + 2.0 * b) / (3.0 * (a + b));
     PI * RADIUS * RADIUS * LENGTH - LENGTH / PITCH * 2.0 * PI * centroid * area
@@ -124,17 +123,12 @@ fn analytic_volume() -> f64 {
 
 #[test]
 fn issue_435_m10_full_length_is_valid() {
-    for extend in [false, true] {
-        let (mut k, mut b) = threaded_shaft(extend);
-        let lines = check(&mut k, &mut b);
-        assert!(lines.is_empty(), "extend {extend}: {lines:#?}");
-        // The skin's cubic through sixteen sections a turn is 6.5e-5 short of the screw.
-        let (v, want) = (volume(&k, &mut b), analytic_volume());
-        assert!(
-            (v - want).abs() < 1e-4 * want,
-            "extend {extend}: volume {v} against {want}"
-        );
-    }
+    let (mut k, mut b) = threaded_shaft();
+    let lines = check(&mut k, &mut b);
+    assert!(lines.is_empty(), "{lines:#?}");
+    // The skin's cubic through sixteen sections a turn is 6.5e-5 short of the screw.
+    let (v, want) = (volume(&k, &mut b), analytic_volume());
+    assert!((v - want).abs() < 1e-4 * want, "volume {v} against {want}");
 }
 
 /// A boolean's edge uses own their UV trim curves under the result's names (`SmEdgeuse`

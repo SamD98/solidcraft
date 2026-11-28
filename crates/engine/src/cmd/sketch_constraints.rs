@@ -34,6 +34,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_smooth")
         .enabled(in_sketch)
+        .from_selection(super::sketch_selection::curvature)
         .contract(&CURVATURE_CONTRACT)
         .output(output_schema_for::<ConstraintAdded>)
         .params("a, b: two curves sharing an end point (curvature continuous, G2)"),
@@ -41,6 +42,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_polygon")
         .enabled(in_sketch)
+        .from_selection(super::sketch_selection::polygon)
         .contract(&POLYGON_CONTRACT)
         .output(output_schema_for::<PolygonResult>)
         .params("lines: [line ids] of a closed chain: equal sides with every corner on one circle (a regular polygon)"),
@@ -82,7 +84,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .enabled(in_sketch)
         .contract(&TOGGLE_DIAMETER_CONTRACT)
         .output(output_schema_for::<ToggleDiameterResult>)
-        .params("constraint: a circle's or an arc's radius or diameter dimension id; diameter?: bool (default: the other one); sketch?: id|name (default: the one being edited). The circle stays the same size: its parameter is halved or doubled (a plain value is rewritten, an expression becomes `(e) / 2` or `2 * (e)`); refused when anything else uses that parameter"),
+        .params("constraint: a circle's or an arc's radius or diameter dimension id, or the distance from a point or line to a construction line, centreline or axis (shown as a diameter: twice the distance); diameter?: bool (default: the other one); sketch?: id|name (default: the one being edited). The circle stays the same size: its parameter is halved or doubled (a plain value is rewritten, an expression becomes `(e) / 2` or `2 * (e)`); refused when anything else uses that parameter"),
     CommandSpec::new("sketch.glyphs", "Constraint Glyphs", crate::checked!("sketch.glyphs", glyphs)).icon("eye")
         .enabled(in_sketch)
         .noundo().read_only()
@@ -184,12 +186,12 @@ const MAX_TRIALS: usize = 2000;
 
 /// Add `k` if it removes a degree of freedom and the sketch still solves; else leave the
 /// sketch as it was. Returns the new dof when kept.
-fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKind, dof: usize, dim: bool) -> Option<usize> {
+fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKind, dof: usize, dim: bool) -> Result<Option<usize>> {
     let saved = sk.clone();
     let param = if dim {
-        let v = k.value()?;
+        let Some(v) = k.value() else { return Ok(None) };
         let (unit, e) = if k.is_angle() { ("deg".into(), format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6)) } else { doc.design_length(v) };
-        Some(doc.new_model_param(&e, &unit))
+        Some(doc.new_model_param(&e, &unit)?)
     } else {
         None
     };
@@ -197,36 +199,37 @@ fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKin
         if let Some(pn) = &param {
             let _ = doc.remove_param(pn);
         }
-        return None;
+        return Ok(None);
     }
     let mut trial = sk.clone();
     let rep = solidcraft_sketch::solve_with(&mut trial, &solidcraft_sketch::Hold::default(), None, solidcraft_sketch::Analysis::Freedom, None);
     if rep.ok() && rep.dof < dof {
         *sk = trial;
-        return Some(rep.dof);
+        return Ok(Some(rep.dof));
     }
     *sk = saved;
     if let Some(pn) = &param {
         let _ = doc.remove_param(pn);
     }
-    None
+    Ok(None)
 }
 
-fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datum: usize, mut dof: usize) -> (Vec<String>, usize) {
+fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datum: usize, mut dof: usize) -> Result<(Vec<String>, usize)> {
     use ConstraintKind::*;
     let tol = num(p, "tolerance").filter(|t| *t > 0.0).unwrap_or(0.01);
     let atol = num(p, "angle_tolerance").filter(|t| *t > 0.0).unwrap_or(1.0).to_radians();
     let dims = crate::params::bool_(p, "dimensions").unwrap_or(true);
     let n0 = sk.constraints.len();
     let mut trials = 0;
-    let mut attempt = |sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKind, dim: bool, dof: &mut usize| {
+    let mut attempt = |sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKind, dim: bool, dof: &mut usize| -> Result<()> {
         if *dof == 0 || trials >= MAX_TRIALS {
-            return;
+            return Ok(());
         }
         trials += 1;
-        if let Some(d) = try_add(sk, doc, k, *dof, dim) {
+        if let Some(d) = try_add(sk, doc, k, *dof, dim)? {
             *dof = d;
         }
+        Ok(())
     };
     // Coincident points.
     let np = sk.points.len();
@@ -234,7 +237,7 @@ fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datu
         for j in (i + 1)..np {
             let (Some(a), Some(b)) = (sk.point(i), sk.point(j)) else { continue };
             if a.dist(b) <= tol {
-                attempt(sk, doc, Coincident { p: i, q: j }, false, &mut dof);
+                attempt(sk, doc, Coincident { p: i, q: j }, false, &mut dof)?;
             }
         }
     }
@@ -248,9 +251,9 @@ fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datu
             let off_h = ang.sin().abs().asin();
             let off_v = ang.cos().abs().asin();
             if off_h <= atol {
-                attempt(sk, doc, Horizontal { l: i }, false, &mut dof);
+                attempt(sk, doc, Horizontal { l: i }, false, &mut dof)?;
             } else if off_v <= atol {
-                attempt(sk, doc, Vertical { l: i }, false, &mut dof);
+                attempt(sk, doc, Vertical { l: i }, false, &mut dof)?;
             }
         }
     }
@@ -275,7 +278,7 @@ fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datu
             if let (Some(u), Some(v)) = (dir(i), dir(j))
                 && u.cross(v).abs() <= atol.sin()
             {
-                attempt(sk, doc, Tangent { a: i, b: j }, false, &mut dof);
+                attempt(sk, doc, Tangent { a: i, b: j }, false, &mut dof)?;
             }
         }
     }
@@ -289,7 +292,7 @@ fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datu
                 Some(CurveKind::Line { a, b }) => Length { l: i, value: sk.point(a).zip(sk.point(b)).map(|(x, y)| x.dist(y)).unwrap_or(1.0) },
                 _ => continue,
             };
-            attempt(sk, doc, k, true, &mut dof);
+            attempt(sk, doc, k, true, &mut dof)?;
         }
         // Positions from the datum.
         let d = sk.point(datum).unwrap_or_default();
@@ -298,12 +301,12 @@ fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datu
                 continue;
             }
             let Some(q) = sk.point(i) else { continue };
-            attempt(sk, doc, DistanceX { p: datum, q: i, value: (q.x - d.x).abs() }, true, &mut dof);
-            attempt(sk, doc, DistanceY { p: datum, q: i, value: (q.y - d.y).abs() }, true, &mut dof);
+            attempt(sk, doc, DistanceX { p: datum, q: i, value: (q.x - d.x).abs() }, true, &mut dof)?;
+            attempt(sk, doc, DistanceY { p: datum, q: i, value: (q.y - d.y).abs() }, true, &mut dof)?;
         }
     }
     let added = sk.constraints.iter().skip(n0).map(|c| c.id.clone()).collect();
-    (added, dof)
+    Ok((added, dof))
 }
 
 fn auto(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
@@ -321,7 +324,7 @@ fn auto(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         }
         // This is the exact state just solved for the current parameter values. Trials update
         // its freedom whenever they change constraints; no separate initial solve is needed.
-        Ok(run_auto(sk, doc, p, datum, rep.dof))
+        run_auto(sk, doc, p, datum, rep.dof)
     })?;
     reply(cmd, AutoConstrainResult { added, dof, sketch: info, created: None, param_warnings: Vec::new() })
 }
@@ -335,6 +338,7 @@ fn auto_constrain_datum(s: &mut Session, p: &Value) -> Result<Value> {
 fn auto_constrain_finish(s: &mut Session, p: &Value) -> Result<Value> {
     let r = auto(s, p, "sketch.finish_auto_constrain")?;
     s.active_sketch = None;
+    s.sketching_view = None;
     s.revision += 1;
     Ok(r)
 }
@@ -444,26 +448,86 @@ fn toggle_driven(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.toggle_driven";
     let cid = str_(p, "constraint").ok_or_else(|| bad(cmd, "`constraint` must be a dimension id"))?.to_string();
     let want = crate::params::bool_(p, "driven");
+    let driven_name = str_(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+    if s.sheet_sketching() && driven_name.is_some() {
+        return Err(bad(cmd, "a sheet sketch dimension cannot define a parameter"));
+    }
+    if let Some(reply) = super::sketch_3d::toggle_driven_3d(s, p, cmd, &cid, want, driven_name.as_deref())? {
+        return Ok(reply);
+    }
     let mut before = None;
-    let (driven, info) = edit(s, p, cmd, true, |sk, doc| {
+    let ((driven, param_out), info) = edit(s, p, cmd, true, |sk, doc| {
         let c = sk.constraints.iter().find(|c| c.id == cid).cloned().ok_or_else(|| bad(cmd, format!("no constraint `{cid}`")))?;
         let v = c.kind.value().ok_or_else(|| bad(cmd, format!("`{cid}` is not a dimension")))?;
         let driven = want.unwrap_or(!c.driven);
         if driven == c.driven {
-            return Ok(driven);
+            if driven && let Some(ref dname) = driven_name {
+                if c.driven_param.as_deref() == Some(dname.as_str()) {
+                    return Ok((true, Some(dname.clone())));
+                }
+                if let Some(old) = c.driven_param.as_deref() {
+                    doc.rename_param(old, dname)?;
+                    if let Some(slot) = sk.constraints.iter_mut().find(|c| c.id == cid) {
+                        slot.driven_param = Some(dname.clone());
+                    }
+                    return Ok((true, Some(dname.clone())));
+                }
+                if let Some(why) = solidcraft_doc::Document::param_name_problem(dname) {
+                    return Err(bad(cmd, format!("name: {why}")));
+                }
+                if doc.param(dname).is_some()
+                    || doc.text_param(dname).is_some()
+                    || doc.is_driven_param(dname)
+                    || doc.features.iter().any(|f| f.param_names.iter().any(|x| x == dname))
+                {
+                    return Err(bad(cmd, format!("name: there is already a parameter `{dname}`")));
+                }
+                if let Some(slot) = sk.constraints.iter_mut().find(|c| c.id == cid) {
+                    slot.driven_param = Some(dname.clone());
+                }
+                return Ok((true, Some(dname.clone())));
+            }
+            return Ok((driven, None));
         }
         let slot = sk.constraints.iter_mut().find(|c| c.id == cid).ok_or_else(|| bad(cmd, "constraint"))?;
         if driven {
+            let old_param = slot.param.take();
             slot.driven = true;
-            slot.param = None;
-        } else {
-            let (unit, e) =
-                if c.kind.is_angle() { ("deg".into(), format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6)) } else { doc.design_length(v) };
-            slot.driven = false;
-            slot.param = Some(doc.new_model_param(&e, &unit));
-            before = None;
+            if let Some(ref dname) = driven_name {
+                if let Some(why) = solidcraft_doc::Document::param_name_problem(dname) {
+                    return Err(bad(cmd, format!("name: {why}")));
+                }
+                let reusing_own = old_param.as_deref() == Some(dname.as_str()) && doc.param(dname).is_some_and(|p| p.model);
+                if !reusing_own
+                    && (doc.param(dname).is_some()
+                        || doc.text_param(dname).is_some()
+                        || doc.is_driven_param(dname)
+                        || doc.features.iter().any(|f| f.param_names.iter().any(|x| x == dname)))
+                {
+                    return Err(bad(cmd, format!("name: there is already a parameter `{dname}`")));
+                }
+                if reusing_own {
+                    doc.params.retain(|p| p.name != *dname);
+                }
+                slot.driven_param = Some(dname.clone());
+                return Ok((true, Some(dname.clone())));
+            }
+            slot.driven_param = None;
+            return Ok((true, None));
         }
-        Ok(driven)
+        let (unit, e) =
+            if c.kind.is_angle() { ("deg".into(), format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6)) } else { doc.design_length(v) };
+        let old_driven = slot.driven_param.take();
+        slot.driven = false;
+        slot.param = Some(match old_driven {
+            Some(old_name) => {
+                doc.params.push(solidcraft_doc::Param { name: old_name.clone(), expr: e, unit, comment: String::new(), model: true });
+                old_name
+            }
+            None => doc.new_model_param(&e, &unit)?,
+        });
+        before = None;
+        Ok((false, None))
     })?;
     if !driven {
         // Making it driving must not over-constrain: compare with the sketch without it.
@@ -479,7 +543,31 @@ fn toggle_driven(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     s.doc_mut().prune_model_params();
-    reply(cmd, ToggleDrivenResult { constraint: cid, driven, sketch: info, created: None, param_warnings: Vec::new() })
+    reply(cmd, ToggleDrivenResult { constraint: cid, driven, param: param_out, sketch: info, created: None, param_warnings: Vec::new() })
+}
+
+/// What a radius / diameter toggle acts on.
+#[derive(Clone, Copy)]
+enum Target {
+    /// A circle or an arc.
+    Round(usize),
+    /// A point and the reference line it is measured from.
+    Linear(usize, usize),
+}
+
+/// Whether line `l` is a reference line a distance can be shown across as a diameter: a
+/// construction line, a centreline, or a sketch or origin axis.
+fn reference_line(sk: &Sketch, l: usize) -> bool {
+    let Some(c) = sk.curves.get(l) else {
+        return false;
+    };
+    matches!(c.kind, CurveKind::Line { .. })
+        && (c.construction
+            || c.centerline
+            || c.link
+                .as_deref()
+                .and_then(|k| sk.link(k))
+                .is_some_and(|k| matches!(k.source, solidcraft_sketch::LinkSource::Axis { .. } | solidcraft_sketch::LinkSource::SketchAxis { .. })))
 }
 
 fn toggle_diameter(s: &mut Session, p: &Value) -> Result<Value> {
@@ -490,19 +578,31 @@ fn toggle_diameter(s: &mut Session, p: &Value) -> Result<Value> {
     let (diameter, info) = edit(s, p, cmd, true, |sk, doc| {
         let c = sk.constraints.iter().find(|c| c.id == cid).cloned().ok_or_else(|| bad(cmd, format!("no constraint `{cid}`")))?;
         let round = |curve: usize| matches!(sk.curves.get(curve).map(|c| &c.kind), Some(CurveKind::Circle { .. } | CurveKind::Arc { .. }));
+        // A circle or arc (radius / diameter), or a point measured from a reference line (a
+        // construction line, a centreline or an axis): the distance, or twice it (#20660).
         let (curve, value, now) = match c.kind {
-            ConstraintKind::Radius { c, value } if round(c) => (c, value, false),
-            ConstraintKind::Diameter { c, value } if round(c) => (c, value, true),
-            _ => return Err(bad(cmd, format!("`{cid}` is not a circle's or an arc's radius or diameter dimension"))),
+            ConstraintKind::Radius { c, value } if round(c) => (Target::Round(c), value, false),
+            ConstraintKind::Diameter { c, value } if round(c) => (Target::Round(c), value, true),
+            ConstraintKind::PointLineDistance { p, l, value } if reference_line(sk, l) => (Target::Linear(p, l), value, false),
+            ConstraintKind::LinearDiameter { p, l, value } => (Target::Linear(p, l), value, true),
+            _ => {
+                return Err(bad(
+                    cmd,
+                    format!("`{cid}` is not a circle's or an arc's radius or diameter dimension, or a distance from a construction line"),
+                ));
+            }
         };
         let diameter = want.unwrap_or(!now);
         if diameter == now {
             return Ok(diameter);
         }
-        let (kind, value) = if diameter {
-            (ConstraintKind::Diameter { c: curve, value: 2.0 * value }, 2.0 * value)
-        } else {
-            (ConstraintKind::Radius { c: curve, value: value / 2.0 }, value / 2.0)
+        // The geometry keeps its size: the value shown doubles or halves.
+        let value = if diameter { 2.0 * value } else { value / 2.0 };
+        let kind = match (curve, diameter) {
+            (Target::Round(c), true) => ConstraintKind::Diameter { c, value },
+            (Target::Round(c), false) => ConstraintKind::Radius { c, value },
+            (Target::Linear(p, l), true) => ConstraintKind::LinearDiameter { p, l, value },
+            (Target::Linear(p, l), false) => ConstraintKind::PointLineDistance { p, l, value },
         };
         // Its parameter now holds the other measure, so the circle keeps its size; another user
         // of that parameter would change size with it.
@@ -600,7 +700,7 @@ fn glyphs(s: &mut Session, p: &Value) -> Result<Value> {
             dimension: c.kind.is_dimension(),
             driven: c.driven,
             value: c.kind.value(),
-            param: c.param.clone(),
+            param: c.param.clone().or_else(|| c.driven_param.clone()),
             at: anchor(&ss.sketch, &c.kind).map(|a| [a.x, a.y]),
             failing: failing.contains(&c.id),
             // Implied by the others (it removes no freedom) but holding: shown dimmed.
@@ -610,8 +710,9 @@ fn glyphs(s: &mut Session, p: &Value) -> Result<Value> {
     let result = GlyphsResult {
         sketch: id,
         glyphs,
-        dof: ss.report.dof,
-        fully_constrained: ss.report.fully_constrained(),
+        dof: ss.report.shown_dof(),
+        planar_dof: ss.report.dof,
+        fully_constrained: ss.report.shown_dof() == 0,
         conflicts: failing.clone(),
         param_warnings: Vec::new(),
     };

@@ -188,11 +188,25 @@ fn looped(curves: &mut [BSplineCurve], tol: f64) -> solidcore::Result<Out<()>> {
 
 /// A sheet of one face on `surface`, over its whole natural box.
 pub(crate) fn sheet(k: &mut Kernel, surface: BSplineSurface) -> solidcore::Result<Out<Brep>> {
+    sheet_starting(k, surface, None)
+}
+
+/// [`sheet`], its loop starting at the edge on side `first` of the box when given (the kernel's
+/// `start_at_side`): a sheet made again on an edited surface lists its edges as the one it
+/// replaces did.
+pub(crate) fn sheet_starting(
+    k: &mut Kernel,
+    surface: BSplineSurface,
+    first: Option<solidcore::surface::side::BoxSide>,
+) -> solidcore::Result<Out<Brep>> {
     let mut b = new_brep(k, USE_DEFAULT, USE_DEFAULT)?;
     let surface = Surface::from(surface);
     let bx = surface.natural_uv_domain_with_nurb(k)?;
-    face_on(k, &mut b, surface, &bx)?;
+    let f = face_on(k, &mut b, surface, &bx)?;
     b.refresh_cached_topology();
+    if let Some(first) = first {
+        solidcore::topology::brep::sheet::start_at_side(k, &mut b, f, first)?;
+    }
     finish(k, b, Expect::FACES)
 }
 
@@ -361,6 +375,7 @@ pub fn reverse_sheet(sheet: &Record) -> Result<(Record, Vec<u32>)> {
 mod tests {
     use super::*;
     use solidcore::eval::SurfaceEval;
+    use solidcore::math::det;
     use solidcore_record::brep::{Face, Frame};
 
     fn line(start: [f64; 3], end: [f64; 3]) -> Curve {
@@ -644,7 +659,7 @@ mod tests {
         (0..5)
             .map(|i| {
                 let a = std::f64::consts::TAU * f64::from(i) / 5.0;
-                let (x, y) = (10.0 * a.cos(), 10.0 * a.sin());
+                let (x, y) = (10.0 * det::cos(a), 10.0 * det::sin(a));
                 [x, y, z(x, y)]
             })
             .collect()
@@ -702,11 +717,11 @@ mod tests {
         // five arcs of the circle z = 6 on the sphere of radius 10 (radius 8), as rational
         // quadratics
         let half = std::f64::consts::PI / 5.0;
-        let w = half.cos();
+        let w = det::cos(half);
         let arcs: Vec<Curve> = (0..5)
             .map(|i| {
                 let a = 2.0 * half * f64::from(i);
-                let on = |t: f64, r: f64| [r * t.cos(), r * t.sin(), 6.0];
+                let on = |t: f64, r: f64| [r * det::cos(t), r * det::sin(t), 6.0];
                 let (s, m, e) = (on(a, 8.0), on(a + half, 8.0 / w), on(a + 2.0 * half, 8.0));
                 Curve::RationalSpline {
                     knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],

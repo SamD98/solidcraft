@@ -63,6 +63,7 @@ use crate::ssi::case::SurfaceSpec;
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, CaseSource, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// The op status of an op the runner does not run (undefined upstream).
 const REJECTED: f64 = -2.0;
@@ -352,9 +353,41 @@ fn st<T>(o: &mut Vec<f64>, r: solidcore::Result<T>) -> Result<Option<T>, Fail> {
             if let Some(d) = Output::unported(&e) {
                 return Err(Fail::Deferred(Box::new(d)));
             }
+            #[cfg(test)]
+            witness::error(&e);
             o.push(status(&e));
             Ok(None)
         }
+    }
+}
+
+/// The errors the run's ops returned, for the proof test of the statuses passed on
+/// (WR-662, #18927). Off unless a test calls [`witness::start`] on its thread.
+#[cfg(test)]
+pub(super) mod witness {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<solidcore::SolidError>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts recording on this thread.
+    pub fn start() {
+        LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stops recording and returns the errors recorded, in order.
+    pub fn take() -> Vec<solidcore::SolidError> {
+        LOG.with(|l| l.borrow_mut().take()).unwrap_or_default()
+    }
+
+    /// Records an op's error when recording.
+    pub fn error(e: &solidcore::SolidError) {
+        LOG.with(|l| {
+            if let Some(v) = l.borrow_mut().as_mut() {
+                v.push(e.clone());
+            }
+        });
     }
 }
 
@@ -900,7 +933,7 @@ fn gen_plane(rng: &mut Rng, s: f64, near: Option<([f64; 3], f64)>) -> SurfaceIn 
             };
             let x0 = norm(cross(n, a));
             let y0 = cross(n, x0);
-            let (c, sn) = (tilt.cos(), tilt.sin());
+            let (c, sn) = (det::cos(tilt), det::sin(tilt));
             let x = [
                 x0[0] * c + n[0] * sn,
                 x0[1] * c + n[1] * sn,
@@ -956,7 +989,7 @@ fn gen_bspline(rng: &mut Rng, s: f64, tube: bool) -> SurfaceIn {
         for j in 0..nv {
             let (x, y, z) = if tube {
                 let a = core::f64::consts::TAU * (i % (nu - 1)) as f64 / (nu - 1) as f64;
-                (s * a.cos(), s * a.sin(), s * j as f64 / (nv - 1) as f64)
+                (s * det::cos(a), s * det::sin(a), s * j as f64 / (nv - 1) as f64)
             } else {
                 (
                     s * i as f64 / (nu - 1) as f64,
@@ -1634,3 +1667,7 @@ impl UnitDiff for Runner {
         rust(&case.parse()?)
     }
 }
+
+#[cfg(test)]
+#[path = "intersect_surface_intersector_p2/status_proof.rs"]
+mod status_proof;

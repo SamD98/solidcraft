@@ -36,6 +36,7 @@
 //!   `d[i][j]`, not one flat array.
 //! - **Bounds.** `T2` reads 0 past its orders (the fork's operands always share them).
 
+use crate::math::det;
 use core::cmp::Ordering;
 
 use super::form::{gn_form, gn_form_t, Bern};
@@ -44,6 +45,7 @@ use super::section::gn_equal_area_w;
 use super::series::{Ser, Trunc, VSer, MAX_E, MAX_K, MAX_S};
 use super::station::{feet_on_knots, gn_solve_station_with, GnStation, StationOptions};
 use super::tay::{gn_area_sum, gn_half_angle, gn_invert, gn_target, gn_wedge_cos, Ring, Tay, TAY};
+use crate::error::blend::{BlendFailure, SectionDegeneracy};
 use crate::error::{Result, SolidError};
 use crate::geom::vector3d::Vec3;
 use crate::kernel::Kernel;
@@ -70,7 +72,7 @@ impl T2Scalar for f64 {
         self > 0.0 && self.is_finite()
     }
     fn pow_of(self, p: f64) -> Self {
-        self.powf(p)
+        det::powf(self, p)
     }
 }
 
@@ -100,7 +102,66 @@ pub struct T2Of<Z> {
     s: usize,
     e: usize,
     n: usize,
-    c: Vec<Z>,
+    c: Coefficients<Z>,
+}
+
+/// How many coefficients a [`T2Of`] holds without allocating: orders (2, 2), what a
+/// surface's partials to second order take.
+const INLINE: usize = 9;
+
+/// A [`T2Of`]'s coefficients: in place up to [`INLINE`] of them, else on the heap. Not the
+/// fork's: its series are arrays on the stack; here a series of small orders, the ones a
+/// point evaluation makes thousands of, allocates nothing. Read as a slice either way.
+#[derive(Clone)]
+enum Coefficients<Z> {
+    Inline { len: usize, c: [Z; INLINE] },
+    Heap(Vec<Z>),
+}
+
+impl<Z: Copy> Coefficients<Z> {
+    /// `len` copies of `zero`.
+    fn filled(len: usize, zero: Z) -> Self {
+        if len <= INLINE {
+            Self::Inline {
+                len,
+                c: [zero; INLINE],
+            }
+        } else {
+            Self::Heap(vec![zero; len])
+        }
+    }
+}
+
+impl<Z> core::ops::Deref for Coefficients<Z> {
+    type Target = [Z];
+    fn deref(&self) -> &[Z] {
+        match self {
+            Self::Inline { len, c } => c.get(..*len).unwrap_or(&[]),
+            Self::Heap(v) => v,
+        }
+    }
+}
+
+impl<Z> core::ops::DerefMut for Coefficients<Z> {
+    fn deref_mut(&mut self) -> &mut [Z] {
+        match self {
+            Self::Inline { len, c } => c.get_mut(..*len).unwrap_or(&mut []),
+            Self::Heap(v) => v,
+        }
+    }
+}
+
+/// Written as the list of coefficients, as the `Vec` it replaced writes them.
+impl<Z: core::fmt::Debug> core::fmt::Debug for Coefficients<Z> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<Z: PartialEq> PartialEq for Coefficients<Z> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
 }
 
 /// `sm_T2`: [`T2Of`] in doubles.
@@ -116,7 +177,7 @@ impl<Z: Ring> T2Of<Z> {
     /// `sm_T2Of(lS, lE, d, lN)`: the constant d, kept to total order `n`.
     #[must_use]
     pub fn with_order(s: usize, e: usize, d: Z, n: usize) -> Self {
-        let mut c = vec![Z::lift(0.0); (s + 1) * (e + 1)];
+        let mut c = Coefficients::filled((s + 1) * (e + 1), Z::lift(0.0));
         if let Some(c0) = c.first_mut() {
             *c0 = d;
         }
@@ -155,7 +216,7 @@ impl<Z: Ring> T2Of<Z> {
     #[must_use]
     pub fn add(&self, b: &Self) -> Self {
         let mut r = Self::with_order(self.s, self.e, Z::lift(0.0), self.n);
-        for ((x, &p), &q) in r.c.iter_mut().zip(&self.c).zip(b.c.iter()) {
+        for ((x, &p), &q) in r.c.iter_mut().zip(self.c.iter()).zip(b.c.iter()) {
             *x = p + q;
         }
         r
@@ -165,7 +226,7 @@ impl<Z: Ring> T2Of<Z> {
     #[must_use]
     pub fn sub(&self, b: &Self) -> Self {
         let mut r = Self::with_order(self.s, self.e, Z::lift(0.0), self.n);
-        for ((x, &p), &q) in r.c.iter_mut().zip(&self.c).zip(b.c.iter()) {
+        for ((x, &p), &q) in r.c.iter_mut().zip(self.c.iter()).zip(b.c.iter()) {
             *x = p - q;
         }
         r
@@ -175,7 +236,7 @@ impl<Z: Ring> T2Of<Z> {
     #[must_use]
     pub fn scale(&self, d: Z) -> Self {
         let mut r = Self::with_order(self.s, self.e, Z::lift(0.0), self.n);
-        for (x, &p) in r.c.iter_mut().zip(&self.c) {
+        for (x, &p) in r.c.iter_mut().zip(self.c.iter()) {
             *x = p * d;
         }
         r
@@ -185,6 +246,30 @@ impl<Z: Ring> T2Of<Z> {
     #[must_use]
     pub fn mul(&self, b: &Self) -> Self {
         let mut r = Self::with_order(self.s, self.e, Z::lift(0.0), self.n);
+        if b.s >= self.s && b.e >= self.e {
+            // b holds every coefficient the product reads: the same sums, term by term in the
+            // same order, read straight from the two arrays
+            let (wa, wb) = (self.e + 1, b.e + 1);
+            let zero = Z::lift(0.0);
+            let a_at = |i: usize, j: usize| self.c.get(i * wa + j).copied().unwrap_or(zero);
+            let b_at = |i: usize, j: usize| b.c.get(i * wb + j).copied().unwrap_or(zero);
+            for i in 0..=self.s {
+                let mut j = 0;
+                while j <= self.e && i + j <= self.n {
+                    let mut d = zero;
+                    for i1 in 0..=i {
+                        for j1 in 0..=j {
+                            d = d + a_at(i1, j1) * b_at(i - i1, j - j1);
+                        }
+                    }
+                    if let Some(x) = r.c.get_mut(i * wa + j) {
+                        *x = d;
+                    }
+                    j += 1;
+                }
+            }
+            return r;
+        }
         for i in 0..=self.s {
             let mut j = 0;
             while j <= self.e && i + j <= self.n {
@@ -213,9 +298,9 @@ impl<Z: Ring> T2Of<Z> {
 pub fn t2_pow<Z: T2Scalar>(x: &T2Of<Z>, p: f64) -> Result<T2Of<Z>> {
     let x0 = x.constant();
     if !x0.positive_finite() {
-        return Err(SolidError::blend_failed(
+        return Err(SolidError::blend(
             OP,
-            "the section degenerates at this point (a weight or a length is zero)",
+            BlendFailure::SectionDegenerate(SectionDegeneracy::WeightOrLengthZero),
         ));
     }
     let mut z = x.scale(Z::lift(1.0) / x0);
@@ -461,6 +546,9 @@ pub fn evaluate_definition(
         }
     }
     let mut r = def.offsets;
+    let equal_setback = def
+        .chamfer
+        .and_then(crate::surface::procedural_blend::chamfer::ChamferDefinition::constant_setback);
     let mut law_ser = Ser::constant(0.0_f64);
     let mut law: Option<&Ser<f64>> = None;
     if let Some(curve) = &def.law {
@@ -471,21 +559,27 @@ pub fn evaluate_definition(
                 fact *= i as f64;
             }
             let di = d.get(i).ok_or_else(|| {
-                SolidError::blend_failed(OP, "the radius law has no derivative of this order")
+                SolidError::blend(
+                    OP,
+                    BlendFailure::Defect {
+                        why: "the radius law's evaluation returned fewer derivatives than \
+                              asked: a B-spline curve's evaluation returns every order up to \
+                              the one asked",
+                    },
+                )
             })?;
             law_ser.set(i, 0, di.x / fact);
         }
-        let d0 = d
-            .first()
-            .ok_or_else(|| SolidError::blend_failed(OP, "the radius law has no value"))?;
-        if d0.x.partial_cmp(&0.0) != Some(Ordering::Greater) {
+        // the law's value: its series' constant term, the value divided by 0! = 1 (exact)
+        let d0 = law_ser.at(0, 0);
+        if d0.partial_cmp(&0.0) != Some(Ordering::Greater) {
             // "its radius law is not positive here"
-            return Err(SolidError::blend_failed(
+            return Err(SolidError::blend(
                 OP,
-                "the radius law is not positive here",
+                BlendFailure::RadiusLawNotPositive { s, radius: d0 },
             ));
         }
-        r = [d0.x, d0.x];
+        r = [d0, d0];
         law = Some(&law_ser);
     }
 
@@ -524,16 +618,6 @@ pub fn evaluate_definition(
         } else {
             0
         };
-        let opts = StationOptions {
-            law,
-            top,
-            sides: None,
-            before,
-        };
-        let (solved, steps) =
-            gn_solve_station_with(k, faces, &def.leader, s, seed, r, def.sides, tr, tol, opts);
-        count_solve(k, steps);
-        let mut st = solved?.0;
         // a foot on a knot line of its support: the support's partials there on the
         // piece the foot moves into along s (comes from, `before`), as the stations'
         // series were taken; the way it moves is the seed's (the stations' feet and
@@ -541,10 +625,16 @@ pub fn evaluate_definition(
         let mut dir = [0.0_f64; 4];
         for (f, sd) in def.seeds.iter().enumerate() {
             let w = sd.evaluate(s, 1, !before, false)?;
-            let w1 = w
-                .get(1)
-                .copied()
-                .ok_or_else(|| SolidError::blend_failed(OP, "the seed has no derivative"))?;
+            let w1 = w.get(1).copied().ok_or_else(|| {
+                SolidError::blend(
+                    OP,
+                    BlendFailure::Defect {
+                        why: "the seed's evaluation to first order returned no derivative: \
+                                  a B-spline curve's evaluation returns every order up to the \
+                                  one asked",
+                    },
+                )
+            })?;
             if let Some(x) = dir.get_mut(2 * f) {
                 *x = w1.x;
             }
@@ -552,11 +642,32 @@ pub fn evaluate_definition(
                 *x = w1.y;
             }
         }
+        // a seed that stands on such a line (at one of the definition's stations, placed
+        // where a foot crosses the line) names its pieces before the solve: a support is
+        // only as smooth across the line as its knot allows, and where its normal differs
+        // on the two sides a solve that takes the piece each iterate's value is in has
+        // no fixed point on the line (each piece's foot lies on the other's side)
+        let (seeded, _) = feet_on_knots(k, faces, seed, dir, before, tr.s() + tr.e() + 1)?;
+        let pinned = seeded.iter().any(|&q| q != 0);
+        let opts = StationOptions {
+            law,
+            equal_setback,
+            top,
+            sides: pinned.then_some(seeded),
+            before,
+        };
+        let (solved, steps) =
+            gn_solve_station_with(k, faces, &def.leader, s, seed, r, def.sides, tr, tol, opts);
+        count_solve(k, steps);
+        let mut st = solved?.0;
         let on = st.x.map(|x| x.at(0, 0));
         let (sides, other) = feet_on_knots(k, faces, on, dir, before, tr.s() + tr.e() + 1)?;
-        if other {
+        // (solved again where the feet's pieces are not the ones the solve took: the
+        // spans of their values without sides, the seed's with them)
+        if if pinned { sides != seeded } else { other } {
             let opts = StationOptions {
                 law,
+                equal_setback,
                 top,
                 sides: Some(sides),
                 before,
@@ -573,16 +684,20 @@ pub fn evaluate_definition(
         // (the leader's derivatives to order s + 1 enter, its unit tangent's; the law's
         // to order s; a curve is C^(p - multiplicity) at a knot, its derivatives to
         // that order the same either side)
-        let along = [(Some(&def.leader), ts + 1), (def.law.as_ref(), ts)];
-        for (curve, used) in along {
+        let along = [
+            (Some(&def.leader), ts + 1, false),
+            (def.law.as_ref(), ts, true),
+        ];
+        for (curve, used, is_law) in along {
             if sided {
                 break;
             }
             let Some(curve) = curve else {
                 continue;
             };
-            let (knots, mult) = curve.knots(None)?;
-            let deg = curve.degree()?;
+            // (the same at every station: kept with the definition's identity)
+            let (knots, mult, deg) = identity.knots(curve, is_law)?;
+            let deg = *deg;
             let mut m = 1;
             while m + 1 < knots.len() && m < mult.len() {
                 let (Some(&km), Some(&mm)) = (knots.get(m), mult.get(m)) else {
@@ -640,9 +755,9 @@ pub fn evaluate_definition(
             let d = gn_area_sum(n, Tay::of_terms(w0, 1.0));
             if d.at(1).partial_cmp(&0.0) != Some(Ordering::Less) {
                 // "the section's area does not fall with its thumbweight"
-                return Err(SolidError::blend_failed(
+                return Err(SolidError::blend(
                     OP,
-                    "the section's area does not fall with its thumbweight",
+                    BlendFailure::SectionDegenerate(SectionDegeneracy::AreaDoesNotFall),
                 ));
             }
             let ws = gn_invert(&gn_target(&u), &d, w0);
@@ -810,9 +925,9 @@ mod tests {
         let error = t2_pow(&T2::new(1, 1, 0.0), 0.5).unwrap_err();
         assert_eq!(
             error,
-            SolidError::blend_failed(
+            SolidError::blend(
                 OP,
-                "the section degenerates at this point (a weight or a length is zero)"
+                BlendFailure::SectionDegenerate(SectionDegeneracy::WeightOrLengthZero)
             )
         );
         assert_eq!(error.upstream_status(), Some(crate::error::SM_ERR));

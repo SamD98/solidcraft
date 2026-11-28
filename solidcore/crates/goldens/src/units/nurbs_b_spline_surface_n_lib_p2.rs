@@ -45,6 +45,7 @@ use solidcore::SolidError;
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, CaseSource, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Generated cases per run, whatever `--seeds` says (it can only raise this).
 pub const MIN_GENERATED: usize = 600;
@@ -501,6 +502,17 @@ fn side(left: bool) -> Side {
     } else {
         Side::Right
     }
+}
+
+/// The unit's Rust run of `case` on the caller's kernel `k` (a fresh default kernel in
+/// the unit's own runs), so a test can read what the kernel's diagnostics recorded
+/// (e.g. [`Kernel::coons_tangency_log`]).
+///
+/// # Errors
+///
+/// As the unit's runner.
+pub fn run_case_on(k: &Kernel, case: &Case) -> Result<Output, HarnessError> {
+    rust(k, &case.parse()?)
 }
 
 fn rust(k: &Kernel, i: &Inputs) -> Result<Output, HarnessError> {
@@ -1133,7 +1145,7 @@ fn plane_loop(rng: &mut Rng, k: usize) -> (Vec<InlineCrv>, Vec<InlineCrv>, Inlin
     let uvs: Vec<[f64; 2]> = (0..k)
         .map(|i| {
             let a = std::f64::consts::TAU * i as f64 / k as f64 + std::f64::consts::PI;
-            [0.5 + 0.3 * a.cos(), 0.5 + 0.3 * a.sin()]
+            [0.5 + 0.3 * det::cos(a), 0.5 + 0.3 * det::sin(a)]
         })
         .collect();
     let to3 = |uv: [f64; 2]| [4.0 * uv[0], 4.0 * uv[1], z0 + 4.0 * uv[1] * tilt];
@@ -1323,8 +1335,8 @@ fn gen_analytic_corner(rng: &mut Rng) -> Inputs {
             let t = turn + std::f64::consts::TAU * i as f64 / sides as f64;
             let t = if reverse { -t } else { t };
             [
-                0.5 * (lo.x + hi.x) + frac * (hi.x - lo.x) * t.cos(),
-                0.5 * (lo.y + hi.y) + frac * (hi.y - lo.y) * t.sin(),
+                0.5 * (lo.x + hi.x) + frac * (hi.x - lo.x) * det::cos(t),
+                0.5 * (lo.y + hi.y) + frac * (hi.y - lo.y) * det::sin(t),
             ]
         };
         let mut c3 = Vec::with_capacity(sides);

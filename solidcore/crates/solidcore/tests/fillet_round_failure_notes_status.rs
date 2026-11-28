@@ -6,9 +6,10 @@
 //! (first, then) pairs, and the part's own edges of both together. Where a round fails, the
 //! session's error info names it: a nonzero code and a comment.
 //!
-//! With `offset_extension_from_base`, `fillet_refuse_overlapping_bands` and
-//! `offset_extension_as_itself` (the least set under which it shows; any one of them off and the
-//! round builds), the arc's round followed by the front edge's fails in the rollover
+//! With the bands' overlap check and the offsets extended from the base and continued as
+//! themselves (once three flags, now the only path, #18921; the least set under which it shows;
+//! any one of them off and the round builds), the arc's round followed by the front edge's fails
+//! in the rollover
 //! (`SM_ERR_NULL_POINTER` from `blend::fillet_solver::p5`) and noted nothing: code 0 and no
 //! comment. It now notes `SM_FILERR_EDGE_PROBLEM` (4) with what failed.
 //!
@@ -28,6 +29,7 @@ use solidcore::blend::fillet_solver::p1::FilletSurfaceGeneratorType;
 use solidcore::boolean::api_brep::boolean_union;
 use solidcore::curve::curve::Curve;
 use solidcore::geom::global_solver::SolverOperation;
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3, BIG_DOUBLE};
 use solidcore::nurbs::knots::Side;
 use solidcore::primitive::api_curves::{create_arc, create_line_segment};
@@ -41,13 +43,10 @@ use solidcore::topology::face::p2 as face;
 use solidcore::topology::{edge, vertex, EdgeId, VertexId};
 use solidcore::{Brep, Kernel};
 
-/// The default kernel with the three fixes under which the rollover failure shows.
+/// The default kernel: the three once-flagged fixes under which the rollover failure shows are
+/// now its only path.
 fn kernel() -> Kernel {
-    let mut k = Kernel::default();
-    k.fixes.offset_extension_from_base = true;
-    k.fixes.fillet_refuse_overlapping_bands = true;
-    k.fixes.offset_extension_as_itself = true;
-    k
+    Kernel::default()
 }
 
 const X0: f64 = 41.0 + 1.0 / 6.0;
@@ -77,7 +76,7 @@ fn arc_part(k: &mut Kernel) -> Brep {
 const LONG: [f64; 3] = [20.0, -21.0, 10.0];
 fn arc_top() -> [f64; 3] {
     let a = std::f64::consts::FRAC_PI_4;
-    [CX - 21.0 * a.cos(), -21.0 + 21.0 * a.sin(), 10.0]
+    [CX - 21.0 * det::cos(a), -21.0 + 21.0 * det::sin(a), 10.0]
 }
 const BACK: [f64; 3] = [30.0, 0.0, 10.0];
 const UPRIGHT: [f64; 3] = [X0, -21.0, 5.0];
@@ -179,7 +178,7 @@ fn chain(k: &Kernel, b: &Brep, at: [f64; 3]) -> Vec<EdgeId> {
                     continue;
                 }
                 if let Some(d) = leaving(k, b, e, v) {
-                    if d.dot(arrive) > 1.0_f64.to_radians().cos() {
+                    if d.dot(arrive) > det::cos(1.0_f64.to_radians()) {
                         next = Some(e);
                     }
                 }
@@ -311,7 +310,11 @@ fn every_failure_notes_its_status() {
 }
 
 /// With the three fixes the arc's round followed by the front edge's fails in the rollover and
-/// notes it: `SM_FILERR_EDGE_PROBLEM` with what failed, not code 0.
+/// notes it: `SM_FILERR_EDGE_PROBLEM` with what failed, not code 0. Since
+/// tangency-labs/solidcraft#16686 the trace's flush that fails there fails the solver's
+/// geometry step, which notes it as upstream's step does ("Fillet Surface Computation
+/// Failure", at the solver's edge); before, the failure surfaced later unnoted, and the
+/// session noted it with the error's text after a ": ".
 #[test]
 fn the_rollover_failure_notes_its_status() {
     let failed = failures(arc_top(), LONG);
@@ -320,10 +323,7 @@ fn the_rollover_failure_notes_its_status() {
         .expect("the second round fails with the three fixes");
     assert_eq!(*which, "second");
     assert_eq!(*code, 4, "{comment}");
-    assert!(
-        comment.starts_with("Fillet Surface Computation Failure: "),
-        "{comment}"
-    );
+    assert_eq!(comment, "Fillet Surface Computation Failure");
 }
 
 /// Every vertex's point and tolerance; every edge's tolerance, its curve's points at the start,
@@ -360,7 +360,7 @@ fn shape(k: &Kernel, b: &Brep) -> Vec<u64> {
 #[test]
 fn a_failed_round_leaves_the_body_as_it_was() {
     let mut k = Kernel::default();
-    let (s, c) = 10f64.to_radians().sin_cos();
+    let (s, c) = det::sin_cos(10f64.to_radians());
     let mut a = create_cylinder(&mut k, Point3::new(0.0, 0.0, -50.0), 20.0, 100.0).unwrap();
     let turn_a = [
         [c, s, 0.0, 0.0],
@@ -369,7 +369,7 @@ fn a_failed_round_leaves_the_body_as_it_was() {
         [0.0, 0.0, 0.0, 1.0],
     ];
     transform_matrix(&mut k, &mut a, &turn_a, true).unwrap();
-    let (s, c) = (-115f64).to_radians().sin_cos();
+    let (s, c) = det::sin_cos((-115f64).to_radians());
     let mut b = create_cylinder(&mut k, Point3::new(0.0, 0.0, -25.0), 18.9, 50.0).unwrap();
     let place_b = [
         [c, 0.0, -s, 0.0],
@@ -392,7 +392,7 @@ fn a_failed_round_leaves_the_body_as_it_was() {
             let start = curve.evaluate_point(&k, r.interval.evaluate(0.0)).unwrap();
             let mid = curve.evaluate_point(&k, r.interval.evaluate(0.5)).unwrap();
             (start - seam).length() < 1e-6
-                && (mid.x.hypot(mid.y) - 20.0).abs() < 1e-4
+                && (det::hypot(mid.x, mid.y) - 20.0).abs() < 1e-4
                 && mid.y.abs() > 1e-3
         })
         .collect();

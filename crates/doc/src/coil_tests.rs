@@ -23,6 +23,23 @@ fn an_old_coil_saves_unchanged() {
 }
 
 #[test]
+fn a_coil_cut_square_saves_its_end_cut() {
+    let v = json!({
+        "type": "coil",
+        "base": [0.0, 0.0, 0.0],
+        "axis": [0.0, 0.0, 1.0],
+        "diameter": "20",
+        "pitch": "7",
+        "turns": "4",
+        "section_size": "2",
+        "section": "circular",
+        "end_cut": "square",
+        "operation": "new_body"
+    });
+    assert_eq!(serde_json::to_value(kind(v.clone())).unwrap(), v);
+}
+
+#[test]
 fn a_coil_from_a_sketch_saves_its_sketch_and_profiles() {
     let v = json!({
         "type": "coil",
@@ -53,4 +70,20 @@ fn all_profiles_are_omitted() {
     let saved = serde_json::to_value(kind(v.clone())).unwrap();
     assert_eq!(saved, v);
     assert!(saved.get("profiles").is_none());
+}
+
+#[test]
+fn a_triangle_coil_from_an_end_face_saves_without_a_diameter() {
+    let v = json!({
+        "type": "coil",
+        "base": [0.0, 0.0, 0.0],
+        "axis": [0.0, 0.0, 1.0],
+        "axis_ref": {"type": "model", "geo": {"type": "face", "at": [5.0, 5.0, 40.0]}},
+        "pitch": "8",
+        "turns": "3",
+        "section_size": "2",
+        "section": "triangle",
+        "operation": "cut"
+    });
+    assert_eq!(serde_json::to_value(kind(v.clone())).unwrap(), v);
 }

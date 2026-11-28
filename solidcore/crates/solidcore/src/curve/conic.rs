@@ -64,6 +64,7 @@
 //!   unit.
 
 use crate::curve::curve::p2::{self as curve_p2, CONIC_TYPE};
+use crate::error::curve::CurveFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::geom_utility::p2::ContinuityType;
@@ -71,6 +72,7 @@ use crate::geom::polynomial::{solve_quadratic, solve_quartic};
 use crate::geom::tol::is_zero;
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::{Point3, Vec3};
+use crate::math::det;
 use crate::math::{EFF_ZERO, EFF_ZERO_SQRT, UNDEF_DOUBLE};
 use crate::topology::database_io::{DatabaseReader, FileType, InputStream};
 
@@ -450,9 +452,12 @@ impl Conic {
             return Ok(out);
         }
 
-        Err(SolidError::curve_failed(
+        Err(SolidError::curve(
             OP_EVALUATE,
-            "more than 2 derivatives were asked",
+            CurveFailure::TooManyDerivatives {
+                asked: num_derivs,
+                most: 2,
+            },
         ))
     }
 
@@ -553,8 +558,8 @@ impl Conic {
         // y' = -x*Sin + Y*Cos
         //   2           2
         // Ax  + Bxy + Cy  + Dx + Ey + F = 0
-        let sin = (-self.theta_rad).sin();
-        let cos = (-self.theta_rad).cos();
+        let sin = det::sin(-self.theta_rad);
+        let cos = det::cos(-self.theta_rad);
         let sin_sq = sin * sin;
         let cos_sq = cos * cos;
         let sin_cos = sin * cos;
@@ -729,8 +734,8 @@ impl Conic {
         let mut param2 = 0.0;
 
         let tmp = point - Vec3::from(self.origin);
-        let cos = (-self.theta_rad).cos();
-        let sin = (-self.theta_rad).sin();
+        let cos = det::cos(-self.theta_rad);
+        let sin = det::sin(-self.theta_rad);
         let local = Vec2::new(tmp.x * cos + tmp.y * sin, tmp.y * cos - tmp.x * sin);
 
         match self.kind {
@@ -803,15 +808,15 @@ impl Conic {
     /// translates it by `translation` (`Transform2D`).
     pub fn transform_2d(&mut self, ccw_rotation_rad: f64, translation: Point2) {
         self.theta_rad -= ccw_rotation_rad;
-        let cos = (-ccw_rotation_rad).cos();
-        let sin = (-ccw_rotation_rad).sin();
+        let cos = det::cos(-ccw_rotation_rad);
+        let sin = det::sin(-ccw_rotation_rad);
         let tmp = Vec2::new(
             self.origin.x * cos + self.origin.y * sin,
             self.origin.y * cos - self.origin.x * sin,
         );
         self.origin = tmp + translation;
-        self.cos_theta = self.theta_rad.cos();
-        self.sin_theta = self.theta_rad.sin();
+        self.cos_theta = det::cos(self.theta_rad);
+        self.sin_theta = det::sin(self.theta_rad);
     }
 
     /// Reads a conic written by `WriteToDB` (`ReadFromDB`): the type code, `a`,
@@ -869,8 +874,8 @@ impl Conic {
         conic.b = b;
         conic.origin = Vec2::new(orig_x, orig_y);
         conic.theta_rad = theta_rad;
-        conic.sin_theta = theta_rad.sin();
-        conic.cos_theta = theta_rad.cos();
+        conic.sin_theta = det::sin(theta_rad);
+        conic.cos_theta = det::cos(theta_rad);
         Ok(conic)
     }
 
@@ -928,7 +933,15 @@ mod tests {
         let v = e.evaluate(0.0, 2, true).unwrap();
         assert_eq!(v.len(), 3);
         assert_eq!(v[1], Vec3::new(0.0, 2.0, 0.0));
-        assert!(e.evaluate(0.0, 3, false).is_err());
+        let err = e.evaluate(0.0, 3, false).unwrap_err();
+        assert_eq!(
+            err.curve_failure(),
+            Some(&CurveFailure::TooManyDerivatives { asked: 3, most: 2 })
+        );
+        assert_eq!(
+            crate::error::upstream_status(&err),
+            Some(crate::error::SM_ERR)
+        );
         let p = e.evaluate(0.3, 0, false).unwrap();
         assert_eq!(p[0], e.evaluate_point(0.3));
     }
@@ -976,6 +989,31 @@ mod tests {
     }
 
     #[test]
+    fn circle_finds_all_four_crossings_with_a_nearly_tangent_ellipse() {
+        let circle = Conic::new(ConicType::Ellipse, 1.0, 1.0);
+        let (a, b, h) = (0.5, 0.71, 0.49999);
+        let mut ellipse = Conic::new(ConicType::Ellipse, a, b);
+        ellipse.transform_2d(0.0, Vec2::new(h, 0.0));
+
+        // Substitute y^2 = 1 - x^2 into (x - h)^2/a^2 + y^2/b^2 = 1.
+        // Both solutions for x are inside the circle, each with two opposite y values.
+        let aa = b * b - a * a;
+        let half_b = -h * b * b;
+        let cc = b * b * h * h + a * a * (1.0 - b * b);
+        let delta = (half_b * half_b - aa * cc).sqrt();
+        let hits = circle.intersect_conic(&ellipse, 1e-7).unwrap();
+        assert_eq!(hits.len(), 4);
+        for x in [(-half_b - delta) / aa, (-half_b + delta) / aa] {
+            let y = (1.0 - x * x).sqrt();
+            for expected in [Vec3::new(x, y, 0.0), Vec3::new(x, -y, 0.0)] {
+                assert!(hits
+                    .iter()
+                    .any(|hit| circle.evaluate_point(hit.param).distance(expected) < 1e-9));
+            }
+        }
+    }
+
+    #[test]
     fn knots_kind_eq() {
         let c = Conic::new(ConicType::Ellipse, 2.0, 1.0);
         assert_eq!(c.knots(None), (vec![-1.0, 3.0], vec![3, 3]));
@@ -998,7 +1036,7 @@ mod tests {
         let c = Conic::read_from_db(&mut db).unwrap();
         assert_eq!(c.conic_type(), ConicType::Hyperbola);
         assert_eq!(c.origin(), Vec2::new(1.0, 2.0));
-        assert_eq!(c.sin_cos_theta(), (0.25f64.sin(), 0.25f64.cos()));
+        assert_eq!(c.sin_cos_theta(), (det::sin(0.25f64), det::cos(0.25f64)));
 
         let mut bytes = 3u64.to_ne_bytes().to_vec();
         for v in [0.5, 0.0, 0.0, 0.0, 0.0f64] {

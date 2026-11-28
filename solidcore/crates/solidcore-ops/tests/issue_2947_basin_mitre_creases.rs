@@ -16,6 +16,10 @@
     clippy::panic,
     clippy::indexing_slicing
 )] // test
+use solidcore::math::det;
+
+#[path = "../../solidcore/tests/support/solidcraft_fixes.rs"]
+mod solidcraft_fixes;
 
 mod common;
 
@@ -46,11 +50,7 @@ const CORPUS: &str = concat!(
 
 /// The case's entry and its operand.
 fn case(name: &str) -> (Value, Body) {
-    let fixes: Vec<String> = serde_json::from_str(include_str!(
-        "../../solidcore/tests/kernel_cases/fixes.json"
-    ))
-    .unwrap();
-    session::set_thread_fixes(fixes.iter().map(String::as_str)).unwrap();
+    session::set_thread_fixes(solidcraft_fixes::solidcraft_fix_names()).unwrap();
     let entry = std::fs::read_to_string(format!("{CORPUS}/{name}.json")).unwrap();
     let e: Value = serde_json::from_str(&entry).unwrap();
     let gz = std::fs::File::open(format!("{CORPUS}/{name}.bodies.json.gz")).unwrap();
@@ -75,7 +75,7 @@ fn angle_at(k: &Kernel, b: &Brep, e: EdgeId, p: Point3) -> f64 {
     };
     let n = normal(face::surface(b, *f).unwrap().unwrap());
     let m = normal(face::surface(b, *g).unwrap().unwrap());
-    n.cross(m).length().atan2(n.dot(m).abs())
+    det::atan2(n.cross(m).length(), n.dot(m).abs())
 }
 
 /// `body` with the entry's edges rounded 4, picked at their points.

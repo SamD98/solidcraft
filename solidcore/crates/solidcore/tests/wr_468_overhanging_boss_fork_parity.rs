@@ -1,7 +1,7 @@
-//! Overhanging bosses rounded with the fork's Nx1 corner fixes on: WR-499
-//! (`fillet_nx1_opposite_continuation_side_edge`, 420e47d) and WR-457
-//! (`fillet_nx1_tangent_side_edge`), without which a boss's base arc that runs on past a
-//! wall as the overhang's rim fails at its corner (#1021). These cases were written for
+//! Overhanging bosses rounded with the fork's Nx1 corner fixes, now unconditional: WR-499
+//! (420e47d, part of WR-457's skip) and WR-457 (its flag `fillet_nx1_tangent_side_edge`
+//! is removed), without which a boss's base arc that runs on past a wall as the
+//! overhang's rim fails at its corner (#1021). These cases were written for
 //! WR-468 (`fillet_through_extended_rail_end`, the fork's tangency-labs/smlib@d33890f),
 //! which is removed (#2500); both rounded the same with and without it.
 //!
@@ -25,6 +25,7 @@ use solidcore::boolean::api_brep::boolean_union;
 use solidcore::curve::curve::Curve;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3, PI};
 use solidcore::primitive::api_curves::{create_arc, create_line_segment};
 use solidcore::primitive::api_primitives::{create_box, create_cylinder};
@@ -42,12 +43,9 @@ fn volume(k: &Kernel, b: &mut Brep) -> f64 {
     brep_volume(k, b, 1e-9, &attrs).unwrap()
 }
 
-/// The fork's Nx1 corner fixes on.
+/// The default kernel, where the fork's Nx1 corner fixes are unconditional.
 fn kernel() -> Kernel {
-    let mut k = Kernel::default();
-    k.fixes.fillet_nx1_opposite_continuation_side_edge = true;
-    k.fixes.fillet_nx1_tangent_side_edge = true;
-    k
+    Kernel::default()
 }
 
 /// The distance from `p` to edge `e`, over 4001 points along it.
@@ -116,7 +114,7 @@ fn added_by_the_round() -> f64 {
         let height = 2.0 - (4.0 - (12.0 - rho) * (12.0 - rho)).sqrt();
         for j in 0..n_turn {
             let t = (f64::from(j) + 0.5) * 2.0 * PI / f64::from(n_turn);
-            if in_outline(12.0 + rho * t.cos(), 32.0 + rho * t.sin()) {
+            if in_outline(12.0 + rho * det::cos(t), 32.0 + rho * det::sin(t)) {
                 added += height * rho * (2.0 / f64::from(n_rho)) * (2.0 * PI / f64::from(n_turn));
             }
         }
@@ -130,8 +128,8 @@ fn fork_4369_boss_rounds_to_its_closed_form() {
     let foot = [
         Point3::new(12.0, 22.0, 10.0),
         Point3::new(
-            12.0 + 10.0 * (PI / 6.0).cos(),
-            32.0 + 10.0 * (PI / 6.0).sin(),
+            12.0 + 10.0 * det::cos(PI / 6.0),
+            32.0 + 10.0 * det::sin(PI / 6.0),
             10.0,
         ),
     ];
@@ -156,8 +154,8 @@ fn wr_641_wall_boss_rounds() {
     let mut b = boolean_union(&mut k, block, boss).unwrap();
     let a = PI / 3.0;
     let picks = [
-        Point3::new(4.0 + 5.0 * a.cos(), 33.0 + 5.0 * a.sin(), 10.0),
-        Point3::new(4.0 + 5.0 * a.cos(), 33.0 - 5.0 * a.sin(), 10.0),
+        Point3::new(4.0 + 5.0 * det::cos(a), 33.0 + 5.0 * det::sin(a), 10.0),
+        Point3::new(4.0 + 5.0 * det::cos(a), 33.0 - 5.0 * det::sin(a), 10.0),
     ];
     round(&mut k, &mut b, &picks, 2.0).unwrap();
     assert!(is_manifold_solid(&b).unwrap());

@@ -13,6 +13,7 @@
 use super::*;
 use crate::make_box;
 use crate::test_corpus::{area, entry, kernel_order, operand, rel, rig, rig_fixes, valid};
+use solidcore::math::det;
 use solidcore_record::brep::Frame;
 
 const X: [f64; 3] = [1.0, 0.0, 0.0];
@@ -76,7 +77,10 @@ fn corpus_tool(t: &serde_json::Value) -> Tool {
     if let Some(p) = t.get("plane") {
         let (x, y) = (v3(&p["xaxis"]), v3(&p["yaxis"]));
         for a in [x, y] {
-            assert!((a[0].hypot(a[1]).hypot(a[2]) - 1.0).abs() < 1e-15, "{a:?}");
+            assert!(
+                (det::hypot(det::hypot(a[0], a[1]), a[2]) - 1.0).abs() < 1e-15,
+                "{a:?}"
+            );
         }
         return plane(v3(&p["origin"]), x, y, v2(&p["u"]), v2(&p["v"]));
     }
@@ -204,14 +208,16 @@ fn bad_asks_are_refused() {
     );
     // a tool the kernel refuses: a box not increasing, axes not square
     let flat = plane([5.0, 0.0, 0.0], Y, Z, [1.0, 1.0], [0.0, 1.0]);
-    assert_eq!(
-        split_body(&b, &flat).err(),
-        Some(Error::Status(crate::error::INVALID_INPUT))
+    let refused = split_body(&b, &flat).err();
+    assert!(
+        matches!(refused, Some(Error::Refused { reason, .. }) if !reason.is_empty()),
+        "{refused:?}"
     );
     let skew = plane([5.0, 0.0, 0.0], Y, [0.0, 1.0, 1.0], [0.0, 1.0], [0.0, 1.0]);
-    assert_eq!(
-        split_faces(&b, &o, &[0], &[skew]).err(),
-        Some(Error::Status(crate::error::INVALID_INPUT))
+    let refused = split_faces(&b, &o, &[0], &[skew]).err();
+    assert!(
+        matches!(refused, Some(Error::Refused { reason, .. }) if !reason.is_empty()),
+        "{refused:?}"
     );
 }
 
@@ -223,6 +229,19 @@ fn a_sheet_is_not_split_into_two_bodies() {
         split_body(&sheet, &plane_x(5.0)).err(),
         Some(Error::NotSolid)
     );
+}
+
+/// A tool that enters the body and stops inside it leaves no closed solid on both sides, so it
+/// is refused (`None`), and the body is as it was.
+#[test]
+fn body_by_a_tool_ending_inside_is_refused() {
+    let (b, _) = cube();
+    // the plane x = 5 over y in [-1, 11] and z in [-1, 5]: it enters through three faces and
+    // ends at z = 5, inside the cube
+    let ends_inside = plane([5.0, 0.0, 0.0], Y, Z, [-1.0, 11.0], [-1.0, 5.0]);
+    assert!(split_body(&b, &ends_inside).unwrap().is_none());
+    assert_eq!(b.counts().unwrap(), [6, 12, 8]);
+    assert!(rel(volume(&b), 1000.0) < 1e-12);
 }
 
 /// The body split is never changed.
@@ -513,9 +532,13 @@ fn body_case(
         volume(&front),
         crate::test_corpus::raw_counts(&e),
     );
+    let want = CLOSED_GAP_VOLUMES
+        .iter()
+        .find(|(c, _)| *c == case)
+        .map_or(m.volume, |(_, v)| *v);
     assert!(
-        rel(v, m.volume) < 1e-9,
-        "{case}: volume {v} vs rig {}",
+        rel(v, want) < 1e-9,
+        "{case}: volume {v} vs {want} (rig {})",
         m.volume
     );
     assert!(rel(a, m.area) < 1e-9, "{case}: area {a} vs rig {}", m.area);
@@ -567,6 +590,15 @@ fn corpus_split_body_by_its_own_face_extended() {
         Some("b18"),
     );
 }
+
+/// The cases whose parts' volume moved off the rig's when `brep_volume` began closing tolerant
+/// edges' gaps (#16735): the rig measures with SMLib's integrator, which leaks through them as
+/// this one did. Each is held to its volume now, as the others to the rig's.
+const CLOSED_GAP_VOLUMES: [(&str, f64); 1] = [(
+    // the rig's 3348.9377643252164, 1.3e-9 below
+    "booleans/3830-split-cup-by-extended-spline-surface",
+    3_348.937_768_682_578_3,
+)];
 
 /// A thin-walled cup split by an extruded spline sheet extended at both ends: the two parts add
 /// up to the cup (closed form 3349.04); the sheet stays, a third body.

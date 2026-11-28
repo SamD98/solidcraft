@@ -15,7 +15,9 @@
 use std::f64::consts::PI;
 
 use crate::curve::curve::Curve;
-use crate::curve::path::{rotation, segments_join, PathShape, PathTolerances, Segment};
+use crate::curve::path::{
+    rotation, segments_close, segments_join, PathShape, PathTolerances, Segment,
+};
 use crate::error::{EntityRef, Result, SolidError};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::certified::unit;
@@ -23,11 +25,16 @@ use crate::geom::tol::USE_DEFAULT;
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
 use crate::math::Transform;
-use crate::sweep::api_brep::{create_linear_sweep, create_rotational_sweep};
+use crate::sweep::api_brep::{
+    create_linear_sweep, create_rotational_sweep, create_rotational_sweep_at_scale,
+};
+use crate::sweep::rotational_sweep_geometry::{cover_axis_chords, omitted_corner_band};
 use crate::topology::brep::p1 as brep_p1;
 use crate::topology::brep::p2::ArenaNotifyState;
 use crate::topology::brep::p3::new_brep;
-use crate::topology::brep::p5::{stitch_and_orient, StitchAndOrientOptions};
+use crate::topology::brep::p5::{
+    stitch_and_orient, stitch_and_orient_open, StitchAndOrientOptions,
+};
 use crate::topology::brep::p7::copy_faces;
 use crate::topology::brep::p8::{create_planar_faces_with_3d_curves, FaceBuildEnv};
 use crate::topology::topology_traverser::Marks;
@@ -133,6 +140,97 @@ pub fn sweep_along_segments(
             "segments not proved to make one path",
         ));
     }
+    walls_along(
+        k,
+        profile,
+        segments,
+        if cap { Ends::Capped } else { Ends::Open },
+    )
+}
+
+/// The profile swept round the closed path of `segments`, turning with it, exactly piece
+/// by piece ([`sweep_along_segments`]): the walls close on each other where the path
+/// closes, where the profile comes back onto itself, so there are no caps. With `solid`
+/// the walls must close into a solid (a closed profile); without it they are sewn as a
+/// sheet whose open profile's ends stay free. The segments must be proved to make one
+/// closed path to `tol` ([`segments_close`]). A profile reaching an arc's axis turns
+/// about it there: the walls of its edges on the axis close to that edge, and the wall
+/// of an edge ending on it closes to a point, as in a rotational sweep. With the motions
+/// that place the profile at the path's start, half way round and at its end (round the
+/// whole loop, back at the start).
+///
+/// # Errors
+///
+/// `InvalidInput` for segments not proved to make one closed path; those of the sweeps,
+/// the face copies and the stitch.
+pub fn sweep_round_closed_segments(
+    k: &mut Kernel,
+    profile: &[Curve],
+    segments: &[Segment],
+    solid: bool,
+    tol: &PathTolerances,
+) -> Result<(Brep, [Transform; 3])> {
+    if segments_close(segments, tol) != PathShape::Is(()) {
+        return Err(SolidError::invalid_input(
+            OP,
+            "segments not proved to make one closed path",
+        ));
+    }
+    walls_along(
+        k,
+        profile,
+        segments,
+        if solid {
+            Ends::Closed
+        } else {
+            Ends::ClosedSheet
+        },
+    )
+}
+
+/// What the walls' ends are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ends {
+    /// Capped at the path's two ends.
+    Capped,
+    /// Left open at the path's two ends: a sheet.
+    Open,
+    /// Round a closed path, closing on each other: a solid.
+    Closed,
+    /// Round a closed path, closing on each other, sewn as a sheet.
+    ClosedSheet,
+}
+
+/// The stitch leaves the tolerance of an omitted corner about a zone short of the
+/// quarter-chord. Grow vertices inside the arc's own band ([`omitted_corner_band`]
+/// of `(start - centre).length()`) to twice the chord, times the gap gain
+/// ([`cover_axis_chords`]). Straight walls are not moved. A plain revolve does not.
+fn cover_omitted_corner_chords(k: &Kernel, b: &mut Brep, segments: &[Segment]) -> Result<()> {
+    for g in segments {
+        let Segment::Arc {
+            start,
+            centre,
+            axis,
+            angle,
+            ..
+        } = *g
+        else {
+            continue;
+        };
+        let band = omitted_corner_band((start - centre).length());
+        cover_axis_chords(k, b, centre, axis, angle, band)?;
+    }
+    Ok(())
+}
+
+/// The walls of `profile` along `segments`, already proved to make one path (closed for
+/// the closed ends), with `ends`.
+fn walls_along(
+    k: &mut Kernel,
+    profile: &[Curve],
+    segments: &[Segment],
+    ends: Ends,
+) -> Result<(Brep, [Transform; 3])> {
     let mut b = new_brep(k, USE_DEFAULT, USE_DEFAULT)?;
     // The path starts where the profile lies: the identity.
     let start = Axis2Placement::IDENTITY;
@@ -149,11 +247,20 @@ pub fn sweep_along_segments(
         let refs: Vec<Option<&Curve>> = section.iter().map(Some).collect();
         let mut piece = match *g {
             Segment::Arc {
+                start,
                 centre,
                 axis,
                 angle,
-                ..
-            } => create_rotational_sweep(k, &refs, centre, axis, angle * 180.0 / PI, false)?,
+            } => {
+                let degrees = angle * 180.0 / PI;
+                // Only a closed path omits a corner within the arc's own band.
+                if matches!(ends, Ends::Closed | Ends::ClosedSheet) {
+                    let scale = (start - centre).length();
+                    create_rotational_sweep_at_scale(k, &refs, centre, axis, degrees, false, scale)?
+                } else {
+                    create_rotational_sweep(k, &refs, centre, axis, degrees, false)?
+                }
+            }
             Segment::Line { start, end } => {
                 let Some(direction) = unit(end - start) else {
                     return Err(SolidError::invalid_input(OP, "a line without a length"));
@@ -169,14 +276,14 @@ pub fn sweep_along_segments(
         let this_face = |f: FaceId| key_of(EntityRef::Face(f));
         let (_, copied) = copy_faces(k, &mut piece, &faces, &mut b, false, &this_face, &mut env)?;
         if !copied {
-            return Err(SolidError::sweep_failed(
+            return Err(SolidError::sweep_defect(
                 "CopyFaces",
-                "the segment pieces' faces could not be copied",
+                "copy_faces copies the segment pieces' faces the kernel just built, each a face of one closed piece with its surface and loops",
             ));
         }
         m = carry(g, &m, 1.0);
     }
-    if cap {
+    if ends == Ends::Capped {
         // The caps: the profile where the path starts and where it ends.
         for at in [start, m] {
             let section = carried(k, profile, &at)?;
@@ -186,7 +293,20 @@ pub fn sweep_along_segments(
             })?;
         }
     }
-    stitch_and_orient(k, &mut b, &StitchAndOrientOptions::default())?;
+    match ends {
+        // round a closed path the last segment's walls end on the section the first's
+        // start from: the stitch sews them there
+        Ends::Capped | Ends::Closed => {
+            stitch_and_orient(k, &mut b, &StitchAndOrientOptions::default())?;
+        }
+        // the profile at both ends stays open: the walls are a sheet (WR-18515)
+        Ends::Open | Ends::ClosedSheet => {
+            stitch_and_orient_open(k, &mut b, &StitchAndOrientOptions::default(), None)?;
+        }
+    }
+    if matches!(ends, Ends::Closed | Ends::ClosedSheet) {
+        cover_omitted_corner_chords(k, &mut b, segments)?;
+    }
     b.refresh_cached_topology();
     let mut half = 0.5 * total;
     let mut middle = m;
@@ -343,5 +463,56 @@ mod tests {
             },
         ];
         assert!(refused(&mut k, &apart));
+    }
+
+    #[test]
+    fn an_uncapped_profile_with_a_short_segment_keeps_every_wall() {
+        // #18515: a 1 x 1 loop in the plane x = 0 whose top side ends in a segment 1.7e-4
+        // long, swept with no caps along x for 4 and a quarter turn of radius 2. Each
+        // profile curve sweeps one wall per segment, so the sheet has 10 walls, the
+        // profile's 5 edges at each of the 3 sections, 5 side edges per segment, and a
+        // vertex per profile vertex at each section. The short curve's edge at every
+        // section is 1.7e-4 long: shorter than the stitch's second tolerance (4e-4).
+        use crate::curve::line::Line;
+        use crate::topology::brep::validation::{check_brep, CheckLevel};
+        use crate::topology::{edge, vertex};
+        let len = 1.7e-4;
+        let p = [
+            Point3::ZERO,
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 1.0),
+            Point3::new(0.0, len, 1.0),
+            Point3::new(0.0, 0.0, 1.0),
+        ];
+        let profile: Vec<Curve> = (0..5)
+            .map(|i| Curve::from(Line::create_line_segment(3, p[i], p[(i + 1) % 5], None).unwrap()))
+            .collect();
+        let mut k = Kernel::default();
+        let (mut b, _) =
+            sweep_along_segments(&mut k, &profile, &bent(FRAC_PI_2), false, &TOL).unwrap();
+        assert_eq!(
+            (
+                b.face_list().len(),
+                b.edge_list().len(),
+                b.vertex_list().len()
+            ),
+            (10, 25, 15),
+            "faces, edges, vertices"
+        );
+        let short = b
+            .edge_list()
+            .iter()
+            .filter(|&&e| {
+                let s = edge::start_vertex(&b, e).unwrap().unwrap();
+                let o = edge::other_vertex(&b, e, Some(s)).unwrap().unwrap();
+                let d = vertex::point(&b, s)
+                    .unwrap()
+                    .distance(vertex::point(&b, o).unwrap());
+                (d - len).abs() <= 1e-12
+            })
+            .count();
+        assert_eq!(short, 3, "the short curve's edge at each section");
+        let check = check_brep(&mut k, &mut b, CheckLevel::Level2).unwrap();
+        assert!(check.is_valid(), "{:?}", check.lines());
     }
 }

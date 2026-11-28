@@ -157,6 +157,40 @@ pub(super) fn face_ref(s: &Session, v: &Value, body: Option<&str>, cmd: &str) ->
     }
 }
 
+/// Resolve a single face on this exact model (placed or local). Unlike Offset Face,
+/// Transform Face must know which owner's frame to use before interpreting the motion.
+pub(crate) fn transform_face_owner<'a>(
+    st: &'a solidcraft_doc::ModelState,
+    face: &Value,
+    body: Option<&str>,
+) -> Result<&'a solidcraft_doc::ModelBody> {
+    let cmd = "solid.transform_face";
+    let point = match face_ref_form(face).map_err(|why| bad(cmd, why))? {
+        FaceRefForm::Name(name) => {
+            let hit = solidcraft_doc::naming::locate_one(st, body, name).map_err(|why| bad(cmd, why))?;
+            return st.bodies.get(hit.body).ok_or_else(|| bad(cmd, format!("no face is named `{name}`")));
+        }
+        FaceRefForm::Point(p) => p,
+    };
+    let holds = |b: &solidcraft_doc::ModelBody| -> Result<bool> {
+        Ok(!b.body.is_mesh() && near_bounds(b, point) && b.body.face_at_point(point).map_err(|e| bad(cmd, e.to_string()))?.is_some())
+    };
+    if let Some(name) = body {
+        let b = st.body(name).ok_or_else(|| bad(cmd, super::no_body(name, st.bodies.iter().map(|b| b.name.as_str()))))?;
+        return holds(b)?.then_some(b).ok_or_else(|| bad(cmd, format!("the picked point is not on a face of `{name}`")));
+    }
+    let mut owner: Option<&solidcraft_doc::ModelBody> = None;
+    for b in &st.bodies {
+        if holds(b)? {
+            if let Some(other) = owner {
+                return Err(bad(cmd, format!("the face pick is ambiguous between `{}` and `{}`; give `body`", other.name, b.name)));
+            }
+            owner = Some(b);
+        }
+    }
+    owner.ok_or_else(|| bad(cmd, "the picked point is not on a body face"))
+}
+
 /// The body a command that works on one body's faces applies to: `body` when given, or else the
 /// one body every picked point lies on, so the feature keeps it (its evaluation otherwise takes
 /// the body whose box is nearest the first point, and coincident faces tie there).
@@ -204,14 +238,16 @@ fn bodies_on_boundary(st: &solidcraft_doc::ModelState, p: Vec3) -> Vec<String> {
     }
     st.bodies
         .iter()
-        .filter(|b| {
-            let Ok(bounds) = b.body.exact_bounds() else { return true };
-            let (lo, hi, grow) = (bounds.min, bounds.max, 1e-3);
-            p.x >= lo.x - grow && p.x <= hi.x + grow && p.y >= lo.y - grow && p.y <= hi.y + grow && p.z >= lo.z - grow && p.z <= hi.z + grow
-        })
+        .filter(|b| near_bounds(b, p))
         .filter(|b| matches!(b.body.classify_point(p), Ok(solidcraft_kernel::PointClass::OnBoundary)))
         .map(|b| b.name.clone())
         .collect()
+}
+
+fn near_bounds(b: &solidcraft_doc::ModelBody, p: Vec3) -> bool {
+    let Ok(bounds) = b.body.exact_bounds() else { return true };
+    let (lo, hi, grow) = (bounds.min, bounds.max, 1e-3);
+    p.x >= lo.x - grow && p.x <= hi.x + grow && p.y >= lo.y - grow && p.y <= hi.y + grow && p.z >= lo.z - grow && p.z <= hi.z + grow
 }
 
 /// What [`faces_body`] found for a command's face picks.
@@ -463,6 +499,22 @@ pub(super) fn sketch_of_faces(s: &mut Session, points: &[Vec3], cmd: &str, face_
     Ok((id, selected, body))
 }
 
+/// Most edges a face used as a profile may have. Each one goes into the sketch, and with
+/// thousands the result body's check alone takes minutes (#18061, #11574).
+const MAX_PROFILE_EDGES: usize = 5000;
+
+/// Whether a face with `edges` edges (seams left out) can be a profile. A face with too many is
+/// refused with its count and the limit, so the user knows what is wrong (#18061).
+fn profile_edge_count(cmd: &str, edges: usize) -> Result<()> {
+    if edges == 0 {
+        return Err(bad(cmd, "the face has no usable boundary"));
+    }
+    if edges > MAX_PROFILE_EDGES {
+        return Err(bad(cmd, format!("the face has {edges} edges; a face used as a profile can have at most {MAX_PROFILE_EDGES}")));
+    }
+    Ok(())
+}
+
 /// Start a sketch on the planar face at `point` holding a copy of the face boundary. Returns
 /// the sketch id, a point inside the face (sketch coordinates), and the picked body's name.
 /// The sketch is left active. `fixed` puts it on the face's plane as a fixed plane, which
@@ -483,7 +535,9 @@ pub(super) fn sketch_of_face(s: &mut Session, point: Vec3, cmd: &str, face_body:
     let tris: Vec<[Vec3; 3]> = m.triangles.iter().zip(&m.tri_face).filter(|(_, tf)| **tf == f).filter_map(|(t, _)| m.tri(t)).collect();
     let normal = tris.iter().find_map(|[a, b, c]| (*b - *a).cross(*c - *a).normalized()).ok_or_else(|| bad(cmd, "degenerate face"))?;
     if tris.iter().any(|[a, b, c]| (*b - *a).cross(*c - *a).normalized().is_some_and(|n| n.dot(normal) < 1.0 - 1e-6)) {
-        return Err(bad(cmd, "only planar faces can be extruded"));
+        // Offset Face is the way to move a curved face, so an extrude says so.
+        let hint = if cmd == "solid.extrude" { "; to move a curved face, use Offset Face" } else { "" };
+        return Err(bad(cmd, format!("only planar faces can be extruded{hint}")));
     }
     // A point well inside the face: the centroid of its largest triangle.
     let inside = tris
@@ -493,9 +547,7 @@ pub(super) fn sketch_of_face(s: &mut Session, point: Vec3, cmd: &str, face_body:
         .unwrap_or(point);
     let edges: Vec<Vec<Vec3>> =
         m.face_edges(f).into_iter().filter(|e| !m.seams.get(*e).copied().unwrap_or(false)).filter_map(|e| m.edges.get(e).cloned()).collect();
-    if edges.is_empty() || edges.len() > 5000 {
-        return Err(bad(cmd, "the face has no usable boundary"));
-    }
+    profile_edge_count(cmd, edges.len())?;
     let run = |s: &mut Session, id: &str, p: Value| -> Result<Value> {
         let spec = crate::find_command(id).ok_or_else(|| bad(cmd, id))?;
         (spec.run)(s, &p)
@@ -526,12 +578,19 @@ pub(super) fn sketch_of_face(s: &mut Session, point: Vec3, cmd: &str, face_body:
     let author_inverse = mat_inverse(&author).ok_or_else(|| bad(cmd, "invalid face profile author frame"))?;
     let author_inside = apply_point(&author_inverse, world_inside);
     drop(doc);
+    // The face's boundary is the profile: it stays profile geometry, even when the design
+    // projects references as construction. As construction it would leave the sketch with no
+    // profile at all, and the feature that uses the face would have nothing to build.
+    let construction = s.project_construction;
+    s.project_construction = false;
     let r = super::sketch::create_face_profile(
         s,
         &json!({"plane": {"face": [world_inside.x, world_inside.y, world_inside.z], "body": world_body, "index": f, "path":path, "fixed": fixed}, "project_edges": true}),
         &body,
         f as usize,
-    )?;
+    );
+    s.project_construction = construction;
+    let r = r?;
     let sid = r.get("sketch").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "could not start a sketch on the face"))?;
     s.refresh();
     let plane = s.model.state().sketch(sid).map(|ss| ss.plane).ok_or_else(|| bad(cmd, "could not start a sketch on the face"))?;

@@ -21,7 +21,7 @@ use solidcore::sweep::stations::{
 use solidcore::topology::{Brep, FaceId};
 
 use super::{bspline, parse, Affine, Curve, KCurve, Made};
-use crate::body::{finish, Body, Expect};
+use crate::body::{finish_closed, Body, Expect};
 use crate::error::status;
 use crate::session::run;
 use crate::{Error, Result};
@@ -188,14 +188,15 @@ fn indices(order: &[FaceId], ids: &[FaceId]) -> Option<Vec<usize>> {
 ///
 /// # Errors
 /// [`Error::Argument`] for no path pieces, a profile or rail the curves refuse, or more than
-/// two rails; the kernel's refusal ([`Error::Status`]) of a twist or end scale past
+/// two rails; the kernel's refusal ([`Error::Refused`]) of a twist or end scale past
 /// SolidCraft's limits ([`MAX_TWIST`], [`MIN_SCALE`], [`MAX_SCALE`], passed to it);
 /// [`Error::Unsupported`] for a path with corners or a closed path, and for a skin the kernel
 /// does not trace to its profile curves (a controlled sweep's sections are affine images of
 /// one profile, so it always is: `create_skin_primitive_with_sources`) or a wall not swept
 /// from one curve of each section; the kernel's refusals of the path, the laws and
-/// the rails ([`Error::Status`]), with SolidCraft's least crossing angle and sine
-/// ([`MIN_PARALLEL_CROSSING`], [`MIN_DIRECTION_ACROSS`]); those of `finish`.
+/// the rails ([`Error::Refused`] for input it refuses, else [`Error::Status`]), with
+/// SolidCraft's least crossing angle and sine
+/// ([`MIN_PARALLEL_CROSSING`], [`MIN_DIRECTION_ACROSS`]); those of `finish_closed`.
 pub fn sweep_controlled(
     profile: &[Curve],
     profile_normal: [f64; 3],
@@ -350,7 +351,7 @@ fn build(
         end: skin.end_faces,
         walls,
     };
-    Ok(match finish(k, skin.brep, Expect::SOLID)? {
+    Ok(match finish_closed(k, skin.brep, Expect::SOLID)? {
         Ok(b) => Ok((b, faces)),
         Err(e) => Err(e),
     })

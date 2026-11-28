@@ -34,23 +34,29 @@
 //! Deviations: none (no upstream counterpart). No recursion: the pairs wait on a heap.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 
+use crate::curve::curve::CurveKind;
+use crate::error::query::QueryFailure;
 use crate::geom::certified::{gamma, Verdict};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::tol::{brep_zone_tol_3d, SmallTopoType};
 use crate::geom::vector2d::Point2;
 use crate::intersect::point_class::PointClassType;
 use crate::kernel::Kernel;
-use crate::mass::integrator::properties::region_material;
-use crate::math::Point3;
+use crate::mass::integrator::properties::{no_unsure_region, region_material};
+use crate::math::{Point3, Vec3};
 use crate::query::api_queries::{
     edge_closest_point, face_bounding_box, face_classify_uv, surface_closest_point,
 };
 use crate::query::brep::BrepClassifier;
 use crate::query::distance_bound::{pieces_about, Piece};
-use crate::surface::surface::Surface;
-use crate::topology::{edgeuse::p1 as eu1, loopuse, Brep, FaceId};
+use crate::query::planar_disjoint::planar_interiors_disjoint;
+use crate::surface::implicit::AnalyticSupport;
+use crate::surface::surface::{Surface, SurfaceKind};
+use crate::topology::brep::p2::is_manifold_solid;
+use crate::topology::face::p2::faceuses;
+use crate::topology::{edge, edgeuse::p1 as eu1, loopuse, Brep, FaceId, ShellId};
 use crate::{EntityRef, Result, SolidError};
 
 const OP: &str = "query::contact::meets";
@@ -230,8 +236,7 @@ fn nurb_boxes(c: &crate::nurbs::crv_basic::Curve) -> Result<Option<Vec<[f64; 4]>
 /// The boxes of face `f`'s own UV trim curves (each its NURBS form's parts,
 /// [`nurb_boxes`], or the curve's whole box where it has none); `None` where a trim curve or
 /// its box is missing.
-fn trim_boxes(k: &Kernel, b: &Brep, f: FaceId) -> Result<Option<Vec<[f64; 4]>>> {
-    use crate::curve::curve::CurveKind;
+pub(crate) fn trim_boxes(k: &Kernel, b: &Brep, f: FaceId) -> Result<Option<Vec<[f64; 4]>>> {
     let Some(fu) = b.face(f)?.faceuse else {
         return Ok(None);
     };
@@ -347,15 +352,7 @@ fn pair_lower(a: &Piece, b: &Piece, axis: Option<[f64; 3]>) -> Result<f64> {
 fn box_lower(a: &Piece, b: &Piece) -> Result<f64> {
     let ((al, ah), (bl, bh)) = (a.widened_box()?, b.widened_box()?);
     let mut sum = 0.0_f64;
-    for i in 0..3 {
-        let (Some(&x0), Some(&x1), Some(&y0), Some(&y1)) =
-            (al.get(i), ah.get(i), bl.get(i), bh.get(i))
-        else {
-            return Err(SolidError::query_failed(
-                OP,
-                "a box has fewer than three axes",
-            ));
-        };
+    for (((&x0, &x1), &y0), &y1) in al.iter().zip(&ah).zip(&bl).zip(&bh) {
         let gap = (y0 - x1).max(x0 - y1).max(0.0);
         // (the difference rounded up by at most gamma_1 of its terms)
         let gap = (gap - gamma(1) * (x0.abs() + x1.abs() + y0.abs() + y1.abs())).max(0.0);
@@ -466,9 +463,16 @@ fn bracket(
     let mut heap = BinaryHeap::new();
     let mut made = 0_usize;
     for (ia, fa) in pa.faces.iter().enumerate() {
+        k.check_cancelled(OP)?;
         for (ib, fb) in pb.faces.iter().enumerate() {
             for x in &fa.pieces {
                 for y in &fb.pieces {
+                    if made >= MAX_PAIRS {
+                        return Ok((0.0, f64::INFINITY, None, false));
+                    }
+                    if made.trailing_zeros() >= 8 {
+                        k.check_cancelled(OP)?;
+                    }
                     let lower = (pair_lower(x, y, None)? - fa.slack - fb.slack).max(0.0);
                     heap.push(Pair {
                         lower,
@@ -486,11 +490,9 @@ fn bracket(
     let mut first: Vec<&Pair> = heap.iter().filter(|p| p.lower <= seed).collect();
     first.sort_by(|x, y| x.lower.total_cmp(&y.lower));
     for pair in first {
+        k.check_cancelled(OP)?;
         let (Some(fa), Some(fb)) = (pa.faces.get(pair.a.0), pb.faces.get(pair.b.0)) else {
-            return Err(SolidError::query_failed(
-                OP,
-                "a pair's face is not among its piece's faces",
-            ));
+            return Err(SolidError::query(OP, QueryFailure::Defect { why: "a pair's face indices are those of the prepared faces it was made from, enumerated, so each is among them" }));
         };
         if pair.lower < upper {
             witness_from(
@@ -521,10 +523,7 @@ fn bracket(
         let (ia, x) = &pair.a;
         let (ib, y) = &pair.b;
         let (Some(fa), Some(fb)) = (pa.faces.get(*ia), pb.faces.get(*ib)) else {
-            return Err(SolidError::query_failed(
-                OP,
-                "a pair's face is not among its piece's faces",
-            ));
+            return Err(SolidError::query(OP, QueryFailure::Defect { why: "a pair's face indices are those of the prepared faces it was made from, enumerated, so each is among them" }));
         };
         // a witness from the pair's centres (none can be nearer than the pair's bound, so a
         // pair past the witness so far is skipped)
@@ -605,12 +604,30 @@ fn witness_from(
     Ok(())
 }
 
-/// A point of `inner`'s boundary classified in `outer`: `Some(true)` inside its material,
-/// `Some(false)` outside it, `None` when none of `inner`'s points tried (its pieces'
-/// centres, where their faces hold them: [`on_face`]) is proved more than twice the
+/// Canonical shell-pair key for a face, grouping faces that belong to the same connected
+/// boundary surface (outer lump boundary or inner cavity wall).
+fn face_shell_key(b: &Brep, f: FaceId) -> Result<Option<(Option<u32>, Option<u32>)>> {
+    let (fu0, fu1) = faceuses(b, f)?;
+    let s0 = match fu0 {
+        Some(fu) => b.faceuse(fu)?.shell.map(ShellId::index),
+        None => None,
+    };
+    let s1 = match fu1 {
+        Some(fu) => b.faceuse(fu)?.shell.map(ShellId::index),
+        None => None,
+    };
+    if s0.is_none() && s1.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(if s0 <= s1 { (s0, s1) } else { (s1, s0) }))
+}
+
+/// Classifies every boundary shell of `inner` against `outer`: `Some(true)` if any shell has
+/// a point inside `outer`'s material, `Some(false)` only when every distinct shell of `inner`
+/// (every lump boundary and every cavity wall) has a point proved more than twice the
 /// classification's tolerance from `outer`'s boundary
-/// ([`crate::query::distance_bound::face_distance_lower_bound`] over `outer`'s faces), or
-/// its classification is not decided.
+/// ([`crate::query::distance_bound::face_distance_lower_bound`] over `outer`'s faces) and
+/// classified outside `outer`, or `None` when any shell cannot be sampled or decided.
 fn point_in(
     k: &Kernel,
     inner: &mut Brep,
@@ -620,37 +637,61 @@ fn point_in(
     use crate::query::distance_bound::face_distance_lower_bound;
     let tol = brep_zone_tol_3d(k, outer, SmallTopoType::NormalSize);
     let clear = 2.0 * tol;
-    for fp in &p_inner.faces {
-        for piece in &fp.pieces {
-            let (_, uv) = piece.centre();
-            let Some(p) = on_face(k, inner, fp, Point2::new(uv[0], uv[1]))? else {
-                continue;
+    let mut shells: BTreeMap<(Option<u32>, Option<u32>), Vec<usize>> = BTreeMap::new();
+    for (idx, fp) in p_inner.faces.iter().enumerate() {
+        let Some(key) = face_shell_key(inner, fp.face)? else {
+            return Ok(None);
+        };
+        shells.entry(key).or_default().push(idx);
+    }
+    if shells.is_empty() {
+        return Ok(None);
+    }
+    let mut classifier = BrepClassifier::of_brep(outer);
+    for face_indices in shells.into_values() {
+        let mut shell_outside = false;
+        'shell: for idx in face_indices {
+            let Some(fp) = p_inner.faces.get(idx) else {
+                return Ok(None);
             };
-            let mut far = true;
-            for &g in outer.face_list() {
-                if face_distance_lower_bound(k, outer, g, p, clear)? <= clear {
-                    far = false;
-                    break;
+            for piece in &fp.pieces {
+                k.check_cancelled(OP)?;
+                let (_, uv) = piece.centre();
+                let Some(p) = on_face(k, inner, fp, Point2::new(uv[0], uv[1]))? else {
+                    continue;
+                };
+                let mut far = true;
+                for &g in outer.face_list() {
+                    if face_distance_lower_bound(k, outer, g, p, clear)? <= clear {
+                        far = false;
+                        break;
+                    }
+                }
+                if !far {
+                    continue;
+                }
+                let pc = match classifier.point_3d_classify(k, p, tol, true) {
+                    Ok(pc) => pc,
+                    Err(e) if e.is_cancelled() => return Err(e),
+                    Err(_) => return Ok(None),
+                };
+                match (pc.point_class(), pc.object()) {
+                    (PointClassType::Region, Some(EntityRef::Region(r))) => {
+                        if region_material(classifier.brep(), r)? {
+                            return Ok(Some(true));
+                        }
+                        shell_outside = true;
+                        break 'shell;
+                    }
+                    _ => return Ok(None),
                 }
             }
-            if !far {
-                continue;
-            }
-            let mut classifier = BrepClassifier::of_brep(outer);
-            let pc = match classifier.point_3d_classify(k, p, tol, true) {
-                Ok(pc) => pc,
-                Err(e) if e.is_cancelled() => return Err(e),
-                Err(_) => return Ok(None),
-            };
-            return Ok(match (pc.point_class(), pc.object()) {
-                (PointClassType::Region, Some(EntityRef::Region(r))) => {
-                    Some(region_material(classifier.brep(), r)?)
-                }
-                _ => None,
-            });
+        }
+        if !shell_outside {
+            return Ok(None);
         }
     }
-    Ok(None)
+    Ok(Some(false))
 }
 
 /// Whether `a` and `b` meet at `tol` (module docs), `a` prepared once for several `b`s.
@@ -738,4 +779,993 @@ pub fn boundary_distance(k: &Kernel, a: &mut Brep, b: &mut Brep, width: f64) -> 
         upper,
         witness,
     })
+}
+
+/// Certified non-boolean test for whether two closed manifold solids share no interior
+/// volume (pure contact or disjoint, never penetrating).
+///
+/// Runs certified stages in order:
+/// 0. Certified body-box separation before building Bézier pieces.
+/// 1. Strict separation via [`meets`] at `1e-9`: proves disjointness when boundaries stay
+///    apart and every boundary shell of each solid lies outside the other.
+/// 2. Certified separating plane from planar face normals and each body's Bézier hulls:
+///    proves strictly zero hull overlap along a separating normal.
+/// 3. Exact analytic half-space separation along candidate planar faces (handles flush
+///    contact with holes, fillets, 180-degree rotations, or tangent cylinders).
+/// 4. Exact analytic coaxial-cylinder separation (handles a cylindrical pin seated flush
+///    inside a matching cylindrical bore).
+/// 5. Exact planar-overlap-region proof when every face meeting the overlap box is a plane
+///    with straight edges inside the other body's inflated box (covers multi-face flush
+///    contacts such as a tenon in a window on a plate with bolt holes elsewhere).
+///
+/// Returns [`Verdict::Yes`] only when zero interior overlap (`int(a) ∩ int(b) == ∅`) is
+/// certified, [`Verdict::No`] when real interior overlap is proved, and
+/// [`Verdict::Undecided`] whenever any ambiguity remains or a work budget is exhausted.
+///
+/// # Errors
+///
+/// `InvalidInput` for a body without faces; those of the underlying queries and cancellation
+/// checks.
+pub fn interiors_disjoint(k: &Kernel, a: &mut Brep, b: &mut Brep) -> Result<Verdict> {
+    if !is_manifold_solid(a)?
+        || !is_manifold_solid(b)?
+        || no_unsure_region(a).is_err()
+        || no_unsure_region(b).is_err()
+    {
+        return Ok(Verdict::Undecided);
+    }
+
+    let box_a = body_box(k, a)?;
+    let box_b = body_box(k, b)?;
+    // Stage 0: fast box-separation check before constructing Bézier hulls or piece heaps.
+    if boxes_strictly_apart(k, a, b, box_a, box_b) {
+        return Ok(Verdict::Yes);
+    }
+
+    let mid = |x: f64, y: f64, z: f64, w: f64| 0.5 * (x.min(z) + y.max(w));
+    let origin = Point3::new(
+        mid(box_a.0.x, box_a.1.x, box_b.0.x, box_b.1.x),
+        mid(box_a.0.y, box_a.1.y, box_b.0.y, box_b.1.y),
+        mid(box_a.0.z, box_a.1.z, box_b.0.z, box_b.1.z),
+    );
+    let pa = Prepared::new(k, a, origin)?;
+
+    // Stage 1: certified strict separation (disjoint boundaries and no containment).
+    if meets_prepared(k, a, &pa, b, 1e-9)?.verdict == Verdict::No {
+        return Ok(Verdict::Yes);
+    }
+
+    // Stage 2a: certified separating plane along any planar face normal of `a` or `b`.
+    let pb = Prepared::new(k, b, origin)?;
+    if separating_plane_certifies_disjoint(k, a, &pa, b, &pb)? {
+        return Ok(Verdict::Yes);
+    }
+
+    // Stage 2b: exact analytic half-space separation on candidate planar faces (handles flush
+    // face-to-face contact with holes, fillets, 180-degree rotations, or tangent cylinders).
+    if let Some(scale) = box_union_scale(box_a, box_b) {
+        if analytic_separating_plane_certifies_disjoint(k, a, &pa, b, &pb, scale)? {
+            return Ok(Verdict::Yes);
+        }
+
+        // Stage 2c: exact analytic coaxial-cylinder separation (handles a cylindrical pin seated
+        // flush inside a matching cylindrical bore).
+        if analytic_separating_cylinder_certifies_disjoint(k, a, &pa, b, &pb, scale)? {
+            return Ok(Verdict::Yes);
+        }
+    }
+
+    // Stage 3: exact planar-overlap-region interior-disjointness proof.
+    planar_interiors_disjoint(k, a, b, box_a, box_b)
+}
+
+/// Whether `box_a` and `box_b` are separated by more than a conservative tolerance and
+/// rounding margin along at least one coordinate axis, ruling out both boundary contact and
+/// containment without building Bézier pieces.
+fn boxes_strictly_apart(
+    k: &Kernel,
+    a: &Brep,
+    b: &Brep,
+    box_a: (Point3, Point3),
+    box_b: (Point3, Point3),
+) -> bool {
+    let union_lo = Point3::new(
+        box_a.0.x.min(box_b.0.x),
+        box_a.0.y.min(box_b.0.y),
+        box_a.0.z.min(box_b.0.z),
+    );
+    let union_hi = Point3::new(
+        box_a.1.x.max(box_b.1.x),
+        box_a.1.y.max(box_b.1.y),
+        box_a.1.z.max(box_b.1.z),
+    );
+    let scale = (union_hi - union_lo).length().max(1.0);
+    if !scale.is_finite() {
+        return false;
+    }
+    let tol = brep_zone_tol_3d(k, a, SmallTopoType::NormalSize)
+        + brep_zone_tol_3d(k, b, SmallTopoType::NormalSize);
+    let margin = 2.0 * tol + gamma(8) * scale;
+    box_a.1.x + margin < box_b.0.x
+        || box_b.1.x + margin < box_a.0.x
+        || box_a.1.y + margin < box_b.0.y
+        || box_b.1.y + margin < box_a.0.y
+        || box_a.1.z + margin < box_b.0.z
+        || box_b.1.z + margin < box_a.0.z
+}
+
+/// Maximum number of deduplicated candidate separating-plane normals tested in Stage 2.
+const MAX_SEPARATING_NORMALS: usize = 64;
+
+/// Collects deduplicated unit normals of planar faces in `a` and `b`.
+fn planar_face_normals(a: &Brep, b: &Brep) -> Result<Vec<Vec3>> {
+    let mut normals: Vec<Vec3> = Vec::new();
+    for brep in [a, b] {
+        for &f in brep.face_list() {
+            if normals.len() >= MAX_SEPARATING_NORMALS {
+                return Ok(normals);
+            }
+            let Some(SurfaceKind::Plane(plane)) = brep.face(f)?.surface.as_ref().map(Surface::kind)
+            else {
+                continue;
+            };
+            let Ok(n) = plane.position().z_axis().unitize() else {
+                continue;
+            };
+            if !(n.x.is_finite() && n.y.is_finite() && n.z.is_finite()) {
+                continue;
+            }
+            if !normals.iter().any(|m| m.dot(n).abs() > 1.0 - 1e-6) {
+                normals.push(n);
+            }
+        }
+    }
+    Ok(normals)
+}
+
+/// Certified range `[lo, hi]` of `(x - origin) · n` over all pieces of `prepared`.
+fn prepared_extent_along(prepared: &Prepared, n: Vec3) -> Result<Option<(f64, f64)>> {
+    let u = [n.x, n.y, n.z];
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for fp in &prepared.faces {
+        for piece in &fp.pieces {
+            let (p0, p1) = piece.extent_along(u)?;
+            lo = lo.min(p0 - fp.slack);
+            hi = hi.max(p1 + fp.slack);
+        }
+    }
+    if lo <= hi && lo.is_finite() && hi.is_finite() {
+        Ok(Some((lo, hi)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether a planar face normal of `a` or `b` strictly separates the certified Bézier hulls
+/// of `a` and `b` with zero overlap (`depth == 0.0`).
+fn separating_plane_certifies_disjoint(
+    k: &Kernel,
+    a: &Brep,
+    pa: &Prepared,
+    b: &Brep,
+    pb: &Prepared,
+) -> Result<bool> {
+    let normals = planar_face_normals(a, b)?;
+    for n in normals {
+        k.check_cancelled(OP)?;
+        let (Some((a0, a1)), Some((b0, b1))) =
+            (prepared_extent_along(pa, n)?, prepared_extent_along(pb, n)?)
+        else {
+            continue;
+        };
+        // Both orientations (+n and -n): depth of overlap between [a0, a1] and [b0, b1]
+        // rounded up. Only a proved zero overlap certifies separation here.
+        let depth_ab = ((a1 - b0) + gamma(2) * (a1.abs() + b0.abs())).max(0.0);
+        let depth_ba = ((b1 - a0) + gamma(2) * (b1.abs() + a0.abs())).max(0.0);
+        if depth_ab.min(depth_ba) == 0.0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Maximum number of deduplicated candidate separating cylinders tested in Stage 2c.
+const MAX_SEPARATING_CYLINDERS: usize = 32;
+
+/// Characteristic size of the union of two body bounding boxes, at least `1.0`.
+fn box_union_scale(box_a: (Point3, Point3), box_b: (Point3, Point3)) -> Option<f64> {
+    let union_lo = Point3::new(
+        box_a.0.x.min(box_b.0.x),
+        box_a.0.y.min(box_b.0.y),
+        box_a.0.z.min(box_b.0.z),
+    );
+    let union_hi = Point3::new(
+        box_a.1.x.max(box_b.1.x),
+        box_a.1.y.max(box_b.1.y),
+        box_a.1.z.max(box_b.1.z),
+    );
+    let scale = (union_hi - union_lo).length().max(1.0);
+    scale.is_finite().then_some(scale)
+}
+
+/// Collects deduplicated candidate separating planes `(origin, unit_normal)` from planar faces
+/// of `a` and `b`, anchored on each face's projected bounding-box centre.
+fn candidate_separating_planes(
+    k: &Kernel,
+    a: &Brep,
+    b: &Brep,
+    scale: f64,
+) -> Result<Vec<(Point3, Vec3)>> {
+    let dedup_eps = (1e-11 * scale).min(1e-7);
+    let mut planes: Vec<(Point3, Vec3)> = Vec::new();
+    for brep in [a, b] {
+        for &f in brep.face_list() {
+            if planes.len() >= MAX_SEPARATING_NORMALS {
+                return Ok(planes);
+            }
+            let Some(SurfaceKind::Plane(plane)) = brep.face(f)?.surface.as_ref().map(Surface::kind)
+            else {
+                continue;
+            };
+            let pos = plane.position();
+            let raw_origin = pos.origin();
+            let Ok(n) = pos.z_axis().unitize() else {
+                continue;
+            };
+            if !(raw_origin.x.is_finite()
+                && raw_origin.y.is_finite()
+                && raw_origin.z.is_finite()
+                && n.x.is_finite()
+                && n.y.is_finite()
+                && n.z.is_finite())
+            {
+                continue;
+            }
+            let p0 = match face_bounding_box(k, brep, f, false) {
+                Ok(fb) => {
+                    let cf = fb.min() + (fb.max() - fb.min()) * 0.5;
+                    let proj = cf - n * (cf - raw_origin).dot(n);
+                    if proj.x.is_finite() && proj.y.is_finite() && proj.z.is_finite() {
+                        proj
+                    } else {
+                        raw_origin
+                    }
+                }
+                Err(e) if e.is_cancelled() => return Err(e),
+                Err(_) => raw_origin,
+            };
+            let seen = planes
+                .iter()
+                .any(|&(q, m)| m.dot(n).abs() > 1.0 - 1e-12 && (q - p0).dot(n).abs() <= dedup_eps);
+            if !seen {
+                planes.push((p0, n));
+            }
+        }
+    }
+    Ok(planes)
+}
+
+/// Certified NURBS upper bound of `(x - p0) · n` over face `fp`.
+fn face_nurbs_max_along(
+    prepared_origin: Point3,
+    fp: &FacePieces,
+    p0: Point3,
+    n: Vec3,
+) -> Result<Option<f64>> {
+    let u = [n.x, n.y, n.z];
+    let shift = (prepared_origin - p0).dot(n);
+    if !shift.is_finite() {
+        return Ok(None);
+    }
+    let mut hi = f64::NEG_INFINITY;
+    for piece in &fp.pieces {
+        let (_, p1) = piece.extent_along(u)?;
+        let bound = p1 + fp.slack + shift + gamma(2) * (p1.abs() + fp.slack.abs() + shift.abs());
+        hi = hi.max(bound);
+    }
+    Ok(hi.is_finite().then_some(hi))
+}
+
+/// Checks that every boundary edge of `f` lies in `(x - p0) · n <= limit` using exact line
+/// endpoints and closed-form ellipse support bounds.
+fn face_edges_max_along(brep: &Brep, f: FaceId, p0: Point3, n: Vec3, limit: f64) -> Result<bool> {
+    let Some(fu) = brep.face(f)?.faceuse else {
+        return Ok(false);
+    };
+    let mut edge_count = 0_usize;
+    for lu in eu1::faceuse_loopuses(brep, fu, false, None)? {
+        for eu in loopuse::edgeuses(brep, lu, None, None)? {
+            let Some(e_id) = brep.edgeuse(eu)?.edge else {
+                return Ok(false);
+            };
+            let ed = brep.edge(e_id)?;
+            let Some(curve) = ed.curve.as_ref() else {
+                return Ok(false);
+            };
+            edge_count += 1;
+            match curve.kind() {
+                CurveKind::Line(_) => {
+                    let (Some(sv), Some(ev)) = (
+                        edge::start_vertex(brep, e_id)?,
+                        edge::end_vertex(brep, e_id)?,
+                    ) else {
+                        return Ok(false);
+                    };
+                    let pa = brep.vertex(sv)?.point;
+                    let pb = brep.vertex(ev)?.point;
+                    for pt in [pa, pb] {
+                        if !(pt.x.is_finite() && pt.y.is_finite() && pt.z.is_finite()) {
+                            return Ok(false);
+                        }
+                        let d = (pt - p0).dot(n);
+                        if !(d.is_finite() && d <= limit) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                CurveKind::Ellipse(ell) => {
+                    let pos = ell.position();
+                    let c = pos.origin();
+                    let rx = ell.x_radius().abs();
+                    let ry = ell.y_radius().abs();
+                    let xa = pos.x_axis();
+                    let ya = pos.y_axis();
+                    if !(c.x.is_finite()
+                        && c.y.is_finite()
+                        && c.z.is_finite()
+                        && rx.is_finite()
+                        && ry.is_finite()
+                        && xa.x.is_finite()
+                        && xa.y.is_finite()
+                        && xa.z.is_finite()
+                        && ya.x.is_finite()
+                        && ya.y.is_finite()
+                        && ya.z.is_finite())
+                    {
+                        return Ok(false);
+                    }
+                    let amp = (rx * xa.dot(n)).hypot(ry * ya.dot(n));
+                    let d_max = (c - p0).dot(n) + amp + gamma(8) * (rx + ry + (c - p0).length());
+                    if !(d_max.is_finite() && d_max <= limit) {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+    Ok(edge_count > 0)
+}
+
+/// Whether every point of face `fp` is certified to satisfy `(x - p0) · n <= plane_eps`.
+fn face_on_plane_side(
+    k: &Kernel,
+    brep: &Brep,
+    prepared_origin: Point3,
+    fp: &FacePieces,
+    p0: Point3,
+    n: Vec3,
+    plane_eps: f64,
+) -> Result<bool> {
+    if face_nurbs_max_along(prepared_origin, fp, p0, n)?.is_some_and(|hi| hi <= plane_eps) {
+        return Ok(true);
+    }
+    match fp.surface.kind() {
+        SurfaceKind::Plane(plane) => {
+            let Ok(fnorm) = plane.position().z_axis().unitize() else {
+                return Ok(false);
+            };
+            let forig = plane.position().origin();
+            if !(forig.x.is_finite()
+                && forig.y.is_finite()
+                && forig.z.is_finite()
+                && fnorm.x.is_finite()
+                && fnorm.y.is_finite()
+                && fnorm.z.is_finite())
+            {
+                return Ok(false);
+            }
+            let fb = face_bounding_box(k, brep, fp.face, false)?;
+            let (l, h) = (fb.min(), fb.max());
+            let span = (h - l).length();
+            if !span.is_finite() {
+                return Ok(false);
+            }
+            let tilt = fnorm.cross(n).length();
+            if tilt * span <= plane_eps {
+                let cf = l + (h - l) * 0.5;
+                let q = cf - fnorm * (cf - forig).dot(fnorm);
+                let d_max =
+                    (q - p0).dot(n) + 0.5 * span * tilt + gamma(8) * (span + (q - p0).length());
+                return Ok(d_max.is_finite() && d_max <= plane_eps);
+            }
+            face_edges_max_along(brep, fp.face, p0, n, plane_eps)
+        }
+        SurfaceKind::Cone(cone) if cone.is_cylinder() => {
+            let can = cone.canonical();
+            let orig = can.origin.origin();
+            let Ok(axis) = can.origin.z_axis().unitize() else {
+                return Ok(false);
+            };
+            let r = can.radius.abs();
+            if !(orig.x.is_finite()
+                && orig.y.is_finite()
+                && orig.z.is_finite()
+                && axis.x.is_finite()
+                && axis.y.is_finite()
+                && axis.z.is_finite()
+                && r.is_finite())
+            {
+                return Ok(false);
+            }
+            let fb = face_bounding_box(k, brep, fp.face, false)?;
+            let (l, h) = (fb.min(), fb.max());
+            let span = (h - l).length();
+            if !span.is_finite() {
+                return Ok(false);
+            }
+            let sin_err = axis.dot(n).abs();
+            if sin_err * span <= plane_eps {
+                let cf = l + (h - l) * 0.5;
+                let q = orig + axis * (cf - orig).dot(axis);
+                let d_max = (q - p0).dot(n)
+                    + r
+                    + 0.5 * span * sin_err
+                    + gamma(8) * (r + span + (q - p0).length());
+                return Ok(d_max.is_finite() && d_max <= plane_eps);
+            }
+            let tilt = axis.cross(n).length();
+            if r * tilt <= plane_eps {
+                return face_edges_max_along(brep, fp.face, p0, n, plane_eps - r * tilt);
+            }
+            Ok(false)
+        }
+        _ => {
+            if let Some(AnalyticSupport::Sphere { placement, radius }) =
+                AnalyticSupport::of(&fp.surface)
+            {
+                let c = placement.origin();
+                let r = radius.abs();
+                if c.x.is_finite() && c.y.is_finite() && c.z.is_finite() && r.is_finite() {
+                    let d_max = (c - p0).dot(n) + r + gamma(8) * (r + (c - p0).length());
+                    return Ok(d_max.is_finite() && d_max <= plane_eps);
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Whether every face of `brep` lies in the closed half-space `(x - p0) · n <= plane_eps`.
+fn body_on_plane_side(
+    k: &Kernel,
+    brep: &Brep,
+    prepared: &Prepared,
+    p0: Point3,
+    n: Vec3,
+    plane_eps: f64,
+) -> Result<bool> {
+    for fp in &prepared.faces {
+        k.check_cancelled(OP)?;
+        if !face_on_plane_side(k, brep, prepared.origin, fp, p0, n, plane_eps)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether a planar face of `a` or `b` defines an exact analytic separating half-space
+/// (`a ⊂ {x : (x - p0)·n <= eps}` and `b ⊂ {x : (x - p0)·n >= -eps}`, or reversed).
+/// Uses a rounding-only tolerance (`<= 1e-7 mm` plus origin rounding), never hiding sub-micron
+/// slab penetrations.
+fn analytic_separating_plane_certifies_disjoint(
+    k: &Kernel,
+    a: &Brep,
+    pa: &Prepared,
+    b: &Brep,
+    pb: &Prepared,
+    scale: f64,
+) -> Result<bool> {
+    let planes = candidate_separating_planes(k, a, b, scale)?;
+    for (p0, n) in planes {
+        k.check_cancelled(OP)?;
+        let plane_eps = (1e-11 * scale).min(1e-7) + gamma(32) * p0.length();
+        if !plane_eps.is_finite() {
+            continue;
+        }
+        if body_on_plane_side(k, a, pa, p0, n, plane_eps)?
+            && body_on_plane_side(k, b, pb, p0, -n, plane_eps)?
+        {
+            return Ok(true);
+        }
+        if body_on_plane_side(k, a, pa, p0, -n, plane_eps)?
+            && body_on_plane_side(k, b, pb, p0, n, plane_eps)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Candidate separating cylinder `(origin, unit_axis, radius)` with an orthonormal cross-section
+/// basis `(u, v)` and rounding tolerance `eps`.
+struct CylSpec {
+    origin: Point3,
+    axis: Vec3,
+    u: Vec3,
+    v: Vec3,
+    radius: f64,
+    eps: f64,
+}
+
+impl CylSpec {
+    fn radial_uv(&self, p: Point3) -> [f64; 2] {
+        let d = p - self.origin;
+        [d.dot(self.u), d.dot(self.v)]
+    }
+
+    fn radial_vec(&self, v: Vec3) -> [f64; 2] {
+        [v.dot(self.u), v.dot(self.v)]
+    }
+
+    fn radial_dist(&self, p: Point3) -> f64 {
+        let [x, y] = self.radial_uv(p);
+        x.hypot(y)
+    }
+}
+
+/// Exact `[min_r, max_r]` of the 2D ellipse `E(t) = cos(t) a + sin(t) b` around the origin.
+fn ellipse_2d_radius_bounds(a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
+    let a2 = a[0] * a[0] + a[1] * a[1];
+    let b2 = b[0] * b[0] + b[1] * b[1];
+    let dot_ab = a[0] * b[0] + a[1] * b[1];
+    let half_sum = 0.5 * (a2 + b2);
+    let half_diff = 0.5 * (a2 - b2);
+    let swing = half_diff.hypot(dot_ab);
+    (
+        (half_sum - swing).max(0.0).sqrt(),
+        (half_sum + swing).max(0.0).sqrt(),
+    )
+}
+
+/// Radial bounds `[r_min, r_max]` of a 3D AABB `[lo, hi]` (in world coordinates) around `cyl`.
+fn aabb_radial_bounds(lo: Point3, hi: Point3, pad: f64, cyl: &CylSpec) -> Option<(f64, f64)> {
+    let xs = [lo.x, hi.x];
+    let ys = [lo.y, hi.y];
+    let zs = [lo.z, hi.z];
+    let (mut u_lo, mut u_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut v_lo, mut v_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut r_max = 0.0_f64;
+    for &x in &xs {
+        for &y in &ys {
+            for &z in &zs {
+                let [pu, pv] = cyl.radial_uv(Point3::new(x, y, z));
+                u_lo = u_lo.min(pu);
+                u_hi = u_hi.max(pu);
+                v_lo = v_lo.min(pv);
+                v_hi = v_hi.max(pv);
+                r_max = r_max.max(pu.hypot(pv));
+            }
+        }
+    }
+    let dx = 0.0_f64.max(u_lo).max(-u_hi);
+    let dy = 0.0_f64.max(v_lo).max(-v_hi);
+    let r_min = (dx.hypot(dy) - pad).max(0.0);
+    let r_max = r_max + pad;
+    (r_min.is_finite() && r_max.is_finite()).then_some((r_min, r_max))
+}
+
+/// Certified NURBS radial bounds `(min_r, max_r)` of face `fp` around `cyl`.
+fn face_nurbs_radial_bounds(
+    prepared_origin: Point3,
+    fp: &FacePieces,
+    cyl: &CylSpec,
+) -> Result<Option<(f64, f64)>> {
+    let mut r_min = f64::INFINITY;
+    let mut r_max = 0.0_f64;
+    let mut any = false;
+    for piece in &fp.pieces {
+        let (lo, hi) = piece.widened_box()?;
+        let lo_w = Point3::new(
+            lo[0] + prepared_origin.x,
+            lo[1] + prepared_origin.y,
+            lo[2] + prepared_origin.z,
+        );
+        let hi_w = Point3::new(
+            hi[0] + prepared_origin.x,
+            hi[1] + prepared_origin.y,
+            hi[2] + prepared_origin.z,
+        );
+        let box_size = (hi_w - lo_w).length();
+        let pad = fp.slack + gamma(8) * (box_size + (prepared_origin - cyl.origin).length());
+        let Some((p_min, p_max)) = aabb_radial_bounds(lo_w, hi_w, pad, cyl) else {
+            return Ok(None);
+        };
+        r_min = r_min.min(p_min);
+        r_max = r_max.max(p_max);
+        any = true;
+    }
+    Ok((any && r_min.is_finite() && r_max.is_finite()).then_some((r_min, r_max)))
+}
+
+/// Collects deduplicated candidate separating cylinders from cylindrical faces of `a` and `b`,
+/// anchored on each face's projected bounding-box centre.
+fn candidate_separating_cylinders(
+    k: &Kernel,
+    a: &Brep,
+    b: &Brep,
+    scale: f64,
+) -> Result<Vec<CylSpec>> {
+    let dedup_eps = (1e-11 * scale).min(1e-7);
+    let mut cyls: Vec<CylSpec> = Vec::new();
+    for brep in [a, b] {
+        for &f in brep.face_list() {
+            if cyls.len() >= MAX_SEPARATING_CYLINDERS {
+                return Ok(cyls);
+            }
+            let Some(SurfaceKind::Cone(cone)) = brep.face(f)?.surface.as_ref().map(Surface::kind)
+            else {
+                continue;
+            };
+            if !cone.is_cylinder() {
+                continue;
+            }
+            let can = cone.canonical();
+            let raw_origin = can.origin.origin();
+            let Ok(axis) = can.origin.z_axis().unitize() else {
+                continue;
+            };
+            let radius = can.radius.abs();
+            if !(raw_origin.x.is_finite()
+                && raw_origin.y.is_finite()
+                && raw_origin.z.is_finite()
+                && axis.x.is_finite()
+                && axis.y.is_finite()
+                && axis.z.is_finite()
+                && radius.is_finite()
+                && radius > 0.0)
+            {
+                continue;
+            }
+            let origin = match face_bounding_box(k, brep, f, false) {
+                Ok(fb) => {
+                    let cf = fb.min() + (fb.max() - fb.min()) * 0.5;
+                    let proj = raw_origin + axis * (cf - raw_origin).dot(axis);
+                    if proj.x.is_finite() && proj.y.is_finite() && proj.z.is_finite() {
+                        proj
+                    } else {
+                        raw_origin
+                    }
+                }
+                Err(e) if e.is_cancelled() => return Err(e),
+                Err(_) => raw_origin,
+            };
+            let Ok([_, u, v]) = axis.make_unit_ortho_vectors(None) else {
+                continue;
+            };
+            let eps = (1e-11 * scale).min(1e-7) + gamma(32) * origin.length();
+            if !eps.is_finite() {
+                continue;
+            }
+            let seen = cyls.iter().any(|c| {
+                c.axis.dot(axis).abs() > 1.0 - 1e-12
+                    && (c.radius - radius).abs() <= dedup_eps
+                    && c.radial_dist(origin) <= dedup_eps
+            });
+            if !seen {
+                cyls.push(CylSpec {
+                    origin,
+                    axis,
+                    u,
+                    v,
+                    radius,
+                    eps,
+                });
+            }
+        }
+    }
+    Ok(cyls)
+}
+
+/// Whether every face of `brep` is certified to lie inside the closed cylinder `r <= cyl.radius + cyl.eps`.
+fn body_inside_cylinder(
+    k: &Kernel,
+    brep: &Brep,
+    prepared: &Prepared,
+    cyl: &CylSpec,
+) -> Result<bool> {
+    let limit = cyl.radius + cyl.eps;
+    for fp in &prepared.faces {
+        k.check_cancelled(OP)?;
+        if face_nurbs_radial_bounds(prepared.origin, fp, cyl)?
+            .is_some_and(|(_, r_max)| r_max <= limit)
+        {
+            continue;
+        }
+        match fp.surface.kind() {
+            SurfaceKind::Cone(cone) if cone.is_cylinder() => {
+                let can = cone.canonical();
+                let orig = can.origin.origin();
+                let Ok(axis) = can.origin.z_axis().unitize() else {
+                    return Ok(false);
+                };
+                let r = can.radius.abs();
+                let fb = face_bounding_box(k, brep, fp.face, false)?;
+                let (l, h) = (fb.min(), fb.max());
+                let span = (h - l).length();
+                if !span.is_finite() {
+                    return Ok(false);
+                }
+                let cf = l + (h - l) * 0.5;
+                let q = orig + axis * (cf - orig).dot(axis);
+                let d_axis = cyl.radial_dist(q);
+                let tilt = axis.cross(cyl.axis).length();
+                let r_bound = r + d_axis + 0.5 * span * tilt + gamma(8) * (r + span + d_axis);
+                if !(r_bound.is_finite() && r_bound <= limit) {
+                    return Ok(false);
+                }
+            }
+            SurfaceKind::Plane(_) => {
+                let Some(fu) = brep.face(fp.face)?.faceuse else {
+                    return Ok(false);
+                };
+                let mut edge_count = 0_usize;
+                for lu in eu1::faceuse_loopuses(brep, fu, false, None)? {
+                    for eu in loopuse::edgeuses(brep, lu, None, None)? {
+                        let Some(e_id) = brep.edgeuse(eu)?.edge else {
+                            return Ok(false);
+                        };
+                        let ed = brep.edge(e_id)?;
+                        let Some(curve) = ed.curve.as_ref() else {
+                            return Ok(false);
+                        };
+                        edge_count += 1;
+                        match curve.kind() {
+                            CurveKind::Line(_) => {
+                                let (Some(sv), Some(ev)) = (
+                                    edge::start_vertex(brep, e_id)?,
+                                    edge::end_vertex(brep, e_id)?,
+                                ) else {
+                                    return Ok(false);
+                                };
+                                for vid in [sv, ev] {
+                                    let pt = brep.vertex(vid)?.point;
+                                    let d = cyl.radial_dist(pt);
+                                    if !(d.is_finite() && d <= limit) {
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                            CurveKind::Ellipse(ell) => {
+                                let pos = ell.position();
+                                let c = pos.origin();
+                                let rx = ell.x_radius().abs();
+                                let ry = ell.y_radius().abs();
+                                let a2 = cyl.radial_vec(pos.x_axis() * rx);
+                                let b2 = cyl.radial_vec(pos.y_axis() * ry);
+                                let (_, max_r_ell) = ellipse_2d_radius_bounds(a2, b2);
+                                let d_c = cyl.radial_dist(c);
+                                let r_bound = d_c + max_r_ell + gamma(8) * (rx + ry + d_c);
+                                if !(r_bound.is_finite() && r_bound <= limit) {
+                                    return Ok(false);
+                                }
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
+                }
+                if edge_count == 0 {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Minimum distance from the 2D origin `(0, 0)` to line segment `a..b`.
+fn origin_to_segment_2d(a: [f64; 2], b: [f64; 2]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let t = if len2 > 0.0 {
+        (-(a[0] * ab[0] + a[1] * ab[1]) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (a[0] + t * ab[0]).hypot(a[1] + t * ab[1])
+}
+
+/// Whether every face of `brep` is certified to lie outside the open cylinder
+/// `r < cyl.radius - cyl.eps`. Since `{r < R}` is connected and unbounded while `brep` is a
+/// bounded closed manifold solid, this certifies that the entire solid lies in `r >= R`.
+fn body_outside_cylinder(
+    k: &Kernel,
+    brep: &mut Brep,
+    prepared: &Prepared,
+    cyl: &CylSpec,
+) -> Result<bool> {
+    let limit = cyl.radius - cyl.eps;
+    for fp in &prepared.faces {
+        k.check_cancelled(OP)?;
+        if face_nurbs_radial_bounds(prepared.origin, fp, cyl)?
+            .is_some_and(|(r_min, _)| r_min >= limit)
+        {
+            continue;
+        }
+        match fp.surface.kind() {
+            SurfaceKind::Cone(cone) if cone.is_cylinder() => {
+                let can = cone.canonical();
+                let orig = can.origin.origin();
+                let Ok(axis) = can.origin.z_axis().unitize() else {
+                    return Ok(false);
+                };
+                let r = can.radius.abs();
+                let fb = face_bounding_box(k, brep, fp.face, false)?;
+                let (l, h) = (fb.min(), fb.max());
+                let span = (h - l).length();
+                if !span.is_finite() {
+                    return Ok(false);
+                }
+                let cf = l + (h - l) * 0.5;
+                let q = orig + axis * (cf - orig).dot(axis);
+                let d_axis = cyl.radial_dist(q);
+                let tilt = axis.cross(cyl.axis).length();
+                let r_bound = r - d_axis - 0.5 * span * tilt - gamma(8) * (r + span + d_axis);
+                if !(r_bound.is_finite() && r_bound >= limit) {
+                    return Ok(false);
+                }
+            }
+            SurfaceKind::Plane(plane) => {
+                let Ok(fnorm) = plane.position().z_axis().unitize() else {
+                    return Ok(false);
+                };
+                let forig = plane.position().origin();
+                let fb = face_bounding_box(k, brep, fp.face, false)?;
+                let (l, h) = (fb.min(), fb.max());
+                let span = (h - l).length();
+                if !span.is_finite() {
+                    return Ok(false);
+                }
+                // Case P1: planar face parallel to the cylinder axis (e.g. outer plate wall).
+                let sin_err = fnorm.dot(cyl.axis).abs();
+                if sin_err * span <= cyl.eps {
+                    let cf = l + (h - l) * 0.5;
+                    let q_axis = cyl.origin + cyl.axis * (cf - cyl.origin).dot(cyl.axis);
+                    let d_plane = (forig - q_axis).dot(fnorm).abs()
+                        - 0.5 * span * sin_err
+                        - gamma(8) * (span + (forig - q_axis).length());
+                    if d_plane.is_finite() && d_plane >= limit {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                // Case P2: planar face perpendicular to the cylinder axis (e.g. plate face
+                // pierced by the bore). The open disk around the axis point must lie strictly
+                // outside the trimmed face: axis point classifies Unknown and every boundary
+                // edge stays at radial distance >= limit.
+                let tilt = fnorm.cross(cyl.axis).length();
+                let denom = cyl.axis.dot(fnorm);
+                if !(denom.abs() > 1.0 - 1e-12 && cyl.radius * tilt <= cyl.eps) {
+                    return Ok(false);
+                }
+                let t = (forig - cyl.origin).dot(fnorm) / denom;
+                let p_axis = cyl.origin + cyl.axis * t;
+                if !(p_axis.x.is_finite() && p_axis.y.is_finite() && p_axis.z.is_finite()) {
+                    return Ok(false);
+                }
+                let Ok(cp) = surface_closest_point(k, &fp.surface, p_axis) else {
+                    return Ok(false);
+                };
+                let Some(&uv) = cp.uvs.first() else {
+                    return Ok(false);
+                };
+                let Ok(eval_pt) = fp.surface.evaluate_point(k, uv) else {
+                    return Ok(false);
+                };
+                if eval_pt.distance(p_axis) > cyl.eps {
+                    return Ok(false);
+                }
+                match face_classify_uv(k, brep, fp.face, uv) {
+                    Ok(PointClassType::Unknown) => {}
+                    Err(e) if e.is_cancelled() => return Err(e),
+                    _ => return Ok(false),
+                }
+                let Some(fu) = brep.face(fp.face)?.faceuse else {
+                    return Ok(false);
+                };
+                let mut edge_count = 0_usize;
+                for lu in eu1::faceuse_loopuses(brep, fu, false, None)? {
+                    for eu in loopuse::edgeuses(brep, lu, None, None)? {
+                        let Some(e_id) = brep.edgeuse(eu)?.edge else {
+                            return Ok(false);
+                        };
+                        let ed = brep.edge(e_id)?;
+                        let Some(curve) = ed.curve.as_ref() else {
+                            return Ok(false);
+                        };
+                        edge_count += 1;
+                        match curve.kind() {
+                            CurveKind::Line(_) => {
+                                let (Some(sv), Some(ev)) = (
+                                    edge::start_vertex(brep, e_id)?,
+                                    edge::end_vertex(brep, e_id)?,
+                                ) else {
+                                    return Ok(false);
+                                };
+                                let a2 = cyl.radial_uv(brep.vertex(sv)?.point);
+                                let b2 = cyl.radial_uv(brep.vertex(ev)?.point);
+                                let d = origin_to_segment_2d(a2, b2);
+                                if !(d.is_finite() && d >= limit) {
+                                    return Ok(false);
+                                }
+                            }
+                            CurveKind::Ellipse(ell) => {
+                                let pos = ell.position();
+                                let c = pos.origin();
+                                let rx = ell.x_radius().abs();
+                                let ry = ell.y_radius().abs();
+                                let a2 = cyl.radial_vec(pos.x_axis() * rx);
+                                let b2 = cyl.radial_vec(pos.y_axis() * ry);
+                                let (min_r_ell, max_r_ell) = ellipse_2d_radius_bounds(a2, b2);
+                                let d_c = cyl.radial_dist(c);
+                                let r_min_edge = (min_r_ell - d_c).max(d_c - max_r_ell)
+                                    - gamma(8) * (rx + ry + d_c);
+                                if !(r_min_edge.is_finite() && r_min_edge >= limit) {
+                                    return Ok(false);
+                                }
+                            }
+                            _ => {
+                                let Some(ext) = curve.certified_bounding_box(k, &ed.interval)?
+                                else {
+                                    return Ok(false);
+                                };
+                                if !ext.is_defined() || !ed.tolerance.is_finite() {
+                                    return Ok(false);
+                                }
+                                let pad = ed.tolerance.max(0.0) + cyl.eps;
+                                let Some((r_min_edge, _)) =
+                                    aabb_radial_bounds(ext.min(), ext.max(), pad, cyl)
+                                else {
+                                    return Ok(false);
+                                };
+                                if r_min_edge < limit {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                }
+                if edge_count == 0 {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Whether a cylindrical face of `a` or `b` defines an exact analytic separating cylinder
+/// (`inner ⊂ {r <= R}` and `outer ⊂ {r >= R}`), proving `int(a) ∩ int(b) == ∅` for coaxial
+/// flush pin-in-bore contact.
+fn analytic_separating_cylinder_certifies_disjoint(
+    k: &Kernel,
+    a: &mut Brep,
+    pa: &Prepared,
+    b: &mut Brep,
+    pb: &Prepared,
+    scale: f64,
+) -> Result<bool> {
+    let cyls = candidate_separating_cylinders(k, a, b, scale)?;
+    for cyl in &cyls {
+        k.check_cancelled(OP)?;
+        if body_inside_cylinder(k, a, pa, cyl)? && body_outside_cylinder(k, b, pb, cyl)? {
+            return Ok(true);
+        }
+        if body_inside_cylinder(k, b, pb, cyl)? && body_outside_cylinder(k, a, pa, cyl)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

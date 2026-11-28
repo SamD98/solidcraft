@@ -52,8 +52,10 @@
 //!   `SM_IS_ZERO_SQUARED` = `SmTol::InTol(a, SmTol::GetScaledZeroSq())` calls
 //!   [`crate::geom::tol`].
 
+use crate::math::det;
 use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 
+use crate::error::geom::GeomFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::tol;
 use crate::geom::vector3d::{acos as sm_acos, asin as sm_asin, sqrt as sm_sqrt};
@@ -200,8 +202,8 @@ impl Vec2 {
     /// The vector rotated counter-clockwise by `ang_rad` about the Z axis (`Rotate`).
     #[must_use]
     pub fn rotate(self, ang_rad: f64) -> Self {
-        let cos = ang_rad.cos();
-        let sin = ang_rad.sin();
+        let cos = det::cos(ang_rad);
+        let sin = det::sin(ang_rad);
         Self::new(cos * self.x - sin * self.y, sin * self.x + cos * self.y)
     }
 
@@ -229,7 +231,7 @@ impl Vec2 {
         match index {
             0 => Ok(self.x),
             1 => Ok(self.y),
-            _ => Err(Self::bad_index()),
+            _ => Err(Self::bad_index(index)),
         }
     }
 
@@ -238,14 +240,14 @@ impl Vec2 {
         match index {
             0 => Ok(&mut self.x),
             1 => Ok(&mut self.y),
-            _ => Err(Self::bad_index()),
+            _ => Err(Self::bad_index(index)),
         }
     }
 
-    fn bad_index() -> SolidError {
-        SolidError::geom_failed(
+    fn bad_index(index: usize) -> SolidError {
+        SolidError::geom(
             "geom::vector2d::Vec2::component",
-            "the component index is out of range",
+            GeomFailure::IndexOutOfRange { index, len: 2 },
         )
     }
 

@@ -37,6 +37,7 @@ use crate::ShapeLimit;
 use solidcore::Vec3;
 
 use super::size::{SizeAt, local};
+use solidcore::math::det;
 
 /// A side is split once it is this many times the side asked (as [`super::cdt`]'s refinement).
 const LONG: f64 = 1.5;
@@ -96,7 +97,8 @@ struct Mesh<'a> {
     tris: &'a mut Vec<[u32; 3]>,
     /// The triangles on each side, by its two nodes in index order.
     sides: BitsMap<(u32, u32), Vec<u32>>,
-    /// The boundary sides, by their two nodes in index order, each as its nodes in loop order.
+    /// The boundary sides, by the two nodes the triangles name them by in index order, each as
+    /// its nodes in loop order.
     fixed: BitsMap<(u32, u32), (u32, u32)>,
     /// Triangles shaping gave up on until they change.
     stuck: Vec<bool>,
@@ -114,6 +116,13 @@ fn key(a: u32, b: u32) -> (u32, u32) {
     (a.min(b), a.max(b))
 }
 
+/// Whether the triangle `a`, `b`, `c` is lower than `tol` over its longest side: its smallest
+/// height, `|ab x ac| / longest`, is under `tol`.
+fn narrower_than(a: Vec3, b: Vec3, c: Vec3, tol: f64) -> bool {
+    let longest = a.dist(b).max(b.dist(c)).max(c.dist(a));
+    (b - a).cross(c - a).len() < tol * longest
+}
+
 /// Twice the signed area of the (u, v) triangle `a`, `b`, `c`.
 fn orient(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
@@ -122,7 +131,7 @@ fn orient(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 /// The angle at `o` between the directions to `a` and `b` (radians; 0 where one is empty).
 fn angle(o: Vec3, a: Vec3, b: Vec3) -> f64 {
     let (x, y) = (a - o, b - o);
-    x.cross(y).len().atan2(x.dot(y))
+    det::atan2(x.cross(y).len(), x.dot(y))
 }
 
 impl Mesh<'_> {
@@ -251,13 +260,13 @@ impl Mesh<'_> {
             let size = (0..3)
                 .map(|k| {
                     let [p0, p1, _] = super::rot3(ps, k);
-                    (p1[0] - p0[0]).hypot(p1[1] - p0[1])
+                    det::hypot(p1[0] - p0[0], p1[1] - p0[1])
                 })
                 .fold(0.0, f64::max);
             for k in 0..3 {
                 let [a, b, _] = super::rot3(tri, k);
                 let [pa, pb, _] = super::rot3(ps, k);
-                let len = (pb[0] - pa[0]).hypot(pb[1] - pa[1]);
+                let len = det::hypot(pb[0] - pa[0], pb[1] - pa[1]);
                 if !(len > 0.0) {
                     continue;
                 }
@@ -336,24 +345,33 @@ enum Located {
 
 /// Shape the face's triangulation `tris` of nodes `uv` (the first `fixed` of them its boundary,
 /// in `loops`, at the 3D points `pos` has for them), adding nodes, by `rules` on the surface
-/// `point`. `pos` holds every node's 3D point and grows with `uv`.
+/// `point`. `pos` holds every node's 3D point and grows with `uv`. `loops` comes with each
+/// boundary node as the triangles name it (by index; a node past its end names itself): where a
+/// loop passes one point twice, the triangulation has one node there, its first, and each
+/// boundary side is kept by the nodes the triangles name it by.
 pub(crate) fn shape(
     uv: &mut Vec<[f64; 2]>,
     pos: &mut Vec<Vec3>,
     tris: &mut Vec<[u32; 3]>,
-    loops: &[std::ops::Range<usize>],
+    (loops, named): (&[std::ops::Range<usize>], &[u32]),
     caps: (&[(u32, u32)], std::ops::Range<usize>, &std::collections::BTreeSet<u32>),
     point: Point<'_>,
     rules: &Rules,
 ) -> Shaped {
     let (ring_sides, fans, poles) = caps;
+    // The boundary's nodes: those of the loops, numbered first.
+    let boundary = loops.iter().map(|r| r.end).max().unwrap_or(0);
     let mut fixed: BitsMap<(u32, u32), (u32, u32)> = BitsMap::default();
     for r in loops {
         let n = r.len();
         for k in 0..n {
             let (Ok(a), Ok(b)) = (u32::try_from(r.start + k), u32::try_from(r.start + (k + 1) % n)) else { continue };
-            if a != b {
-                fixed.entry(key(a, b)).or_insert((a, b));
+            let name = |i: u32| named.get(i as usize).copied().unwrap_or(i);
+            let (na, nb) = (name(a), name(b));
+            if na != nb {
+                // A side the loops run twice (a slit's two runs, one edge) keeps its first run's
+                // nodes: either names the edge's segment.
+                fixed.entry(key(na, nb)).or_insert((a, b));
             }
         }
     }
@@ -372,7 +390,7 @@ pub(crate) fn shape(
     all.sort_unstable();
     m.flip(all, per);
     let h_at = |p: Vec3| local(rules.h, rules.size_at, p);
-    let floor = if rules.tol.is_finite() && rules.tol > 0.0 { (1e-3 * rules.tol).powi(2) } else { 0.0 };
+    let floor = if rules.tol.is_finite() && rules.tol > 0.0 { det::powi(1e-3 * rules.tol, 2) } else { 0.0 };
     let mut limits: Vec<ShapeLimit> = Vec::new();
     // The sides points would encroach on, by their nodes in index order.
     let mut encroached: std::collections::BTreeMap<(u32, u32), (u32, u32)> = std::collections::BTreeMap::new();
@@ -492,7 +510,17 @@ pub(crate) fn shape(
         }
         if !near.is_empty() {
             let edge_sides: Vec<(u32, u32)> = near.into_iter().filter(|e| m.fixed.contains_key(e)).collect();
+            // A triangle of boundary nodes alone, with at most one side on the boundary, that is
+            // narrower than the chord lies where the face is narrower than the chord, finer than
+            // the mesh resolves anything (two curves of the face within the chord of each other: a
+            // sliver). Splitting its sides would halve them round after round toward the sliver's
+            // width, without making it wider: it is left as it is. A triangle with two sides on
+            // the boundary (an ear of one curve, whose height is that curve's sag) is split as
+            // before.
+            let on_boundary = (0..3).filter(|&k| matches!(super::rot3(t, k), [x, y, _] if m.fixed.contains_key(&key(x, y)))).count();
+            let narrow = t.iter().all(|&i| (i as usize) < boundary) && on_boundary <= 1 && narrower_than(a, b, c, rules.tol);
             match rules.whole {
+                None if narrow && !edge_sides.is_empty() => give_up(&mut m, ti, Some(ShapeLimit::Narrow), &mut limits),
                 None => {
                     for e in edge_sides {
                         if let Some(&side) = m.fixed.get(&e) {
@@ -609,7 +637,7 @@ fn off_centre(m: &Mesh<'_>, e: (u32, u32), rules: &Rules) -> Option<(u32, [f64; 
     if !(length > 0.0 && reach > 0.0) {
         return None;
     }
-    let height = 0.5 * length * (rules.min_angle * (1.0 + 1e-3)).tan();
+    let height = 0.5 * length * det::tan(rules.min_angle * (1.0 + 1e-3));
     let target = mid + across * (height / reach);
     let qm = [0.5 * (qx[0] + qy[0]), 0.5 * (qx[1] + qy[1])];
     let f = height / reach;

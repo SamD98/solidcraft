@@ -12,10 +12,9 @@
 //! An M33x3.5 groove on a 14 mm shaft (the rig's case 2193): upstream, two edges end
 //! 1.52e-5 from their vertices (the C++ reference reports the same two test #0 lines on
 //! the same body); solidcore fits the edges' ends to their proto vertices (WR-452) and
-//! every edge ends within 1.2e-6 of its vertex, with or without the opt-in
-//! `Kernel::fixes.imprint_extends_edge_to_proto_vertex` (WR-453). An internal M10x1.5
-//! thread (a nut of radius 8 bored to the minor radius 4.188, the groove out to the major
-//! radius 5) has no gap over half a tolerance either way, as in the C++.
+//! every edge ends within 1.2e-6 of its vertex (with the end extension, WR-453, too). An
+//! internal M10x1.5 thread (a nut of radius 8 bored to the minor radius 4.188, the groove
+//! out to the major radius 5) has no gap over half a tolerance, as in the C++.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -26,6 +25,7 @@ use std::f64::consts::PI;
 
 use solidcore::boolean::api_brep::boolean_difference;
 use solidcore::curve::curve::Curve;
+use solidcore::math::det;
 use solidcore::math::Point3;
 use solidcore::primitive::api_curves::create_line_segment;
 use solidcore::primitive::api_primitives::create_cylinder;
@@ -44,7 +44,7 @@ fn screw_groove(k: &mut Kernel, p: f64, z0: f64, turns: f64, prof: &[(f64, f64)]
     let mut curves = Vec::new();
     for i in 0..=n {
         let turn = i as f64 / PER_TURN as f64;
-        let (s, c) = (2.0 * PI * turn).sin_cos();
+        let (s, c) = det::sin_cos(2.0 * PI * turn);
         let pts: Vec<Point3> = prof
             .iter()
             .map(|&(r, z)| Point3::new(r * c, r * s, z0 + z + p * turn))
@@ -61,10 +61,8 @@ fn screw_groove(k: &mut Kernel, p: f64, z0: f64, turns: f64, prof: &[(f64, f64)]
         .brep
 }
 
-fn kernel(extend: bool) -> Kernel {
-    let mut k = Kernel::default();
-    k.fixes.imprint_extends_edge_to_proto_vertex = extend;
-    k
+fn kernel() -> Kernel {
+    Kernel::default()
 }
 
 /// An external thread: a shaft of radius `r` and length `len` minus a groove of pitch `p`,
@@ -73,7 +71,7 @@ fn external(k: &mut Kernel, p: f64, r: f64, len: f64, depth: f64, flat: f64) -> 
     let root = r - depth;
     let outer = r + 0.05;
     let half_root = flat / 2.0;
-    let half_outer = half_root + (outer - root) * 30.0_f64.to_radians().tan();
+    let half_outer = half_root + (outer - root) * det::tan(30.0_f64.to_radians());
     let prof = [
         (root, -half_root),
         (outer, -half_outer),
@@ -94,7 +92,7 @@ fn internal_m10(k: &mut Kernel) -> Brep {
     let nut = boolean_difference(k, nut, bore).unwrap();
     let (inner, major) = (4.188 - 0.05, 5.0);
     let half_major = p / 16.0;
-    let half_inner = half_major + (major - inner) * 30.0_f64.to_radians().tan();
+    let half_inner = half_major + (major - inner) * det::tan(30.0_f64.to_radians());
     let prof = [
         (inner, -half_inner),
         (major, -half_major),
@@ -142,30 +140,20 @@ fn brep_reports(k: &mut Kernel, b: &mut Brep) -> Vec<String> {
 
 #[test]
 fn issue_410_m33x3_5_edges_end_at_their_vertices() {
-    for extend in [false, true] {
-        let mut k = kernel(extend);
-        let mut b = external(&mut k, 3.5, 16.5, 14.0, 2.15, 0.875);
-        let (gap, tol) = worst_vertex_gap(&k, &b);
-        assert!(
-            gap < 2e-6,
-            "extend {extend}: gap {gap:e}, tolerance {tol:e}"
-        );
-        let lines = brep_reports(&mut k, &mut b);
-        assert!(lines.is_empty(), "extend {extend}: {lines:#?}");
-    }
+    let mut k = kernel();
+    let mut b = external(&mut k, 3.5, 16.5, 14.0, 2.15, 0.875);
+    let (gap, tol) = worst_vertex_gap(&k, &b);
+    assert!(gap < 2e-6, "gap {gap:e}, tolerance {tol:e}");
+    let lines = brep_reports(&mut k, &mut b);
+    assert!(lines.is_empty(), "{lines:#?}");
 }
 
 #[test]
 fn issue_410_internal_m10x1_5_has_no_vertex_gap() {
-    for extend in [false, true] {
-        let mut k = kernel(extend);
-        let mut b = internal_m10(&mut k);
-        let (gap, tol) = worst_vertex_gap(&k, &b);
-        assert!(
-            gap < tol / 2.0,
-            "extend {extend}: gap {gap:e}, tolerance {tol:e}"
-        );
-        let lines = brep_reports(&mut k, &mut b);
-        assert!(lines.is_empty(), "extend {extend}: {lines:#?}");
-    }
+    let mut k = kernel();
+    let mut b = internal_m10(&mut k);
+    let (gap, tol) = worst_vertex_gap(&k, &b);
+    assert!(gap < tol / 2.0, "gap {gap:e}, tolerance {tol:e}");
+    let lines = brep_reports(&mut k, &mut b);
+    assert!(lines.is_empty(), "{lines:#?}");
 }

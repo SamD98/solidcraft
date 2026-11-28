@@ -55,6 +55,7 @@ use super::topology_edgeuse_p1::{
     surface_of, BrepIn, CrvIn, ImportTypes, FILES,
 };
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// The unit runner.
 pub struct Runner;
@@ -1092,7 +1093,7 @@ fn run_rust_op(
         }
         OpIn::SetSize { kind, value } => {
             if *kind == 0 {
-                let r = b.set_this_model_size_estimate(k, *value);
+                let r = b.set_this_model_size_estimate(*value);
                 o.push(r);
                 o.push(b.tolerance());
                 o.push(b.this_model_size_estimate(k, false));
@@ -1100,7 +1101,7 @@ fn run_rust_op(
                 o.push(k.context.this_model_size_estimate(k));
                 o.push(k.context.this_zone_tol_3d());
             } else {
-                b.set_this_large_small_size_ratio(k, *value);
+                b.set_this_large_small_size_ratio(*value);
                 o.push(b.this_large_small_size_ratio(k, false));
                 o.push(b.this_large_small_size_ratio(k, true));
                 // SmContext::GetThisLargeSmallSizeRatio
@@ -1786,6 +1787,22 @@ fn run_rust_op(
 }
 
 fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
+    run_rust_on(&mut crate::runner_kernel(), i)
+}
+
+/// The unit's Rust run of `case` on the caller's kernel `k` (a fresh default kernel in
+/// the unit's own runs), so a test can read what the kernel's diagnostics recorded
+/// (e.g. [`Kernel::coons_tangency_log`]). A B-rep against another B-rep runs on kernels
+/// of its own.
+///
+/// # Errors
+///
+/// As the unit's runner.
+pub fn run_case_on(k: &mut Kernel, case: &Case) -> Result<Output, HarnessError> {
+    run_rust_on(k, &case.parse::<Inputs>()?)
+}
+
+fn run_rust_on(k: &mut Kernel, i: &Inputs) -> Result<Output, HarnessError> {
     if let OpIn::BrepIntersect2 {
         other,
         tol,
@@ -1795,8 +1812,7 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
     {
         return run_rust_intersection(i, other, *tol, *ang, *want_points);
     }
-    let mut k = Kernel::default();
-    let (mut b, types, c) = match rust_brep(&mut k, i)? {
+    let (mut b, types, c) = match rust_brep(k, i)? {
         Ok(x) => x,
         Err(o) => return Ok(o),
     };
@@ -1806,7 +1822,7 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
     if let Some(refused) = refused_input(&op) {
         return Ok(refused);
     }
-    match run_rust_op(&mut k, &mut b, &types, &op) {
+    match run_rust_op(k, &mut b, &types, &op) {
         Ok(Ok(o)) => Ok(guarded_output(o)),
         Ok(Err(o)) => Ok(o),
         Err(Fail::Solid(e)) => match Output::unported(&e) {
@@ -1965,7 +1981,7 @@ fn run_rust_intersection(
 ) -> Result<Output, HarnessError> {
     cross_body_input(i, other)?; // same input-kind check, no native construction/import
     let run = || -> Result<Output, Fail> {
-        let mut k = Kernel::default();
+        let mut k = crate::runner_kernel();
         let first = i
             .brep
             .as_ref()
@@ -2170,7 +2186,7 @@ fn gen_op(rng: &mut Rng) -> OpIn {
         3 => {
             let value = match rng.below(6) {
                 0 => tol::USE_DEFAULT,
-                1 => 10f64.powf(rng.uniform(-8.0, 8.0)),
+                1 => det::powf(10f64, rng.uniform(-8.0, 8.0)),
                 2 => -rng.uniform(0.0, 100.0),
                 3 => 0.0,
                 4 => rng.uniform(0.5, 500.0),
@@ -2193,7 +2209,7 @@ fn gen_op(rng: &mut Rng) -> OpIn {
             },
         },
         5 => OpIn::Degenerate {
-            tol: 10f64.powf(rng.uniform(-9.0, 9.0)),
+            tol: det::powf(10f64, rng.uniform(-9.0, 9.0)),
         },
         6 => OpIn::AddDeleted {
             n: rng.below(5) as u8,
@@ -2253,7 +2269,7 @@ fn gen_op(rng: &mut Rng) -> OpIn {
             let tol = match rng.below(3) {
                 0 => 0.0,
                 1 => 1e-6,
-                _ => 10f64.powf(rng.uniform(-9.0, 0.0)),
+                _ => det::powf(10f64, rng.uniform(-9.0, 0.0)),
             };
             OpIn::FindSide { curve, p, dir, tol }
         }
@@ -2280,12 +2296,12 @@ fn gen_op(rng: &mut Rng) -> OpIn {
             eu_new: gen_sel(rng),
             p: rng.point3(-2.0, 2.0),
             t: rng.uniform(-0.2, 1.2),
-            scaled_zero: 10f64.powf(rng.uniform(-9.0, -1.0)),
+            scaled_zero: det::powf(10f64, rng.uniform(-9.0, -1.0)),
             orient: rng.below(3) as u8,
             for_tess: rng.chance(0.5),
         },
         22 => OpIn::BrepIntersect {
-            tol: 10f64.powf(rng.uniform(-6.0, -2.0)),
+            tol: det::powf(10f64, rng.uniform(-6.0, -2.0)),
             ang: rng.uniform(5.0, 30.0),
             want_points: rng.chance(0.5),
         },
@@ -2296,7 +2312,7 @@ fn gen_op(rng: &mut Rng) -> OpIn {
                 tangent: rng
                     .chance(0.5)
                     .then(|| (0..n).map(|_| rng.chance(0.7)).collect()),
-                tol: 10f64.powf(rng.uniform(-6.0, -2.0)),
+                tol: det::powf(10f64, rng.uniform(-6.0, -2.0)),
                 ang: rng.uniform(0.0, 0.1),
             }
         }
@@ -2314,7 +2330,7 @@ fn gen_op(rng: &mut Rng) -> OpIn {
                 _ => rng.point3(-1.0, 1.0),
             },
             dist: rng.chance(0.3).then(|| rng.uniform(0.5, 20.0)),
-            tol: rng.chance(0.7).then(|| 10f64.powf(rng.uniform(-6.0, -2.0))),
+            tol: rng.chance(0.7).then(|| det::powf(10f64, rng.uniform(-6.0, -2.0))),
             ang: rng.chance(0.5).then(|| rng.uniform(0.05, 0.5)),
             want_3d: rng.chance(0.8),
             want_uv: rng.chance(0.8),

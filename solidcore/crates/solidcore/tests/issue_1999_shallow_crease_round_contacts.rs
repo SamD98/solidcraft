@@ -13,6 +13,7 @@ use solidcore::blend::definition_check::{BlendFaceKind, BlendFaceLog};
 use solidcore::blend::fillet_executive::api::fillet_edges;
 use solidcore::curve::curve::Curve;
 use solidcore::mass::integrator::properties::brep_volume_default;
+use solidcore::math::det;
 use solidcore::math::Vec3;
 use solidcore::primitive::api_curves::create_line_segment;
 use solidcore::surface::procedural_blend::BlendNet;
@@ -28,7 +29,7 @@ fn line(a: (f64, f64), b: (f64, f64)) -> Curve {
 
 /// The rise of the crease above y = 1 for a turn of `turn` degrees.
 fn rise(turn: f64) -> f64 {
-    3.0 * (0.5 * turn * PI / 180.0).tan()
+    3.0 * det::tan(0.5 * turn * PI / 180.0)
 }
 
 /// The 6 x 1 roof profile, extruded 2 along z.
@@ -80,7 +81,7 @@ fn shallow_crease_round_contact_profiles() {
     use solidcore::kernel::UpstreamFixes;
     use solidcore::topology::brep::validation::{check_brep, CheckLevel};
     let mut invalid = Vec::new();
-    for profile in ["default", "half_degree", "new_blend", "all_fixes"] {
+    for profile in ["default", "new_blend", "all_fixes"] {
         for (turn, radius, multi) in [
             (2.5, 0.12, false),
             (0.6, 2.0, false),
@@ -93,9 +94,6 @@ fn shallow_crease_round_contact_profiles() {
             (1.9, 1.0, true),
         ] {
             let mut k = Kernel::default();
-            if profile == "half_degree" {
-                k.fixes.fillet_half_degree_crease = true;
-            }
             if profile == "new_blend" {
                 // The current generic-blend construction and supporting fillet fixes;
                 // leave unrelated boolean, sweep and validation fixes at default.
@@ -107,7 +105,6 @@ fn shallow_crease_round_contact_profiles() {
             }
             if profile == "all_fixes" {
                 k.fixes = UpstreamFixes::all();
-                k.fixes.geometric_g2_continuity = false;
             }
             if turn == 2.5 && radius == 0.12 {
                 let enabled: Vec<_> = k
@@ -147,7 +144,7 @@ fn shallow_crease_round_contact_profiles() {
             let result = fillet_edges(&mut k, &mut b, &edges, radius, 1, 1, 1.0);
             let check = check_brep(&mut k, &mut b, CheckLevel::Level2).unwrap();
             let manifold = is_manifold_solid(&b).unwrap();
-            println!("CASE profile={profile} turn={turn} radius={radius} multi={multi} result={result:?} faces={} manifold={manifold} valid={} pointers={} failures={:?}", b.face_list().len(), check.is_valid(), check.pointers_status, check.failures().collect::<Vec<_>>());
+            println!("CASE profile={profile} turn={turn} radius={radius} multi={multi} result={result:?} faces={} manifold={manifold} valid={} pointers={:?} failures={:?}", b.face_list().len(), check.is_valid(), check.pointers, check.failures().collect::<Vec<_>>());
             if result.is_ok()
                 && !check.is_valid()
                 && (profile == "new_blend" || profile == "all_fixes")
@@ -180,7 +177,6 @@ fn new_blend_constructs_valid_shallow_crease_rounds() {
                 blend_face_log: Some(BlendFaceLog::default()),
                 ..Kernel::default()
             };
-            k.fixes.geometric_g2_continuity = false;
             k.tolerances.zone_tol_3d *= scale;
             let mut b = block_scaled(&mut k, turn, scale);
             // The builder starts with fixed 1e-5 entity tolerances. Scale those
@@ -229,9 +225,9 @@ fn new_blend_constructs_valid_shallow_crease_rounds() {
             // The unrounded section is the 6x1 rectangle plus the roof triangle;
             // extruding it by 2 and scaling all lengths gives the volume below.
             let half_turn = 0.5 * turn * PI / 180.0;
-            let part_volume = (6.0 + 3.0 * rise(turn)) * 2.0 * scale.powi(3);
+            let part_volume = (6.0 + 3.0 * rise(turn)) * 2.0 * det::powi(scale, 3);
             let removed_volume =
-                radius * radius * (half_turn.tan() - half_turn) * 2.0 * scale.powi(3);
+                radius * radius * (det::tan(half_turn) - half_turn) * 2.0 * det::powi(scale, 3);
             let expected = part_volume - removed_volume;
             let rounding = 1e-9 * part_volume;
             assert!(
@@ -277,12 +273,11 @@ fn new_blend_vertex_contact_boundary() {
     use solidcore::topology::brep::validation::{check_brep, CheckLevel};
     for turn in [0.6, 1.5, 2.5, 5.0, 10.0, 30.0] {
         for sagitta in [1.9e-5, 2.1e-5, 4.9e-5, 5.1e-5] {
-            let radius = sagitta / (1.0 / (0.5 * turn * PI / 180.0).cos() - 1.0);
+            let radius = sagitta / (1.0 / det::cos(0.5 * turn * PI / 180.0) - 1.0);
             let mut k = Kernel {
                 fixes: UpstreamFixes::all(),
                 ..Kernel::default()
             };
-            k.fixes.geometric_g2_continuity = false;
             let mut b = block(&mut k, turn);
             let e = crease(&k, &b, turn);
             fillet_edges(&mut k, &mut b, &[e], radius, 1, 1, 1.0)
@@ -309,7 +304,6 @@ fn new_blend_contact_resolution_is_body_tolerance() {
             fixes: UpstreamFixes::all(),
             ..Kernel::default()
         };
-        k.fixes.geometric_g2_continuity = false;
         let mut b = block(&mut k, 2.5);
         for f in b.face_list().to_vec() {
             solidcore::topology::face::p3::set_tolerance(&mut b, f, entity_tol, false, false)

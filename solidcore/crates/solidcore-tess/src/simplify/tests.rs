@@ -8,7 +8,7 @@ fn sphere(r: f64, n: u32) -> (Vec<Vec3>, Vec<[u32; 3]>) {
             std::f64::consts::PI * f64::from(i) / f64::from(n),
             std::f64::consts::TAU * f64::from(j) / f64::from(2 * n),
         );
-        let (st, ct, sp, cp) = (t.sin(), t.cos(), p.sin(), p.cos());
+        let (st, ct, sp, cp) = (det::sin(t), det::cos(t), det::sin(p), det::cos(p));
         // The poles exactly, and the seam the same as the start, so corners weld.
         let (st, sp, cp) = (
             if i == 0 || i == n { 0.0 } else { st },
@@ -71,7 +71,7 @@ fn a_sphere_comes_down_to_each_target_within_its_error() {
     let full = tris.len();
     let made = levels(&pos, &tris, &[full / 4, full / 16, full / 64]);
     assert_eq!(made.len(), 3);
-    let exact = 4.0 / 3.0 * std::f64::consts::PI * 50.0f64.powi(3);
+    let exact = 4.0 / 3.0 * std::f64::consts::PI * det::powi(50.0f64, 3);
     let mut last = 0.0;
     for (l, target) in made.iter().zip([full / 4, full / 16, full / 64]) {
         assert!(
@@ -83,7 +83,7 @@ fn a_sphere_comes_down_to_each_target_within_its_error() {
         assert!(l.error >= last, "the error grows: {} after {last}", l.error);
         last = l.error;
         // Each point within the error of the sphere (its faces' planes lie within their sag of it).
-        let sag = 50.0 * (1.0 - (std::f64::consts::PI / 100.0).cos());
+        let sag = 50.0 * (1.0 - det::cos(std::f64::consts::PI / 100.0));
         for p in &l.positions {
             assert!(
                 (p.len() - 50.0).abs() <= l.error + sag + 1e-9,
@@ -188,6 +188,91 @@ fn hostile_meshes_never_panic() {
             .flatten()
             .all(|i| (*i as usize) < l.positions.len())
     }));
+}
+
+#[test]
+fn unused_welded_vertices_need_no_collapse_state() {
+    let pos = [
+        Vec3::new(-10.0, 0.0, 0.0),
+        Vec3::new(-0.0, 0.0, 0.0),
+        Vec3::new(10.0, 0.0, 0.0),
+        Vec3::X,
+        Vec3::ZERO,
+        Vec3::Y,
+        Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(f64::NAN, 0.0, 0.0),
+        Vec3::new(20.0, 0.0, 0.0),
+    ];
+    let tris = [[4, 3, 5], [1, 4, 2], [3, 6, 5], [2, 7, 3], [8, 3, u32::MAX]];
+    let (mesh, source) = Collapser::new(&pos, &tris, WeldOrder::Positions).unwrap();
+    // The first zero is the representative even though a later corner carries its index.
+    assert_eq!(source, [1, 3, 5, 6]);
+    assert_eq!(mesh.pos[0][0].to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(mesh.tris, [[0, 1, 2], [1, 3, 2]]);
+    assert_eq!(mesh.seed, [0, 0, 0, 1]);
+    assert_eq!(mesh.quadric.len(), source.len());
+    assert_eq!(mesh.around.len(), source.len());
+
+    // Removing unused source vertices and invalid faces yields the same simplified surface.
+    let clean = levels(&[pos[1], pos[3], pos[5], pos[6]], &mesh.tris, &[1]);
+    let sparse = levels(&pos, &tris, &[1]);
+    assert_eq!(clean.len(), 1);
+    assert_eq!(sparse.len(), 1);
+    assert_eq!(clean[0].triangles, sparse[0].triangles);
+    let bits = |level: &Level| {
+        level
+            .positions
+            .iter()
+            .map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bits(&clean[0]), bits(&sparse[0]));
+    assert_eq!(clean[0].error.to_bits(), sparse[0].error.to_bits());
+}
+
+#[test]
+fn indexed_facets_weld_in_corner_order() {
+    let positions = [
+        Vec3::new(-10.0, 0.0, 0.0),
+        Vec3::X,
+        Vec3::ZERO,
+        Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(-0.0, 0.0, 0.0),
+        Vec3::Y,
+        Vec3::new(f64::NAN, 0.0, 0.0),
+    ];
+    let triangles = [[2, 1, u32::MAX], [4, 1, 5], [2, 4, 3], [1, 3, 5], [2, 6, 5]];
+    let (mesh, source) = Collapser::new(&positions, &triangles, WeldOrder::Facets).unwrap();
+    // Triangles with missing vertices are omitted before expansion. The first zero in the
+    // remaining corner stream wins, even though its storage index follows the other zero.
+    assert_eq!(source, [4, 1, 5, 3]);
+    assert_eq!(mesh.pos[0][0].to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(mesh.tris, [[0, 1, 2], [1, 3, 2]]);
+
+    let expanded = [
+        positions[4],
+        positions[1],
+        positions[5],
+        positions[2],
+        positions[4],
+        positions[3],
+        positions[1],
+        positions[3],
+        positions[5],
+        positions[2],
+        positions[6],
+        positions[5],
+    ];
+    let reference = levels(
+        &expanded,
+        &[[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]],
+        &[1],
+    );
+    let indexed = levels_from_indexed_facets(&positions, &triangles, &[1]);
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0].triangles, reference[0].triangles);
+    assert_eq!(indexed[0].positions, reference[0].positions);
+    assert_eq!(indexed[0].error.to_bits(), reference[0].error.to_bits());
 }
 
 /// Timing, not a check (`SOLIDCORE_TESS_BENCH_STL=part.stl cargo test --release -p

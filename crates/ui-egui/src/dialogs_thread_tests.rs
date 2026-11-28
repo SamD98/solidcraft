@@ -1,5 +1,6 @@
 use serde_json::json;
 use solidcore_record::Vec3;
+use solidcraft_engine::geom::MeshGeom as _;
 
 use super::*;
 use crate::dialogs::{Kind, apply_commands, edge_sel};
@@ -30,7 +31,7 @@ fn a_new_thread_leaves_the_flank_layout_out_and_an_edit_keeps_its_saved_layout()
         assert_eq!(params(&h).get("continuous_flanks"), None);
         // A saved thread (an old design's has the historical layout) keeps its layout when edited.
         h.app.run("solid.thread", json!({"face": [4,0,5], "designation": "M8", "continuous_flanks": continuous})).unwrap();
-        let saved = h.app.session.doc.features.last().unwrap().kind.clone();
+        let saved = h.app.session.doc.features.last().unwrap().clone();
         let mut d = crate::dialogs::Dialog::for_command(&h.app, "solid.thread").unwrap();
         crate::dialogs_thread::reopen(&mut d, &h.app.session, &saved);
         assert_eq!(d.extra["continuous_flanks"], json!(continuous));
@@ -80,7 +81,11 @@ fn shown(row: &str) -> bool {
 fn every_option_reaches_the_command() {
     let mut h = shaft();
     let untouched = params(&h);
-    assert_eq!(untouched.as_object().unwrap().keys().collect::<Vec<_>>(), ["face"], "defaults stay out of the command: {untouched}");
+    assert_eq!(
+        untouched.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["faces", "single_face_selection"],
+        "default thread options stay out of the command: {untouched}"
+    );
     choose(&mut h, "Form", "Trapezoidal (ISO 2904)");
     choose(&mut h, "Size", "20 mm");
     assert_eq!(params(&h)["designation"], "Tr20x4", "a new size takes its standard pitch");
@@ -97,7 +102,8 @@ fn every_option_reaches_the_command() {
     type_in(&mut h, "Chamfer Depth", "0.5 mm");
     click(&mut h, &["dialog:Modeled"]);
     let mut p = params(&h);
-    p.as_object_mut().unwrap().remove("face");
+    p.as_object_mut().unwrap().remove("faces");
+    p.as_object_mut().unwrap().remove("single_face_selection");
     assert_eq!(
         p,
         json!({
@@ -221,6 +227,53 @@ fn a_form_change_keeps_what_still_applies() {
     assert_eq!((&p["hand"], &p["starts"], &p["length"], &p["ease_out"]), (&json!("left"), &json!(3), &json!("4 mm"), &json!("standard")));
 }
 
+/// Unified offers the shared UNC/UNF sizes by their full designation, including the pitch;
+/// displaying an authored class must keep it in the command and saved dialog.
+#[test]
+fn unified_form_offers_catalogue_sizes_and_keeps_an_authored_class() {
+    let mut h = shaft();
+    choose(&mut h, "Form", "thread.form_unified");
+    assert_eq!(options(&h).form, ThreadForm::Unified);
+    assert_eq!(params(&h)["form"], "unified");
+    assert!(params(&h).get("designation").is_none(), "the Unified face size is automatic");
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation == "5/16-18 UNC"));
+    click(&mut h, &["dialog:Automatic size"]);
+    choose(&mut h, "Size", "#10-32 UNF");
+    assert_eq!(params(&h)["designation"], "#10-32 UNF");
+    type_in(&mut h, "Designation", "5/16-24 UNF-2A");
+    h.frames(2);
+    assert_eq!(params(&h)["designation"], "5/16-24 UNF-2A");
+    let (command, args) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+    h.app.run(&command, args).unwrap();
+    let saved = h.app.session.doc.features.last().unwrap().clone();
+    let mut dialog = crate::dialogs::Dialog::for_command(&h.app, "solid.thread").unwrap();
+    crate::dialogs_thread::reopen(&mut dialog, &h.app.session, &saved);
+    assert!(
+        matches!(dialog.kind, Kind::Thread { designation, options, .. } if designation == "5/16-24 UNF-2A" && options.form == ThreadForm::Unified)
+    );
+}
+
+/// An ISO metric class typed after the size stays through a pitch or size change (the Size and
+/// Pitch rows still read the size), and reaches the command and the reopened dialog.
+#[test]
+fn metric_form_keeps_an_authored_class() {
+    let mut h = shaft();
+    type_in(&mut h, "Designation", "M8-6g");
+    assert_eq!(params(&h)["designation"], "M8-6g");
+    choose(&mut h, "Size", "3 mm");
+    assert_eq!(params(&h)["designation"], "M3-6g", "a new size starts with its coarse pitch");
+    type_in(&mut h, "Designation", "M8-6g");
+    choose(&mut h, "Pitch", "1 mm");
+    assert_eq!(params(&h)["designation"], "M8x1-6g");
+    let (command, args) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+    h.app.run(&command, args).unwrap();
+    assert_eq!(h.app.session.model.state().threads[0].designation, "M8x1-6g");
+    let saved = h.app.session.doc.features.last().unwrap().clone();
+    let mut dialog = crate::dialogs::Dialog::for_command(&h.app, "solid.thread").unwrap();
+    crate::dialogs_thread::reopen(&mut dialog, &h.app.session, &saved);
+    assert!(matches!(dialog.kind, Kind::Thread { designation, .. } if designation == "M8x1-6g"));
+}
+
 /// The dialog shows the command's own error text for options it cannot build.
 #[test]
 fn the_command_error_is_what_the_dialog_shows() {
@@ -244,6 +297,7 @@ fn the_forms_are_the_documents_and_square_is_not_offered() {
     assert_eq!(parse(ThreadForm::Trapezoidal, "M10x1"), None);
     assert_eq!(pitches(ThreadForm::Metric, 8.0, 1.25), [1.25, 1.0, 0.75, 0.5, 0.35, 0.25, 0.2]);
     assert_eq!(example(ThreadForm::ButtressAsme), "2.5-8 BUTT");
+    assert_eq!(example(ThreadForm::Custom), "C10x1.5x90");
     assert_eq!(example(ThreadForm::Trapezoidal), "Tr20x4");
 }
 
@@ -323,6 +377,7 @@ fn a_saved_thread_reopens_with_every_option() {
         ),
         (json!({"designation":"M20","from":[10,0,20],"up_to":[10,0,5]}), vec!["Cylindrical face", START_END, UP_TO]),
         (json!({"designation":"M20","up_to":"XY","from":[10,0,20]}), vec!["Cylindrical face", START_END, UP_TO]),
+        (json!({"designation":"M20","length":"8 mm","offset":"3 mm","from":[10,0,20]}), vec!["Cylindrical face", START_END]),
     ] {
         let mut h = Harness::new();
         h.call("ui.resize", json!({"width":1600,"height":1400}));
@@ -354,4 +409,646 @@ fn a_saved_thread_reopens_with_every_option() {
         let (cmd, params) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
         h.app.session.execute(&cmd, &params).unwrap_or_else(|e| panic!("{made}: OK on the reopened dialog: {e}"));
     }
+}
+
+/// Four separate cylindrical faces on an extruded boss and its circular-pattern copies.
+fn patterned_shafts() -> (Harness, Vec<Sel>) {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.run("solid.cylinder", json!({"radius":30,"height":3,"body_name":"Plate"})).unwrap();
+    h.app.run("sketch.create", json!({"plane":"XY","offset":3,"name":"PostSketch"})).unwrap();
+    h.app.run("sketch.circle.center", json!({"center":[20,0],"radius":3})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.app.run("solid.extrude", json!({"distance":10,"operation":"join","targets":["Plate"],"name":"Post"})).unwrap();
+    h.app.run("solid.pattern.circular", json!({"features":["Post"],"axis":"Z","count":4,"name":"Posts"})).unwrap();
+    let topology = h.app.run("model.faces", json!({"body":"Plate"})).unwrap();
+    let picks = topology["faces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|face| face["cylinder"]["radius"].as_f64().is_some_and(|r| (r - 3.0).abs() < 1e-8))
+        .map(|face| serde_json::from_value(json!({"type":"face","body":"Plate","index":face["index"],"point":face["point"]})).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(picks.len(), 4);
+    (h, picks)
+}
+
+/// Ordinary clicks replace the previous face when Thread starts with zero or one selected face.
+#[test]
+fn ordinary_thread_face_clicks_replace_the_previous_face() {
+    let mut h = Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":4,"height":10,"body_name":"First"})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":[30,0,0],"radius":10,"height":10,"body_name":"Second"})).unwrap();
+    let first = thread_face(&h.app, "First");
+    let second = thread_face(&h.app, "Second");
+    for selection in [vec![], vec![first.clone()]] {
+        let expected: Vec<_> = selection.first().cloned().into_iter().collect();
+        h.app.session.selection = selection;
+        h.app.start("solid.thread");
+        let d = h.app.dialog.as_ref().unwrap();
+        assert!(!d.inputs[0].multi);
+        assert_eq!(d.inputs[0].items, expected);
+        for pick in [first.clone(), second.clone(), second.clone()] {
+            let Sel::Face { body, index, point } = &pick else { panic!("face") };
+            let hit = crate::viewport::Hit::Face { body: body.clone(), index: *index, point: *point };
+            crate::viewport::dialog_pick(&mut h.app, &hit, pick.clone());
+            let d = h.app.dialog.as_ref().unwrap();
+            assert!(!d.inputs[0].multi);
+            assert_eq!(d.inputs[0].items, vec![pick]);
+        }
+        let d = h.app.dialog.as_ref().unwrap();
+        assert!(matches!(&d.kind, Kind::Thread { designation, .. } if designation == "M20"));
+        let commands = apply_commands(&h.app, d).unwrap();
+        assert!(commands[0].1.get("face").is_none());
+        assert_eq!(commands[0].1["faces"][0]["body"], "Second");
+        assert_eq!(commands[0].1["single_face_selection"], true);
+        crate::dialogs::cancel(&mut h.app);
+    }
+}
+
+/// A size filled in for a Ø150 shaft is replaced by the next face's automatic size, while a typed one stays.
+#[test]
+fn a_filled_in_large_size_gives_way_to_the_next_faces_automatic_size_but_a_typed_one_stays() {
+    let mut h = Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":75,"height":10,"body_name":"Big"})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":[200,0,0],"radius":10,"height":10,"body_name":"Small"})).unwrap();
+    let big = thread_face(&h.app, "Big");
+    let small = thread_face(&h.app, "Small");
+    let designation = |h: &Harness| match &h.app.dialog.as_ref().unwrap().kind {
+        Kind::Thread { designation, suggested, .. } => (designation.clone(), suggested.clone()),
+        _ => panic!("Thread"),
+    };
+    let pick = |h: &mut Harness, sel: &Sel| {
+        let Sel::Face { body, index, point } = sel else { panic!("face") };
+        let hit = crate::viewport::Hit::Face { body: body.clone(), index: *index, point: *point };
+        crate::viewport::dialog_pick(&mut h.app, &hit, sel.clone());
+    };
+    h.app.session.selection = vec![big.clone()];
+    h.app.start("solid.thread");
+    assert_eq!(designation(&h), ("M150x4".to_string(), None));
+    pick(&mut h, &small);
+    assert_eq!(designation(&h), ("M20".to_string(), Some("M20".to_string())));
+    pick(&mut h, &big);
+    assert_eq!(designation(&h).0, "M150x4");
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands[0].1["designation"], "M150x4");
+    pick(&mut h, &small);
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert!(commands[0].1.get("designation").is_none());
+    if let Kind::Thread { designation, suggested, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *designation = "M12".into();
+        *suggested = None;
+    }
+    pick(&mut h, &big);
+    pick(&mut h, &small);
+    assert_eq!(designation(&h).0, "M12");
+    crate::dialogs::cancel(&mut h.app);
+}
+
+/// Marquee replacement keeps one face until an explicit add enables grouped selection.
+#[test]
+fn thread_box_selection_keeps_one_face_until_explicit_add() {
+    let (mut h, picks) = patterned_shafts();
+    h.app.session.selection.clear();
+    for added in [vec![picks[1].clone()], picks[..2].to_vec()] {
+        let mut d = crate::dialogs::Dialog::for_command(&h.app, "solid.thread").unwrap();
+        d.take_box(&h.app.session, picks[..2].to_vec(), false);
+        assert!(!d.inputs[0].multi);
+        assert_eq!(d.inputs[0].items, picks[..1]);
+        d.take_box(&h.app.session, picks[2..].to_vec(), false);
+        assert!(!d.inputs[0].multi);
+        assert_eq!(d.inputs[0].items, picks[2..3]);
+        d.take_box(&h.app.session, picks[..2].to_vec(), false);
+        d.take_box(&h.app.session, added, true);
+        assert!(d.inputs[0].multi);
+        assert_eq!(d.inputs[0].items, picks[..2]);
+        d.pick(&h.app.session, picks[2].clone());
+        assert_eq!(d.inputs[0].items, picks[..3]);
+        d.pick(&h.app.session, picks[2].clone());
+        assert_eq!(d.inputs[0].items, picks[..2]);
+        let commands = apply_commands(&h.app, &d).unwrap();
+        assert_eq!(commands[0].1["faces"].as_array().unwrap().len(), 2);
+        d.take_box(&h.app.session, picks[2..].to_vec(), false);
+        assert_eq!(d.inputs[0].items, picks[2..]);
+        // Start/Up To inputs keep their existing single-selection contract.
+        let Kind::Thread { options, .. } = &mut d.kind else { panic!("Thread") };
+        options.extent = UP_TO_EXTENT;
+        sync_inputs(&mut d.inputs, &mut d.active, options, &h.app.session.doc);
+        let up_to = d.inputs.iter().position(|i| i.label == UP_TO).unwrap();
+        d.active = up_to;
+        d.take_box(&h.app.session, picks[..2].to_vec(), false);
+        assert!(!d.inputs[up_to].multi);
+        assert_eq!(d.inputs[up_to].items.len(), 1);
+    }
+}
+
+/// Older saved groups have no target body domain but still keep every selected face when edited.
+#[test]
+fn a_legacy_multi_face_thread_reopens_in_group_selection_mode() {
+    let mut h = Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":4,"height":10,"body_name":"First"})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":[30,0,0],"radius":4,"height":10,"body_name":"Second"})).unwrap();
+    let faces = ["First", "Second"]
+        .into_iter()
+        .map(|body| match thread_face(&h.app, body) {
+            Sel::Face { point, .. } => json!({"body":body,"point":point}),
+            _ => panic!("face"),
+        })
+        .collect::<Vec<_>>();
+    let id = h.app.run("solid.thread", json!({"faces":faces,"designation":"M8"})).unwrap()["feature"].as_u64().unwrap();
+    let doc = std::sync::Arc::make_mut(&mut h.app.session.doc);
+    let FeatureKind::Thread { target_bodies, .. } = &mut doc.feature_mut(id).unwrap().kind else { panic!("Thread") };
+    target_bodies.clear();
+    let saved = h.app.session.doc.to_json();
+    *h.app = crate::SolveApp::new(Session::new(Document::from_json(&saved).unwrap()), crate::Services::default());
+    assert_eq!(h.app.session.model.state().threads.len(), 2);
+    h.app.edit_feature(id);
+    h.frames(2);
+    let d = h.app.dialog.take().unwrap();
+    assert!(d.inputs[0].multi);
+    assert_eq!(d.inputs[0].items.len(), 2);
+    assert!(h.app.session.model.state().threads.is_empty(), "editing shows the model before the Thread");
+    let commands = apply_commands(&h.app, &d).unwrap();
+    assert_eq!(commands[0].1["params"]["faces"].as_array().unwrap().len(), 2);
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.model.state().threads.len(), 2);
+    assert!(h.app.session.model.state().threads.iter().all(|thread| thread.feature == id));
+}
+
+/// Opening Thread keeps every preselected boss and sends their shared options in one command.
+#[test]
+fn all_preselected_pattern_faces_receive_the_threads_options() {
+    let (mut h, picks) = patterned_shafts();
+    h.app.session.selection = picks.clone();
+    h.app.start("solid.thread");
+    let d = h.app.dialog.as_mut().unwrap();
+    assert!(d.inputs[0].multi);
+    assert_eq!(d.inputs[0].items.len(), 4);
+    let Kind::Thread { designation, suggested, length, options, .. } = &mut d.kind else { panic!("Thread") };
+    *designation = "M6x0.75".into();
+    *suggested = None;
+    *length = "6 mm".into();
+    options.extent = LENGTH;
+    options.hand = ThreadHand::Left;
+    options.starts = 1;
+    d.extra.insert("modeled".into(), json!(true));
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands.len(), 1);
+    let (command, params) = &commands[0];
+    assert_eq!(command, "solid.thread");
+    assert!(params.get("face").is_none());
+    assert_eq!(params["faces"].as_array().unwrap().len(), 4);
+    for (face, pick) in params["faces"].as_array().unwrap().iter().zip(&picks) {
+        let Sel::Face { body, point, .. } = pick else { panic!("face") };
+        assert_eq!(*face, json!({"body":body,"point":[point.x, point.y, point.z]}));
+    }
+    assert_eq!(params["designation"], "M6x0.75");
+    assert_eq!(params["length"], "6 mm");
+    assert_eq!(params["hand"], "left");
+    assert!(params.get("starts").is_none(), "the single-start default stays omitted");
+    assert_eq!(params["modeled"], true);
+}
+
+/// One OK creates one saved feature for four threads, undone and redone together.
+#[test]
+fn a_thread_on_four_pattern_faces_applies_and_undoes_as_one_operation() {
+    let volume = |app: &crate::SolveApp| app.session.model.state().body("Plate").unwrap().mesh().measure().volume;
+    for modeled in [false, true] {
+        let (mut h, picks) = patterned_shafts();
+        h.app.session.selection = picks.clone();
+        h.app.start("solid.thread");
+        let mut d = h.app.dialog.take().unwrap();
+        let Kind::Thread { designation, suggested, .. } = &mut d.kind else { panic!("Thread") };
+        *designation = "M6x0.75".into();
+        *suggested = None;
+        if modeled {
+            d.extra.insert("modeled".into(), json!(true));
+        }
+        let before = h.app.session.doc.to_json();
+        let smooth_volume = volume(&h.app);
+        let markings = if modeled { 0 } else { 4 };
+        let undo = h.app.session.undo.len();
+        let features = h.app.session.doc.features.len();
+        crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+        assert_eq!(h.app.session.doc.features.len(), features + 1);
+        let feature = h.app.session.doc.features.last().unwrap();
+        let id = feature.id;
+        let saved_kind = feature.kind.clone();
+        let FeatureKind::Thread { additional_faces, target_bodies, modeled: saved_modeled, .. } = &feature.kind else { panic!("Thread") };
+        assert_eq!(*saved_modeled, modeled);
+        assert_eq!(additional_faces.len(), 3);
+        assert_eq!(target_bodies.iter().map(|n| n.as_ref()).collect::<Vec<&str>>(), ["Plate"; 4]);
+        let threads = h.app.session.model.state().threads.clone();
+        assert_eq!(threads.len(), markings);
+        let threaded_volume = volume(&h.app);
+        if modeled {
+            assert!(smooth_volume - threaded_volume > 1.0, "modeled threads remove material");
+        } else {
+            assert!((smooth_volume - threaded_volume).abs() < 1e-6, "cosmetic threads keep the solid");
+        }
+        for thread in &threads {
+            assert_eq!(thread.designation, "M6x0.75");
+            assert_eq!(thread.feature, id, "all markings belong to one timeline feature");
+        }
+        assert_eq!(h.app.session.undo.len(), undo + 1);
+        let saved = h.app.session.doc.to_json();
+        let reopened = Session::new(Document::from_json(&saved).unwrap());
+        assert_eq!(reopened.model.state().threads.len(), markings);
+        assert_eq!(reopened.doc.features.len(), features + 1);
+        let reopened_app = crate::SolveApp::new(reopened, crate::Services::default());
+        assert!((volume(&reopened_app) - threaded_volume).abs() < 1e-6, "saving preserves the threaded shape");
+        let reopened_dialog = crate::dialogs::for_feature(&reopened_app, id, None).unwrap();
+        assert_eq!(reopened_dialog.inputs[0].items.len(), 4);
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(h.app.session.doc.to_json(), before);
+        assert!(h.app.session.model.state().threads.is_empty());
+        assert!((volume(&h.app) - smooth_volume).abs() < 1e-6, "one undo restores the smooth shafts");
+        h.app.run("edit.redo", json!({})).unwrap();
+        assert_eq!(h.app.session.model.state().threads.len(), markings);
+        assert_eq!(h.app.session.doc.feature(id).unwrap().kind, saved_kind);
+        assert!((volume(&h.app) - threaded_volume).abs() < 1e-6, "one redo restores the threaded shape");
+    }
+}
+
+/// A later invalid face leaves none of the preceding cosmetic threads in the document.
+#[test]
+fn an_invalid_face_cannot_partially_apply_a_thread_batch() {
+    let (mut h, mut picks) = patterned_shafts();
+    h.app.session.selection = picks.clone();
+    h.app.start("solid.thread");
+    h.app.dialog.as_mut().unwrap().take_box(&h.app.session, picks.clone(), true);
+    let mut d = h.app.dialog.take().unwrap();
+    let Kind::Thread { designation, suggested, .. } = &mut d.kind else { panic!("Thread") };
+    *designation = "M6x0.75".into();
+    *suggested = None;
+    let topology = h.app.run("model.faces", json!({"body":"Plate"})).unwrap();
+    let plate = topology["faces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|face| face["cylinder"]["radius"].as_f64().is_some_and(|r| (r - 30.0).abs() < 1e-8))
+        .unwrap();
+    picks.push(serde_json::from_value(json!({"type":"face","body":"Plate","index":plate["index"],"point":plate["point"]})).unwrap());
+    d.inputs[0].items = picks;
+    let before = h.app.session.doc.to_json();
+    let undo = h.app.session.undo.len();
+    assert!(crate::dialogs::run_dialog(&mut h.app, &d).is_err());
+    assert_eq!(h.app.session.doc.to_json(), before);
+    assert_eq!(h.app.session.undo.len(), undo);
+    assert!(h.app.session.model.state().threads.is_empty());
+}
+
+/// Editing the grouped feature restores every face and can add or remove its members.
+#[test]
+fn editing_a_grouped_thread_reopens_adds_and_removes_faces() {
+    let (mut h, picks) = patterned_shafts();
+    h.app.session.selection = picks[..2].to_vec();
+    h.app.start("solid.thread");
+    h.app.dialog.as_mut().unwrap().take_box(&h.app.session, picks[..2].to_vec(), true);
+    let mut d = h.app.dialog.take().unwrap();
+    let Kind::Thread { designation, suggested, .. } = &mut d.kind else { panic!("Thread") };
+    *designation = "M6x0.75".into();
+    *suggested = None;
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    let id = h.app.session.doc.features.last().unwrap().id;
+    let features = h.app.session.doc.features.len();
+    assert_eq!(h.app.session.model.state().threads.len(), 2);
+    for selected in [picks.clone(), vec![picks[0].clone()]] {
+        let previous = h.app.session.model.state().threads.len();
+        let mut d = crate::dialogs::for_feature(&h.app, id, None).unwrap();
+        assert!(d.inputs[0].multi);
+        assert_eq!(d.inputs[0].items.len(), previous);
+        d.take_box(&h.app.session, selected.clone(), false);
+        let commands = apply_commands(&h.app, &d).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "timeline.redefine");
+        assert_eq!(commands[0].1["feature"], id);
+        let params = &commands[0].1["params"];
+        assert!(params.get("face").is_none(), "an edited body-qualified group retains its identity domain");
+        assert_eq!(params["faces"].as_array().unwrap().len(), selected.len());
+        h.app.session.execute(&commands[0].0, &commands[0].1).unwrap();
+        assert_eq!(h.app.session.doc.features.len(), features);
+        let state = h.app.session.model.state();
+        assert_eq!(state.threads.len(), selected.len());
+        assert!(state.threads.iter().all(|thread| thread.feature == id));
+        let reopened = crate::dialogs::for_feature(&h.app, id, None).unwrap();
+        assert!(reopened.inputs[0].multi, "a saved group keeps its selection mode with one member");
+        assert_eq!(reopened.inputs[0].items.len(), selected.len());
+    }
+}
+
+/// Repeated points on the same selected face create one feature, not duplicate markings.
+#[test]
+fn duplicate_face_picks_create_only_one_thread_command() {
+    let mut h = shaft();
+    let d = h.app.dialog.as_mut().unwrap();
+    let mut duplicate = d.inputs[0].items[0].clone();
+    if let Sel::Face { point, .. } = &mut duplicate {
+        point.z = 5.0;
+    }
+    d.inputs[0].items.push(duplicate);
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].1.get("face").is_none());
+    assert_eq!(commands[0].1["faces"].as_array().unwrap().len(), 1);
+    assert_eq!(commands[0].1["single_face_selection"], true);
+}
+
+/// A full history still retains the state before every thread of the operation.
+#[test]
+fn a_thread_batch_keeps_its_start_when_the_undo_history_is_full() {
+    let (mut h, picks) = patterned_shafts();
+    h.app.session.selection = picks.clone();
+    h.app.start("solid.thread");
+    h.app.dialog.as_mut().unwrap().take_box(&h.app.session, picks.clone(), true);
+    let mut d = h.app.dialog.take().unwrap();
+    let Kind::Thread { designation, suggested, .. } = &mut d.kind else { panic!("Thread") };
+    *designation = "M6x0.75".into();
+    *suggested = None;
+    let before = h.app.session.doc.to_json();
+    let earlier = h.app.session.undo.last().unwrap().clone();
+    // Exercise the engine's 200-step history without computing 200 extra features.
+    h.app.session.undo.resize(200, earlier);
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.undo.len(), 200);
+    assert_eq!(h.app.session.model.state().threads.len(), 4);
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(h.app.session.doc.to_json(), before);
+    assert!(h.app.session.model.state().threads.is_empty());
+}
+
+/// Editing after an upstream move resolves every saved face name, including the Up To slot.
+#[test]
+fn a_grouped_thread_reopens_named_faces_after_its_shafts_move() {
+    let mut h = Harness::new();
+    h.app.run("parameters.add", json!({"name":"shift","expression":"0 mm"})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":["shift",0,0],"radius":3,"height":10,"body_name":"First"})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":["shift + 30 mm",0,0],"radius":3,"height":10,"body_name":"Second"})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":["shift",30,0],"radius":3,"height":10,"body_name":"Limit"})).unwrap();
+    let id = h
+        .app
+        .run(
+            "solid.thread",
+            json!({
+                "faces":[{"body":"First","point":[3,0,2]},{"body":"Second","point":[33,0,2]}],"designation":"M6x0.75","from":[3,0,0],"up_to":[0,30,10]
+            }),
+        )
+        .unwrap()["feature"]
+        .as_u64()
+        .unwrap();
+    let names = h.app.session.doc.feature(id).unwrap().face_names.clone();
+    assert_eq!(names.len(), 3, "primary face, Up To face, then the second shaft");
+    assert!(names.iter().all(|name| !name.is_empty()));
+    h.app.run("parameters.change", json!({"name":"shift","expression":"50 mm"})).unwrap();
+    assert!(h.app.session.model.results.iter().all(|result| result.error.is_none()));
+    let feature = h.app.session.doc.feature(id).unwrap();
+    assert_eq!(feature.face_names, names);
+    let FeatureKind::Thread { face, additional_faces, .. } = &feature.kind else { panic!("Thread") };
+    assert_eq!(face.0.x, 3.0, "the saved point remains at its original location");
+    assert_eq!(additional_faces[0].0.x, 33.0);
+    let saved = h.app.session.doc.to_json();
+    *h.app = crate::SolveApp::new(Session::new(Document::from_json(&saved).unwrap()), crate::Services::default());
+    let features = h.app.session.doc.features.len();
+    h.app.edit_feature(id);
+    h.frames(2);
+    let d = h.app.dialog.take().expect("the saved group can be edited");
+    assert_eq!(d.inputs[0].items.len(), 2);
+    for (pick, expected) in d.inputs[0].items.iter().zip(["First", "Second"]) {
+        let Sel::Face { body, point, .. } = pick else { panic!("face") };
+        assert_eq!(body, expected, "the Up To name cannot stand for an added shaft");
+        assert!(point.x >= 47.0 - 1e-6, "the pick follows its moved source, not its saved coordinate");
+    }
+    let commands = apply_commands(&h.app, &d).unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, "timeline.redefine");
+    let params = &commands[0].1["params"];
+    assert_eq!(params["faces"].as_array().unwrap().len(), 2);
+    assert!(params["up_to"][0].as_f64().unwrap() >= 47.0 - 1e-6, "Up To follows its own name too");
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.doc.features.len(), features);
+    let state = h.app.session.model.state();
+    assert_eq!(state.threads.len(), 2);
+    for (thread, (body, x)) in state.threads.iter().zip([("First", 50.0), ("Second", 80.0)]) {
+        assert_eq!(thread.feature, id);
+        assert_eq!(thread.body, body);
+        assert!((thread.axis_point.x - x).abs() < 1e-6);
+    }
+}
+
+/// Reopening an unchanged group preserves its exact saved picks through name reprojection.
+#[test]
+fn an_unchanged_grouped_thread_edit_keeps_its_exact_saved_parameters() {
+    let mut h = Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":3,"height":10,"body_name":"First"})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":[30,0,0],"radius":3,"height":10,"body_name":"Second"})).unwrap();
+    let points = ["First", "Second"]
+        .into_iter()
+        .map(|body| match thread_face(&h.app, body) {
+            Sel::Face { point, .. } => json!({"body":body,"point":point}),
+            other => panic!("expected a cylindrical face: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let id = h.app.run("solid.thread", json!({"faces":points,"designation":"M6x0.75"})).unwrap()["feature"].as_u64().unwrap();
+    let before = h.app.session.doc.feature(id).unwrap().kind.clone();
+    let saved = h.app.session.doc.to_json();
+    *h.app = crate::SolveApp::new(Session::new(Document::from_json(&saved).unwrap()), crate::Services::default());
+    h.app.edit_feature(id);
+    h.frames(2);
+    let d = h.app.dialog.take().expect("the unchanged group can be edited");
+    assert_eq!(d.inputs[0].items.len(), 2);
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.doc.feature(id).unwrap().kind, before, "a no-op edit preserves every saved floating-point value");
+}
+
+/// A single selected face retains its body even when another cylinder occupies the same place.
+#[test]
+fn a_single_thread_face_keeps_the_selected_body_when_shafts_coincide() {
+    let mut h = Harness::new();
+    for body in ["A", "B"] {
+        h.app.run("solid.cylinder", json!({"radius":4,"height":8,"body_name":body,"operation":"new"})).unwrap();
+    }
+    h.app.session.selection = vec![thread_face(&h.app, "B")];
+    h.app.start("solid.thread");
+    let d = h.app.dialog.take().unwrap();
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.model.state().threads.iter().map(|thread| thread.body.as_str()).collect::<Vec<_>>(), ["B"]);
+    let id = h.app.session.doc.features.last().unwrap().id;
+    h.app.run("body.rename", json!({"body":"B","name":"Renamed"})).unwrap();
+    let saved = h.app.session.doc.to_json();
+    *h.app = crate::SolveApp::new(Session::new(Document::from_json(&saved).unwrap()), crate::Services::default());
+    h.app.edit_feature(id);
+    h.frames(2);
+    let d = h.app.dialog.take().unwrap();
+    assert!(!d.inputs[0].multi, "a single selected face still replaces on a click after reopening");
+    assert!(matches!(&d.inputs[0].items[..], [Sel::Face { body, .. }] if body == "Renamed"));
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.model.state().threads.iter().map(|thread| thread.body.as_str()).collect::<Vec<_>>(), ["Renamed"]);
+    let mut d = crate::dialogs::for_feature(&h.app, id, None).unwrap();
+    d.take_box(&h.app.session, vec![thread_face(&h.app, "A")], true);
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.model.state().threads.iter().map(|thread| thread.body.as_str()).collect::<Vec<_>>(), ["Renamed", "A"]);
+    let d = crate::dialogs::for_feature(&h.app, id, None).unwrap();
+    assert!(d.inputs[0].multi, "explicitly adding a face switches the saved selection mode");
+}
+
+/// Editing an older point-only thread also retains the body of its replacement face.
+#[test]
+fn editing_a_legacy_thread_can_select_a_coincident_body() {
+    let mut h = Harness::new();
+    for body in ["A", "B"] {
+        h.app.run("solid.cylinder", json!({"radius":4,"height":8,"body_name":body,"operation":"new"})).unwrap();
+    }
+    let id = h.app.run("solid.thread", json!({"face":[4,0,2],"designation":"M8"})).unwrap()["feature"].as_u64().unwrap();
+    let mut d = crate::dialogs::for_feature(&h.app, id, None).unwrap();
+    assert!(!d.inputs[0].multi);
+    d.take_box(&h.app.session, vec![thread_face(&h.app, "B")], false);
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.model.state().threads.iter().map(|thread| thread.body.as_str()).collect::<Vec<_>>(), ["B"]);
+    assert!(!crate::dialogs::for_feature(&h.app, id, None).unwrap().inputs[0].multi);
+}
+
+/// Cold edit and rename preserve each body's identity, even where two source bodies coincide.
+#[test]
+fn grouped_thread_dialog_preserves_coincident_body_identities_and_missing_slots() {
+    let mut h = Harness::new();
+    for body in ["A", "B"] {
+        h.app.run("solid.cylinder", json!({"radius":4,"height":8,"body_name":body,"operation":"new"})).unwrap();
+    }
+    let id = h.app.run("solid.thread", json!({"faces":[{"body":"B","point":[4,0,2]},{"body":"A","point":[4,0,2]}],"designation":"M8"})).unwrap()["feature"].as_u64().unwrap();
+    h.app.run("body.rename", json!({"body":"B","name":"Renamed"})).unwrap();
+    let saved = h.app.session.doc.to_json();
+    *h.app = crate::SolveApp::new(Session::new(Document::from_json(&saved).unwrap()), crate::Services::default());
+    h.app.edit_feature(id);
+    h.frames(2);
+    let mut d = h.app.dialog.take().unwrap();
+    let commands = apply_commands(&h.app, &d).unwrap();
+    let faces = commands[0].1["params"]["faces"].as_array().unwrap();
+    assert_eq!(faces.iter().map(|p| p["body"].as_str().unwrap()).collect::<Vec<_>>(), ["Renamed", "A"]);
+    crate::dialogs::run_dialog(&mut h.app, &d).unwrap();
+    assert_eq!(h.app.session.model.state().threads.iter().map(|t| t.body.as_str()).collect::<Vec<_>>(), ["Renamed", "A"]);
+    d.inputs[0].items.truncate(1);
+    let commands = apply_commands(&h.app, &d).unwrap();
+    assert_eq!(commands[0].1["params"]["faces"].as_array().unwrap().len(), 1);
+    assert_eq!(commands[0].1["params"]["faces"][0]["body"], "Renamed");
+    // An unresolved saved slot remains visible and blocks Apply, rather than dropping a face.
+    let mut broken: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    broken["features"].as_array_mut().unwrap().last_mut().unwrap()["face_names"][1] = json!("missing");
+    let app = crate::SolveApp::new(Session::new(Document::from_json(&broken.to_string()).unwrap()), crate::Services::default());
+    let d = crate::dialogs::for_feature(&app, id, None).unwrap();
+    assert_eq!(d.inputs[0].items.len(), 2, "the failed saved reference is not silently dropped");
+    assert!(apply_commands(&app, &d).is_err());
+}
+
+/// A stud is chamfered at both ends: with the start chamfered, "Chamfer both ends" sends the
+/// command's `tip: both`, and unticking it goes back to the start alone (#20629).
+#[test]
+fn a_thread_can_be_chamfered_at_both_ends() {
+    let mut h = shaft();
+    // A checkbox, not a labelled row: its own handle is what is drawn.
+    assert!(crate::scenario::handle_at("dialog:Chamfer both ends").is_none(), "only offered once the start is chamfered");
+    choose(&mut h, "Start", "Chamfer");
+    assert!(crate::scenario::handle_at("dialog:Chamfer both ends").is_some());
+    assert_eq!(params(&h)["tip"], "start");
+    click(&mut h, &["dialog:Chamfer both ends"]);
+    assert_eq!(params(&h)["tip"], "both");
+    assert_eq!(options(&h).tip, ThreadTip::Both);
+    click(&mut h, &["dialog:Chamfer both ends"]);
+    assert_eq!(params(&h)["tip"], "start");
+    choose(&mut h, "Start", "None");
+    assert!(params(&h).get("tip").is_none());
+}
+
+/// Review of #23393: a tip chamfered before Custom is chosen is cleared even with the Ends
+/// section collapsed, where its rows are hidden, so the custom thread is never sent a tip.
+#[test]
+fn choosing_custom_with_the_ends_collapsed_clears_a_chamfered_tip() {
+    let mut h = shaft();
+    choose(&mut h, "Start", "Chamfer");
+    assert_eq!(params(&h)["tip"], "start");
+    click(&mut h, &["dialog:section:Ends"]);
+    // Custom is last in a long list, below the popup's fold; the window draws the form it holds.
+    match &mut h.app.dialog.as_mut().unwrap().kind {
+        Kind::Thread { options, .. } => options.form = ThreadForm::Custom,
+        k => panic!("{k:?}"),
+    }
+    h.frames(2);
+    assert_eq!(options(&h).tip, ThreadTip::None);
+    assert!(params(&h).get("tip").is_none(), "{}", params(&h));
+}
+
+/// #23145: a typed offset goes into the command and a blank one stays out, and with one the end to
+/// start from can be picked even on a Full thread. An offset that comes to 0 is none, as the
+/// command takes it; one that can't be worked out, or is negative, counts as given.
+#[test]
+fn an_offset_is_sent_only_when_typed_and_asks_for_the_start_end() {
+    let mut doc = Document::default();
+    doc.set_param("lead_in", "0 mm", Some("mm"), None).unwrap();
+    let mut o = Options::default();
+    let mut p = json!({});
+    put_params(&mut p, "", &o, &[]);
+    assert_eq!(p.get("offset"), None, "{p}");
+    assert!(!o.starts_at_an_end(&doc));
+    for none in ["  ", "0", "0 mm", "0 in", "lead_in"] {
+        o.offset = none.into();
+        assert!(!o.has_offset(&doc) && !o.starts_at_an_end(&doc), "`{none}` is no offset");
+    }
+    for given in ["4 mm", "-1 mm", "no_such_param"] {
+        o.offset = given.into();
+        assert!(o.has_offset(&doc) && o.starts_at_an_end(&doc), "`{given}` is an offset");
+    }
+    o.offset = "4 mm".into();
+    let mut p = json!({});
+    put_params(&mut p, "", &o, &[]);
+    assert_eq!(p["offset"], "4 mm");
+}
+
+/// Review of #23145: with an offset the start lies inside the face, so the Start row's Chamfer is
+/// the command's `tip: both`, the far end, as the refusal of `tip: start` advises; "Chamfer both
+/// ends" is then fixed on (the tip sent is `both`). The stud it makes builds, the far end its free one. An offset of 0 is
+/// none: the start-end pick stays away and Chamfer is the start again.
+#[test]
+fn a_chamfer_with_an_offset_is_the_far_ends_and_a_zero_offset_is_none() {
+    let inputs = |h: &Harness| h.app.dialog.as_ref().unwrap().inputs.iter().map(|i| i.label).collect::<Vec<_>>();
+    let mut h = shaft();
+    type_in(&mut h, "Offset", "0 mm");
+    assert_eq!(inputs(&h), ["Cylindrical face"], "an offset of 0 starts at no end in particular");
+    choose(&mut h, "Start", "Chamfer");
+    assert_eq!(params(&h)["tip"], "start");
+    choose(&mut h, "Start", "None");
+    type_in(&mut h, "Offset", "2 mm");
+    assert_eq!(inputs(&h), ["Cylindrical face", START_END], "an offset starts at an end");
+    choose(&mut h, "Start", "Chamfer");
+    assert!(shown("Chamfer Angle") && shown("Chamfer Depth"));
+    click(&mut h, &["dialog:Modeled"]);
+    let (cmd, mut p) = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+    assert_eq!((&p["tip"], &p["offset"]), (&json!("both"), &json!("2 mm")), "{p}");
+    // From the top of the 10 mm shaft: the thread runs z 8 down to 0, whose end is free.
+    p["from"] = json!([0, 0, 10]);
+    h.app.session.execute(&cmd, &p).unwrap_or_else(|e| panic!("{p}: {e}"));
+}
+
+/// Review of #23317: clearing the offset brings back the chamfer the user chose. With an offset the
+/// start's chamfer is sent as `tip: both`, but the window keeps the user's Start, so an offset of 0
+/// (none) sends `tip: start` again and "Chamfer both ends" is not left ticked.
+#[test]
+fn clearing_the_offset_brings_back_the_chosen_start_chamfer() {
+    let mut h = shaft();
+    type_in(&mut h, "Offset", "2 mm");
+    choose(&mut h, "Start", "Chamfer");
+    assert_eq!(params(&h)["tip"], "both");
+    assert_eq!(options(&h).tip, ThreadTip::Start, "the window keeps the user's choice");
+    type_in(&mut h, "Offset", "0 mm");
+    assert_eq!(params(&h)["tip"], "start");
+    assert_eq!(options(&h).tip, ThreadTip::Start);
+}
+
+/// Review of #23317: the offset is a length like the thread's own, so a bare number in an inch
+/// design is inches (sent with its unit), not millimetres.
+#[test]
+fn an_offset_typed_in_an_inch_design_is_inches() {
+    let mut h = shaft();
+    h.app.run("document.units", json!({ "units": "in" })).unwrap();
+    h.frames(2);
+    type_in(&mut h, "Offset", "0.1");
+    assert_eq!(params(&h)["offset"], "0.1 in");
 }

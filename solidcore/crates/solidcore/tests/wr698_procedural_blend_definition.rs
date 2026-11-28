@@ -19,6 +19,7 @@
 use solidcore::blend::fillet_section::section::{GnSectionFsg, GN_THUMBWEIGHT_EQUAL_AREA};
 use solidcore::geom::vector3d::{Point3, Vec3};
 use solidcore::kernel::Kernel;
+use solidcore::math::det;
 use solidcore::math::Point2;
 use solidcore::nurbs::b_spline_curve::{BSplineCurve, KnotType};
 use solidcore::nurbs::b_spline_surface::{
@@ -36,9 +37,7 @@ const L: f64 = 10.0;
 const R: f64 = 2.0;
 
 fn kernel() -> Kernel {
-    let mut k = Kernel::default();
-    k.fixes.fillet_round_as_definition = true;
-    k
+    Kernel::default()
 }
 
 fn bilinear(p: [Point3; 4]) -> BSplineSurface {
@@ -272,7 +271,7 @@ fn the_circle_between_planes_is_the_ball_s() {
             let d = pb.evaluate_definition(&k, s, t, 1, 1).unwrap();
             let p = d[0][0];
             assert!((p.x - L * s).abs() < 1e-12, "{p:?}");
-            let r = ((p.y - R).powi(2) + (p.z - R).powi(2)).sqrt();
+            let r = (det::powi(p.y - R, 2) + det::powi(p.z - R, 2)).sqrt();
             assert!((r - R).abs() < 1e-12, "{s} {t}: {r}");
             assert!((d[1][0] - Vec3::new(L, 0.0, 0.0)).length() < 1e-12);
         }
@@ -357,11 +356,16 @@ fn the_record_is_the_fork_s_and_reads_back() {
             let tol = if ft == FileType::Binary { 0.0 } else { 1e-9 };
             assert!((p - want).length() <= tol, "{ft:?}: {p:?} != {want:?}");
 
-            // without the flag the type is refused, as the pinned reader refuses it
-            let off = Kernel::default();
+            // a fresh kernel (no cache shared with the writer's) reads the type too, to the
+            // same point; the pinned reader refused it
+            let default = Kernel::default();
             let mut r = DatabaseReader::new();
             r.open_for_read(bytes.clone(), ft);
-            assert!(Surface::read_from_db(&off, PROCEDURAL_BLEND_TYPE, &mut r, 30).is_err());
+            let back = Surface::read_from_db(&default, PROCEDURAL_BLEND_TYPE, &mut r, 30).unwrap();
+            let q = back
+                .evaluate_point(&default, Point2::new(0.37, 0.6))
+                .unwrap();
+            assert!((q - want).length() <= tol, "{ft:?}: {q:?} != {want:?}");
         }
     }
 }
@@ -809,6 +813,7 @@ fn a_plane_label_needs_the_plane_s_parametrisation() {
         }
         r.definition.supports[0] = SupportRecord::Nurbs {
             kind: SupportKindRecord::Plane,
+            revolution: None,
             form: NurbsSurfaceRecord {
                 u_degree: 2,
                 v_degree: 1,
@@ -988,8 +993,9 @@ fn a_revolved_label_needs_the_form_s_parametrisation() {
             checked += 1;
         }
     }
-    // (the partial torus is a surface of revolution, no support label)
-    assert_eq!(checked, 8);
+    // (every curved face: the partial torus's revolved side is a torus too, its profile's
+    // analytic face since WR-448, and the round's)
+    assert_eq!(checked, 9);
 
     // a quarter cylinder of radius 2 about z from height 0 to 5, its quarter circle the
     // rational quadratic arc with end weights 1 and c^2 (c = 1 the circle's own
@@ -1136,8 +1142,9 @@ fn a_support_builds_from_its_own_label() {
             faces += 1;
         }
     }
-    // (the partial torus is a surface of revolution, no support label)
-    assert_eq!(faces, 7);
+    // (one curved analytic face per body: the partial torus's revolved side is a torus too,
+    // its profile's analytic face since WR-448, and its label builds it like the others')
+    assert_eq!(faces, 8);
 
     // a label off its form is still refused: the #2554 cone's radius changed by 1e-9,
     // which is far above the rounding of the recognition the old check compared against
@@ -1169,7 +1176,7 @@ fn turned_about_its_axis(label: AnalyticSupport, angle: f64) -> AnalyticSupport 
         | AnalyticSupport::Sphere { placement, .. }
         | AnalyticSupport::Torus { placement, .. } => placement,
     };
-    let (c, s) = (angle.cos(), angle.sin());
+    let (c, s) = (det::cos(angle), det::sin(angle));
     *p = Axis2Placement::new(
         p.origin(),
         p.x_axis() * c + p.y_axis() * s,
@@ -1239,7 +1246,7 @@ fn a_support_s_turned_frame_is_refused() {
 
         // a sphere's axis is unconstrained by its implicit equation too
         if let AnalyticSupport::Sphere { placement, radius } = label {
-            let (c, si) = (1e-6_f64.cos(), 1e-6_f64.sin());
+            let (c, si) = (det::cos(1e-6_f64), det::sin(1e-6_f64));
             let tilted = AnalyticSupport::Sphere {
                 placement: Axis2Placement::new(
                     placement.origin(),

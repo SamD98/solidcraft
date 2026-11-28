@@ -3,8 +3,8 @@ use solidcraft_geom::prelude::*;
 use solidcraft_geom::tess::EvaluateMesh as _;
 use solidcraft_kernel::{Body, BoolOp};
 
-use solidcore_tess::EvalSurface;
-use solidcore_tess::TessPlan;
+use solidcraft_kernel::services::tess::EvalSurface;
+use solidcraft_kernel::services::tess::TessPlan;
 use solidcraft_viewport_gpu::{GpuError, PackedPlans, SHADER, TessGpu, VERTEX_STRIDE, open_headless};
 
 /// The adapter policy this crate's GPU tests run under: the host's, from its environment.
@@ -37,6 +37,126 @@ fn gpu() -> Option<TessGpu> {
             None
         }
     }
+}
+
+/// Native teardown can fail after the test body returns, so verify a fresh process's exit too.
+#[test]
+fn fresh_headless_devices_finish_and_their_process_exits() {
+    const CHILD: &str = "SOLIDCRAFT_GPU_LIFETIME_TEST_CHILD";
+    const COMPLETE: &str = "headless GPU lifetimes completed: 10";
+    const UNAVAILABLE: &str = "headless GPU lifetimes unavailable";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let made = std::thread::scope(|scope| {
+            let create = || {
+                let mut made = 0;
+                for _ in 0..5 {
+                    let Some(device) = gpu() else { return made };
+                    assert!(!device.adapter_name().is_empty());
+                    drop(device);
+                    made += 1;
+                }
+                made
+            };
+            let first = scope.spawn(create);
+            let second = scope.spawn(create);
+            [ok(first.join()), ok(second.join())]
+        });
+        if made == [0, 0] && std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_none() {
+            println!("{UNAVAILABLE}");
+            return;
+        }
+        assert_eq!(made, [5, 5], "both workers must finish every actual GPU lifetime");
+        println!("{COMPLETE}");
+        return;
+    }
+    let mut child = ok(std::process::Command::new(ok(std::env::current_exe()))
+        .args(["--exact", "tests::fresh_headless_devices_finish_and_their_process_exits", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn());
+    // This bounds a stuck native destructor; it is not a performance expectation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let stdout_pipe = ok(child.stdout.take().ok_or("missing child stdout pipe"));
+    let stderr_pipe = ok(child.stderr.take().ok_or("missing child stderr pipe"));
+    fn drain(mut pipe: impl std::io::Read) -> (Vec<u8>, std::io::Result<usize>, bool) {
+        const CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        let mut total = 0_usize;
+        let mut truncated = false;
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => return (bytes, Ok(total), truncated),
+                Ok(count) => {
+                    total = total.saturating_add(count);
+                    let keep = count.min(CAPTURE_LIMIT.saturating_sub(bytes.len()));
+                    bytes.extend_from_slice(&buffer[..keep]);
+                    truncated |= keep < count;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return (bytes, Err(error), truncated),
+            }
+        }
+    }
+    let (timed_out, poll_error, kill_error, status, stdout, stderr) = std::thread::scope(|scope| {
+        let stdout = match std::thread::Builder::new().name("gpu-test-stdout".into()).spawn_scoped(scope, move || drain(stdout_pipe)) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let kill = child.kill();
+                let status = child.wait();
+                panic!("could not start GPU child stdout reader: {error}; kill={kill:?}, status={status:?}");
+            }
+        };
+        let stderr = match std::thread::Builder::new().name("gpu-test-stderr".into()).spawn_scoped(scope, move || drain(stderr_pipe)) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let kill = child.kill();
+                let status = child.wait();
+                let drained = stdout.join();
+                panic!("could not start GPU child stderr reader: {error}; kill={kill:?}, status={status:?}, stdout={drained:?}");
+            }
+        };
+        let mut poll_error = None;
+        let mut kill_error = None;
+        let timed_out = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break false,
+                Ok(None) => {}
+                Err(error) => {
+                    poll_error = Some(error);
+                    kill_error = child.kill().err();
+                    break false;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                kill_error = child.kill().err();
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let status = child.wait();
+        (timed_out, poll_error, kill_error, status, ok(stdout.join()), ok(stderr.join()))
+    });
+    let (stdout_bytes, stdout_read, stdout_truncated) = stdout;
+    let (stderr_bytes, stderr_read, stderr_truncated) = stderr;
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    assert!(
+        !timed_out
+            && poll_error.is_none()
+            && status.as_ref().is_ok_and(|status| status.success())
+            && stdout_read.is_ok()
+            && stderr_read.is_ok()
+            && !stdout_truncated
+            && !stderr_truncated,
+        "native GPU child timed_out={timed_out}, status={status:?}, poll={poll_error:?}, kill={kill_error:?}, stdout={stdout_read:?}, stderr={stderr_read:?}, truncated=({stdout_truncated},{stderr_truncated}):\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(COMPLETE) || (std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_none() && stdout.contains(UNAVAILABLE)),
+        "the child must execute the scoped GPU lifetimes: {stdout}\n{stderr}"
+    );
 }
 
 /// A shader the device rejects when the pipeline is created (its binding 1 is writable, the
@@ -88,6 +208,30 @@ fn a_pipeline_the_device_rejects_is_an_error_not_a_crash() {
 fn the_shader_takes_every_degree_the_cpu_evaluator_does() {
     let slots = format!("const W: u32 = {}u;", solidcraft_geom::bspline::MAX_SPLINE_DEGREE + 1);
     assert!(SHADER.contains(&slots), "tess.wgsl must declare `{slots}`");
+}
+
+/// Older NVIDIA Vulkan drivers (a Kepler GeForce GT 730 on 456.71) misread an array value indexed
+/// by a loop counter: with the NURBS basis held in `let`, a third of a model's vertices came out
+/// millimetres off and the view showed stretched wedges, while D3D12 on the same card was right
+/// (#18685). The same arrays held in `var` are read right, so the shader indexes arrays only
+/// through a variable.
+#[test]
+fn the_shader_indexes_arrays_only_through_variables() {
+    let module = ok(naga::front::wgsl::parse_str(SHADER));
+    let info = ok(naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module));
+    let functions = module.functions.iter().map(|(handle, function)| (function, &info[handle]));
+    let entries = module.entry_points.iter().enumerate().map(|(i, entry)| (&entry.function, info.get_entry_point(i)));
+    for (function, function_info) in functions.chain(entries) {
+        for (handle, expression) in function.expressions.iter() {
+            let naga::Expression::Access { base, .. } = expression else { continue };
+            let base_type = function_info[*base].ty.inner_with(&module.types);
+            assert!(
+                !matches!(base_type, naga::TypeInner::Array { .. }),
+                "{:?} indexes an array value by a run-time index ({handle:?}): hold the array in a `var`",
+                function.name
+            );
+        }
+    }
 }
 
 /// Browsers compile WGSL with Tint, which keeps a rule of the WGSL grammar that naga doesn't: a
@@ -496,7 +640,7 @@ fn plans_pack_to_the_same_bytes() {
 fn a_plan_with_pole_nodes_is_refused_by_name() {
     let mut plan = gpu_form(&synthetic_plans()[0]);
     let face = plan.faces.get_mut(1).map(|f| {
-        f.poles.push(solidcore_tess::PoleNode { node: 0, rule: solidcore_tess::PoleRule::Averaged });
+        f.poles.push(solidcraft_kernel::services::tess::PoleNode { node: 0, rule: solidcraft_kernel::services::tess::PoleRule::Averaged });
         f.face
     });
     assert_eq!(face, Some(1));

@@ -32,6 +32,7 @@ use solidcore::boolean::api_brep::{boolean_difference, boolean_union};
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::kernel::UpstreamFixes;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, PI};
 use solidcore::primitive::api_primitives::{create_box, create_cylinder};
 use solidcore::query::api_queries::edge_closest_point;
@@ -153,8 +154,8 @@ fn arc_ended_box_volume(r: f64) -> f64 {
     let cut = simpson(|x| (20.0 - end_at(x)) * 30.0, 0.0, 10.0, n);
     let removed = simpson(
         |t| {
-            let x = 10.0 - r + r * t.sin();
-            (r - r * t.cos()) * end_at(x) * r * t.cos()
+            let x = 10.0 - r + r * det::sin(t);
+            (r - r * det::cos(t)) * end_at(x) * r * det::cos(t)
         },
         0.0,
         PI / 2.0,
@@ -373,4 +374,23 @@ fn the_cornered_block_s_rim_at_its_corners_radius_builds() {
     blend(&mut k, &mut b, &rim, 5.0, 1).unwrap();
     let removed = 754.0 * 25.0 * (1.0 - PI / 4.0) + 4.0 * (PI / 2.0) * (62.5 - 125.0 / 3.0);
     assert_one_sound_solid(&mut k, &mut b, before - removed, 1e-7);
+}
+
+// ---- an overflow the trim keeps nothing of, no corner taking any of its edge ----------
+
+/// A 10 cube's lone top edge x = 10, z = 10 chamfered 30: the chord runs past both faces,
+/// the edge's ends are open ends (no other edge is blended there, so no corner takes any of
+/// it) and the trim keeps none of it. Refused as an overflow that keeps nothing (class 129;
+/// before, under corners taking the whole edge, 110), naming the overflow's own bound, where
+/// the rails stay on their faces, unchanged: the faces' width 10 (open) less the margin.
+#[test]
+fn a_chamfer_the_trim_keeps_nothing_of_names_where_it_stays_on_its_faces() {
+    let at = Point3::new(10.0, 5.0, 10.0);
+    let mut k = kernel();
+    let mut b = create_box(&mut k, Point3::ZERO, 10.0, 10.0, 10.0).unwrap();
+    let m = margin(&k, &b, at);
+    let got = blend(&mut k, &mut b, &[at], 30.0, 0);
+    assert_refused(got, NoRoomReason::OverflowKeepsNothing, 10.0 - m);
+    let class = solidcore::error::blend::no_room_class(NoRoomReason::OverflowKeepsNothing);
+    assert_eq!(class as u16, 129);
 }

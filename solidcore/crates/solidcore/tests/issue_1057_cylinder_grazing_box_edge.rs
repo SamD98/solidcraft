@@ -3,8 +3,8 @@
 //! x = 0.0003 and passes 3e-8 inside the column's edge at x = 0, y = 1.5, so on each cap
 //! its arc meets the edge y = 1.5 twice: tangent at x = 0.0003, and at the edge's vertex.
 //! SMLib classifies the arc between them, within 3e-8 of the edge, inside the cap, splits
-//! the caps along it and keeps a solid 3e-8 thick. The opt-in
-//! `Kernel::fixes.classify_edge_interval` classifies such an interval to the edge.
+//! the caps along it and keeps a solid 3e-8 thick. The port classifies such an interval to
+//! the edge (`CurveClassification::classify_edge_interval`).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -14,6 +14,7 @@
 use solidcore::boolean::api_brep::boolean_difference;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::Point3;
 use solidcore::primitive::api_primitives::{create_box, create_cylinder};
 use solidcore::topology::brep::p1;
@@ -28,7 +29,7 @@ const X0: f64 = 0.0003;
 
 /// The integral of sqrt(r^2 - u^2) over u = a..b.
 fn half_disc(r: f64, a: f64, b: f64) -> f64 {
-    let f = |u: f64| 0.5 * (u * (r * r - u * u).sqrt() + r * r * (u / r).asin());
+    let f = |u: f64| 0.5 * (u * (r * r - u * u).sqrt() + r * r * det::asin(u / r));
     f(b) - f(a)
 }
 
@@ -48,15 +49,14 @@ fn solid_regions(b: &Brep) -> usize {
 }
 
 #[test]
-fn issue_1057_classify_edge_interval_is_off_by_default() {
-    assert!(!Kernel::default().fixes.classify_edge_interval);
-}
-
-#[test]
 fn issue_1057_grazing_cut_leaves_one_solid() {
     let mut k = Kernel::default();
-    k.fixes.classify_edge_interval = true;
     let mut b = cut(&mut k);
+    // the arc is put on the edge by the curved-piece certificate, not by another path
+    assert!(
+        k.work_counters.curved_edge_runs() >= 1,
+        "no curved piece certified on an edge"
+    );
     assert_eq!(
         solid_regions(&b),
         1,

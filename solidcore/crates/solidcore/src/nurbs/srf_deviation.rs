@@ -26,6 +26,7 @@
 //! Deviations: none (no upstream counterpart). Non-rational 3D surfaces only, of degrees 1 to
 //! [`MAX_DEGREE`], their knot vectors clamped on one domain.
 
+use crate::error::query::QueryFailure;
 use crate::error::{Result, SolidError};
 use crate::nurbs::crv_deviation::norm_up;
 use crate::nurbs::knots::MAX_DEGREE;
@@ -45,8 +46,8 @@ const OP: &str = "nurbs::srf_deviation::certified_distance";
 ///
 /// `InvalidInput` for a rational or 2D surface, a number not finite, a degree outside
 /// `1..=MAX_DEGREE` or knots that do not fit the net, knots not clamped, or two surfaces on
-/// different domains; a query failure when their patches do not match or the bound is not
-/// finite; those of the refinement, the extraction and the elevation.
+/// different domains; [`QueryFailure::BoundOverflows`] when the bound overflows the floating
+/// range; those of the refinement, the extraction and the elevation.
 pub fn certified_distance(a: &Surface, b: &Surface) -> Result<f64> {
     check(a)?;
     check(b)?;
@@ -83,7 +84,9 @@ pub fn certified_distance(a: &Surface, b: &Surface) -> Result<f64> {
     let moved = gamma(2) * size;
     let (pa, ea) = patches(a, b, degrees, size)?;
     let (pb, eb) = patches(b, a, degrees, size)?;
-    let mismatch = || SolidError::query_failed(OP, "the surfaces' patches do not match");
+    let mismatch = || {
+        SolidError::query(OP, QueryFailure::Defect { why: "both surfaces are cut into Bézier patches at the union of their knots and raised to the same degrees, so their patches pair up span by span with nets of one size" })
+    };
     if pa.len() != pb.len() {
         return Err(mismatch());
     }
@@ -105,7 +108,7 @@ pub fn certified_distance(a: &Surface, b: &Surface) -> Result<f64> {
                 }
                 for (p, r) in row_x.iter().zip(row_y) {
                     let d = norm_up(p.x - r.x, p.y - r.y, p.z - r.z)
-                        .ok_or_else(|| SolidError::query_failed(OP, "the bound is not finite"))?;
+                        .ok_or_else(|| SolidError::query(OP, QueryFailure::BoundOverflows))?;
                     largest = largest.max(d);
                 }
             }
@@ -113,7 +116,7 @@ pub fn certified_distance(a: &Surface, b: &Surface) -> Result<f64> {
     }
     let bound = (largest + 2.0 * (ea + eb + 2.0 * moved)) * (1.0 + gamma(2));
     if !bound.is_finite() {
-        return Err(SolidError::query_failed(OP, "the bound is not finite"));
+        return Err(SolidError::query(OP, QueryFailure::BoundOverflows));
     }
     Ok(bound)
 }
@@ -241,6 +244,7 @@ fn patches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::det;
     use crate::math::Vec3;
     use crate::nurbs::geom::Rectangle;
     use crate::nurbs::knots::{clamped_uniform, Side};
@@ -295,7 +299,8 @@ mod tests {
                 let (u, v) = (f64::from(i) / 40.0, f64::from(j) / 40.0);
                 let p = s.eval(u, v, Side::Left, Side::Left).unwrap();
                 let q = m.eval(u, v, Side::Left, Side::Left).unwrap();
-                let gap2 = (p.x - q.x).powi(2) + (p.y - q.y).powi(2) + (p.z - q.z).powi(2);
+                let gap2 =
+                    det::powi(p.x - q.x, 2) + det::powi(p.y - q.y, 2) + det::powi(p.z - q.z, 2);
                 assert!(gap2 <= d * d, "at ({u}, {v}): {gap2} past {d}²");
             }
         }

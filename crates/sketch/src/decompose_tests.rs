@@ -39,13 +39,13 @@ struct Placed {
 
 /// A constraint pushed without validation (hostile and oversized inputs).
 fn raw(kind: ConstraintKind) -> Constraint {
-    Constraint { id: "k".into(), kind, param: None, driven: false, text: None }
+    Constraint { id: "k".into(), kind, param: None, driven: false, driven_param: None, text: None }
 }
 
 /// A point pushed past the sketch's own size cap.
 fn push_point(sk: &mut Sketch, pos: Vec2) {
     let id = format!("p{}", sk.points.len());
-    sk.points.push(crate::model::SPoint { id, pos, fixed: false, link: None, exprs: None });
+    sk.points.push(crate::model::SPoint { id, pos, fixed: false, link: None, exprs: None, construction: false });
 }
 
 /// Every point of `ids` placed at its `want` position.

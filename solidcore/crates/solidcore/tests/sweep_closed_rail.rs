@@ -1,8 +1,8 @@
 //! The curve sweep (`CreateSweepSurface`, NLib's `N_CreateSweepScale`) carries its section on
 //! the projection-normal frame, close to rotation-minimising. Round a closed rail that is not
 //! planar a rotation-minimising frame comes back turned about the rail (its holonomy); the
-//! kernel's own closed-curve correction (`N_CreateBVectors`: on a closed curve the last frame
-//! vector is reset to the first and the others averaged back from it) brings it back, so the
+//! kernel's own closed-curve correction (on a closed curve the last frame vector is the first,
+//! and the turn between them is spread evenly along the rail, #18117) brings it back, so the
 //! last section lies on the first and the sheet closes. A regression test of that guarantee.
 #![allow(
     clippy::unwrap_used,
@@ -12,6 +12,7 @@
 )] // test helpers
 
 use solidcore::geom::axis2_placement::Axis2Placement;
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3};
 use solidcore::nurbs::b_spline_curve::BSplineCurve;
 use solidcore::nurbs::b_spline_surface::BSplineSurface;
@@ -26,8 +27,8 @@ fn loop_rail(lift: f64) -> BSplineCurve {
     let mut points: Vec<Point3> = (0..16)
         .map(|i| {
             let t = std::f64::consts::TAU * f64::from(i) / 16.0;
-            let r = 10.0 + lift * (2.0 * t).cos();
-            Point3::new(r * t.cos(), r * t.sin(), lift * (2.0 * t).sin())
+            let r = 10.0 + lift * det::cos(2.0 * t);
+            Point3::new(r * det::cos(t), r * det::sin(t), lift * det::sin(2.0 * t))
         })
         .collect();
     if let Some(&first) = points.first() {

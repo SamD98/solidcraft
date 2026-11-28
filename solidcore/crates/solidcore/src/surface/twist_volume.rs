@@ -53,10 +53,9 @@
 //! - **`operator==`** assigns the period comparison and then overwrites it with the
 //!   minimum-distance comparison; only the latter decides (kept,
 //!   [`TwistVolume::members_eq`]).
-//! - **`EvaluateSimple`'s `Duw`** is `(-per sin a, -per cos a, 0)` where the header
-//!   documents `(-per sin a, per cos a, 0)`; `Evaluate` uses the documented form.
-//!   Both are kept as written by default; [`Volume::evaluate_simple`]
-//!   corrects the simple form when `Kernel::fixes.twist_simple_duw_sign` is set.
+//! - **`EvaluateSimple`'s `Duw`** is `(-per sin a, -per cos a, 0)` upstream, where the
+//!   header documents `(-per sin a, per cos a, 0)` and `Evaluate` uses the documented
+//!   form. The port uses the documented form, the `w` derivative of `Du` (WR-46).
 //! - **Bounding boxes.** `EvaluateBoundingBoxSimple` keeps upstream's optional
 //!   outputs as `Option<&mut _>`; the unbounded branch writes the axis-aligned box
 //!   unconditionally, so a request for the pseudo box alone is
@@ -106,10 +105,11 @@ use crate::geom::transform::Transform;
 use crate::geom::vector2d::Point2;
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{max4, EFF_ZERO_DEG, INFINITE_PARAMETER, PI, UNDEF_DOUBLE};
 use crate::surface::surface::p2::Surface;
 use crate::surface::volume::p1::{
-    concat_evals_opt_in, is_kind_of as volume_is_kind_of, EvalOptions, Volume, VolumeKind,
+    concat_evals, is_kind_of as volume_is_kind_of, EvalOptions, Volume, VolumeKind,
 };
 use crate::surface::volume::p2::ignore_read;
 use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType};
@@ -347,8 +347,8 @@ impl TwistVolume {
         let per = self.per();
         let a = dw * per;
 
-        let cos = a.cos();
-        let sin = a.sin();
+        let cos = det::cos(a);
+        let sin = det::sin(a);
 
         let mid = volume.twist_mid_dir();
         let bin = volume.twist_binormal();
@@ -413,12 +413,7 @@ impl TwistVolume {
                 };
                 let next_derivs = next.map(position, n, &map_opts)?;
                 // Concatenate Evaluate(ParamPoint) = Next(Mid(ParamPoint))
-                concat_evals_opt_in(
-                    n,
-                    &d,
-                    &next_derivs,
-                    opts.fixes.volume_lift_third_derivative_terms,
-                )
+                concat_evals(n, &d, &next_derivs)
             }
             _ => Ok(d),
         }
@@ -432,15 +427,6 @@ impl TwistVolume {
     ///
     /// [`SolidError::InvalidInput`] (`SM_ERR_INVALID_INPUT`) for `n > 3`.
     pub fn evaluate_simple(&self, param_point: Point3, n: usize) -> Result<Vec<Vec3>> {
-        self.evaluate_simple_impl(param_point, n, false)
-    }
-
-    pub(crate) fn evaluate_simple_impl(
-        &self,
-        param_point: Point3,
-        n: usize,
-        fix_duw_sign: bool,
-    ) -> Result<Vec<Vec3>> {
         // check input - limit the number of derivatives
         if n > MAX_DERIV {
             return Err(SolidError::invalid_input(
@@ -458,8 +444,8 @@ impl TwistVolume {
         let per = self.per(); // negative for left hand twists
         let a = dw * per;
 
-        let cos = a.cos();
-        let sin = a.sin();
+        let cos = det::cos(a);
+        let sin = det::sin(a);
 
         // init output array
         let mut d = vec![Vec3::ZERO; eval_size(n)];
@@ -488,8 +474,8 @@ impl TwistVolume {
             // 2nd derivs (Duu, Duv, Dvv are zero)
             if n >= 2 {
                 let per2 = per * per;
-                let duw_y = if fix_duw_sign { per * cos } else { per * -cos };
-                put(sv(1, 0, 1), Vec3::new(per * -sin, duw_y, 0.0));
+                // Duw is d/dw of Du = (cos, sin, 0); upstream writes per * -cos for y (WR-46)
+                put(sv(1, 0, 1), Vec3::new(per * -sin, per * cos, 0.0));
                 put(sv(0, 1, 1), Vec3::new(per * -cos, -per * sin, 0.0));
                 put(
                     sv(0, 0, 2),
@@ -576,10 +562,10 @@ impl TwistVolume {
         let rad2 = (u_min * u_min + v_max * v_max).sqrt();
         let rad3 = (u_max * u_max + v_max * v_max).sqrt();
         let rad4 = (u_max * u_max + v_min * v_min).sqrt();
-        let ang_rad1 = v_min.atan2(u_min);
-        let ang_rad2 = v_max.atan2(u_min);
-        let ang_rad3 = v_max.atan2(u_max);
-        let ang_rad4 = v_min.atan2(u_max);
+        let ang_rad1 = det::atan2(v_min, u_min);
+        let ang_rad2 = det::atan2(v_max, u_min);
+        let ang_rad3 = det::atan2(v_max, u_max);
+        let ang_rad4 = det::atan2(v_min, u_max);
 
         // The BBox UV square on the W=0 plane is swept in a helix from WMin to WMax
         // sweeping through associated angles AngMin and AngMax. Each corner sweeps
@@ -619,11 +605,11 @@ impl TwistVolume {
                 }
 
                 // arc end points
-                proj_pt1.x = rad * theta_rad1.cos();
-                proj_pt1.y = rad * theta_rad1.sin();
+                proj_pt1.x = rad * det::cos(theta_rad1);
+                proj_pt1.y = rad * det::sin(theta_rad1);
 
-                proj_pt2.x = rad * theta_rad2.cos();
-                proj_pt2.y = rad * theta_rad2.sin();
+                proj_pt2.x = rad * det::cos(theta_rad2);
+                proj_pt2.y = rad * det::sin(theta_rad2);
 
                 s_proj_box.add_point(proj_pt1);
                 s_proj_box.add_point(proj_pt2);
@@ -683,8 +669,8 @@ impl TwistVolume {
         // (neg sign = rotate from ProjSpace to ParamSpace)
         let theta_rad = -2.0 * PI * proj_point.z / self.twist_period_dist;
 
-        let cos = theta_rad.cos();
-        let sin = theta_rad.sin();
+        let cos = det::cos(theta_rad);
+        let sin = det::sin(theta_rad);
 
         // same as positive twist mapping but with the angle negated
         vec![Vec3::new(

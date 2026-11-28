@@ -25,6 +25,7 @@ use solidcore::topology::Brep;
 use solidcore::{Result as SolidResult, SolidError};
 
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Why a normal whose squared length overflows is refused (UB-169).
 const NORMAL_OVERFLOWS: &str =
@@ -304,12 +305,12 @@ impl UnitDiff for Runner {
 
     fn run_rust(&self, case: &Case) -> Result<Output, HarnessError> {
         let i: Inputs = case.parse()?;
-        let mut k = Kernel::default();
+        let mut k = crate::runner_kernel();
         rust_record(&mut k, &i)
     }
 
     fn generate(&self, rng: &mut Rng) -> Option<Value> {
-        let scale = 10f64.powi(rng.range_i64(-1, 1) as i32);
+        let scale = det::powi(10f64, rng.range_i64(-1, 1) as i32);
         let op = match rng.below(4) {
             0 => Op::ProjectBrep,
             1 => Op::Silhouette,

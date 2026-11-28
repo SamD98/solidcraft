@@ -9,10 +9,13 @@
     clippy::panic,
     clippy::indexing_slicing
 )] // test helpers
+use solidcore::math::det;
+
+#[path = "support/solidcraft_fixes.rs"]
+mod solidcraft_fixes;
 
 use solidcore::boolean::api_brep::boolean_intersection;
 use solidcore::curve::curve::Curve;
-use solidcore::kernel::UpstreamFixes;
 use solidcore::math::{Point2, Point3, Vec3};
 use solidcore::primitive::api_curves as curves;
 use solidcore::primitive::api_primitives::create_box;
@@ -42,7 +45,7 @@ fn wedge(k: &mut Kernel) -> Brep {
     let c = p(CENTRE.0, CENTRE.1);
     let at = |r: f64, deg: f64| {
         let a = f64::to_radians(deg);
-        p(CENTRE.0 + r * a.cos(), CENTRE.1 + r * a.sin())
+        p(CENTRE.0 + r * det::cos(a), CENTRE.1 + r * det::sin(a))
     };
     let profile = [
         Curve::from(curves::create_arc(c, RADIUS, 90.0, 99.0).unwrap()),
@@ -58,13 +61,7 @@ fn wedge(k: &mut Kernel) -> Brep {
 
 #[test]
 fn a_short_arc_extends_along_long_rulings_on_its_cylinder() {
-    let names: Vec<String> = serde_json::from_str(include_str!("kernel_cases/fixes.json")).unwrap();
-    let mut f = UpstreamFixes::default();
-    for name in &names {
-        if let Some(flag) = f.flag_mut(name) {
-            *flag = true;
-        }
-    }
+    let f = solidcraft_fixes::solidcraft_fixes();
     let mut k = Kernel {
         fixes: f,
         ..Kernel::default()
@@ -104,7 +101,7 @@ fn a_short_arc_extends_along_long_rulings_on_its_cylinder() {
                     v.min() + v.length() * f64::from(j) / 8.0,
                 );
                 let x = grown.evaluate_point(&k, uv).unwrap();
-                let r = (x.x - CENTRE.0).hypot(x.y - CENTRE.1);
+                let r = det::hypot(x.x - CENTRE.0, x.y - CENTRE.1);
                 assert!((r - RADIUS).abs() < 1e-9, "{d} {i} {j} {r}");
             }
         }
@@ -144,7 +141,7 @@ fn a_small_arc_extends_far_beyond_its_size_on_its_cylinder() {
                     v.min() + v.length() * f64::from(j) / 8.0,
                 );
                 let x = grown.evaluate_point(&k, uv).unwrap();
-                let r = x.x.hypot(x.y);
+                let r = det::hypot(x.x, x.y);
                 assert!(
                     (r - 1.0).abs() < 1e-9 * (1.0 + x.z.abs()),
                     "{d} {i} {j} {r}"

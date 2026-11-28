@@ -4,7 +4,7 @@
 //! returns the entry chosen this frame, which the host runs. Nothing here knows the app.
 //!
 //! Tiles and samples take a host [`Icon`] (a kit icon name, a texture or the host's painter);
-//! menu entries do too. Thumbnails are textures the host made.
+//! context menus use the shared Item definition. Thumbnails are textures the host made.
 
 use std::borrow::Cow;
 
@@ -24,7 +24,8 @@ pub struct Page<'a, A> {
     pub name: Label<'a>,
     /// Whether the page takes input (not while a file picker or a load is up).
     pub interactive: bool,
-    pub back: Back<'a, A>,
+    /// Left out when there is no document to go back to (the page shown at launch).
+    pub back: Option<Back<'a, A>>,
     pub rail: Vec<RailItem<'a, A>>,
     pub title: Label<'a>,
     pub hint: Label<'a>,
@@ -40,6 +41,9 @@ pub struct Back<'a, A> {
     pub document: Label<'a>,
     pub shortcut: Label<'a>,
     pub chosen: A,
+    /// Escape chooses the row too, while none of the page's own menus is open. Off for a host
+    /// that handles Escape itself, for example to close its own windows over the page first.
+    pub escape: bool,
 }
 
 pub enum RailItem<'a, A> {
@@ -101,6 +105,8 @@ pub struct Banner<'a, A> {
     pub after_filename: Label<'a>,
     pub recover: (Label<'a>, A),
     pub discard: Option<(Label<'a>, A)>,
+    /// A close (×) after the buttons, with its hover text: hides the banner, keeps the designs.
+    pub close: Option<(Label<'a>, A)>,
 }
 
 pub struct Recent<'a, A> {
@@ -110,25 +116,19 @@ pub struct Recent<'a, A> {
     pub kind: Label<'a>,
     /// What hovering the row says about the file's signing provenance, when it has any.
     pub security: Option<Label<'a>>,
-    pub thumbnail: Option<(egui::TextureId, egui::Vec2)>,
+    pub thumbnail: Option<crate::PreviewArt>,
     /// No picture could be made: a dimmed placeholder rather than a loading one.
     pub thumbnail_failed: bool,
     pub chosen: A,
     /// The row's context menu.
-    pub menu: Vec<MenuEntry<'a, A>>,
-}
-
-pub struct MenuEntry<'a, A> {
-    pub label: Label<'a>,
-    pub icon: Icon<'a>,
-    pub chosen: A,
+    pub menu: Vec<(crate::Item, A)>,
 }
 
 pub struct Sample<'a, A> {
     pub title: Label<'a>,
     pub description: Label<'a>,
     pub icon: Icon<'a>,
-    pub thumbnail: Option<(egui::TextureId, egui::Vec2)>,
+    pub thumbnail: Option<crate::PreviewArt>,
     pub chosen: A,
 }
 
@@ -151,6 +151,11 @@ pub fn show<A>(ui: &mut egui::Ui, page: Page<'_, A>) -> Option<A> {
     let t = Tokens::get();
     let Page { id, name, interactive, back, rail, title, hint, error, body } = page;
     let mut chosen = None;
+    let escape = interactive
+        && back.as_ref().is_some_and(|back| back.escape)
+        && !egui::Popup::is_any_open(ui.ctx())
+        && !crate::Menu::any_open(ui.ctx())
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let mut rail = Some((back, rail));
     let mut body = Some(body);
     FileView::page(ui, |ui| {
@@ -165,7 +170,7 @@ pub fn show<A>(ui: &mut egui::Ui, page: Page<'_, A>) -> Option<A> {
                         ui.set_min_width(t.file_nav_width);
                         FileView::navigation(ui, |ui| {
                             if let Some((back, rail)) = rail.take() {
-                                navigation(ui, id, back, rail, &mut chosen);
+                                navigation(ui, id, back, rail, escape, &mut chosen);
                             }
                             if chosen.is_some() {
                                 ui.close();
@@ -181,7 +186,7 @@ pub fn show<A>(ui: &mut egui::Ui, page: Page<'_, A>) -> Option<A> {
                 FileView::rail(ui, rail_rect, |ui| {
                     egui::ScrollArea::vertical().id_salt(navigation_id.as_str()).auto_shrink([false, false]).show(ui, |ui| {
                         if let Some((back, rail)) = rail.take() {
-                            navigation(ui, id, back, rail, &mut chosen);
+                            navigation(ui, id, back, rail, escape, &mut chosen);
                         }
                     });
                 });
@@ -194,15 +199,24 @@ pub fn show<A>(ui: &mut egui::Ui, page: Page<'_, A>) -> Option<A> {
             }
         });
     });
+    // The narrow layout draws the rail only while its menu is open.
+    if escape
+        && chosen.is_none()
+        && let Some((Some(back), _)) = rail.take()
+    {
+        chosen = Some(back.chosen);
+    }
     chosen
 }
 
-fn navigation<A>(ui: &mut egui::Ui, id: &str, back: Back<'_, A>, rail: Vec<RailItem<'_, A>>, chosen: &mut Option<A>) {
-    let back_id = format!("{id}:back");
-    let response = FileView::back_to(ui, &back_id, &back.template, &back.document, &back.shortcut);
-    publish(&back_id, &response);
-    if response.clicked() {
-        *chosen = Some(back.chosen);
+fn navigation<A>(ui: &mut egui::Ui, id: &str, back: Option<Back<'_, A>>, rail: Vec<RailItem<'_, A>>, escape: bool, chosen: &mut Option<A>) {
+    if let Some(back) = back {
+        let back_id = format!("{id}:back");
+        let response = FileView::back_to(ui, &back_id, &back.template, &back.document, &back.shortcut);
+        publish(&back_id, &response);
+        if response.clicked() || escape {
+            *chosen = Some(back.chosen);
+        }
     }
     for item in rail {
         match item {
@@ -273,7 +287,14 @@ fn start_content<A>(ui: &mut egui::Ui, id: &str, start: Start<'_, A>, chosen: &m
         };
         let (recover_label, recover_chosen) = banner.recover;
         let (discard_label, discard_chosen) = banner.discard.map_or((None, None), |(label, chosen)| (Some(label), Some(chosen)));
-        let (recover, discard) = FileView::recovery_banner(ui, &banner_id, message, &recover_label, discard_label.as_deref());
+        let (close_label, close_chosen) = banner.close.map_or((None, None), |(label, chosen)| (Some(label), Some(chosen)));
+        let (recover, discard, close) = match close_label.as_deref() {
+            Some(close) => FileView::recovery_banner_closable(ui, &banner_id, message, &recover_label, discard_label.as_deref(), close),
+            None => {
+                let (recover, discard) = FileView::recovery_banner(ui, &banner_id, message, &recover_label, discard_label.as_deref());
+                (recover, discard, None)
+            }
+        };
         publish(&format!("{banner_id}:recover"), &recover);
         if recover.clicked() {
             *chosen = Some(recover_chosen);
@@ -282,6 +303,12 @@ fn start_content<A>(ui: &mut egui::Ui, id: &str, start: Start<'_, A>, chosen: &m
             publish(&format!("{banner_id}:discard"), &discard);
             if discard.clicked() {
                 *chosen = Some(discard_chosen);
+            }
+        }
+        if let (Some(close), Some(close_chosen)) = (close, close_chosen) {
+            publish(&format!("{banner_id}:close"), &close);
+            if close.clicked() {
+                *chosen = Some(close_chosen);
             }
         }
         ui.add_space(t.file_section_gap);
@@ -310,17 +337,16 @@ fn start_content<A>(ui: &mut egui::Ui, id: &str, start: Start<'_, A>, chosen: &m
                     },
                 );
                 publish(&row_id, &response);
-                let mut menu = row.menu.into_iter().map(Some).collect::<Vec<_>>();
-                crate::Menu::context(&response, |ui| {
-                    for entry in &mut menu {
-                        let picked =
-                            entry.as_ref().is_some_and(|entry| crate::MenuItem::new(&entry.label, &entry.label, entry.icon).show(ui).clicked());
-                        if picked && let Some(entry) = entry.take() {
-                            *chosen = Some(entry.chosen);
-                            ui.close();
-                        }
+                if crate::Menu::context_active(&response) {
+                    let mut menu = row.menu.into_iter().map(Some).collect::<Vec<_>>();
+                    let entries = menu.iter().filter_map(|entry| entry.as_ref().map(|(item, _)| item.clone())).collect::<Vec<_>>();
+                    if let Some(picked) = crate::Menu::context_items(&response, &entries)
+                        && let Some(index) = menu.iter().position(|entry| entry.as_ref().is_some_and(|(item, _)| item.id == picked.id))
+                        && let Some((_, action)) = menu.get_mut(index).and_then(Option::take)
+                    {
+                        *chosen = Some(action);
                     }
-                });
+                }
                 if response.clicked() {
                     *chosen = Some(row.chosen);
                 }
@@ -388,7 +414,7 @@ mod tests {
     const HOST_ICON: egui::TextureId = egui::TextureId::User(7);
 
     /// A start page of plain data: no app, no design, no engine.
-    fn page(recent: usize) -> Page<'static, Picked> {
+    fn page(recent: usize, back: bool) -> Page<'static, Picked> {
         let tile = |id: &'static str, icon, primary| Tile {
             id: id.into(),
             icon,
@@ -409,7 +435,13 @@ mod tests {
             id: "start",
             name: "Start page".into(),
             interactive: true,
-            back: Back { template: "Back to {name}".into(), document: "Plate".into(), shortcut: "Esc".into(), chosen: Picked::Back },
+            back: back.then(|| Back {
+                template: "Back to {name}".into(),
+                document: "Plate".into(),
+                shortcut: "Esc".into(),
+                chosen: Picked::Back,
+                escape: true,
+            }),
             rail: vec![
                 RailItem::Entry(entry("start:home", true, true)),
                 RailItem::Entry(entry("start:save", false, false)),
@@ -439,8 +471,8 @@ mod tests {
                         thumbnail_failed: false,
                         chosen: Picked::Recent(i),
                         menu: vec![
-                            MenuEntry { label: "Remove from list".into(), icon: "delete".into(), chosen: Picked::Forget(i) },
-                            MenuEntry { label: "Show in folder".into(), icon: "folder".into(), chosen: Picked::ShowInFolder(i) },
+                            (crate::Item::action("forget", "Remove from list", "delete"), Picked::Forget(i)),
+                            (crate::Item::action("folder", "Show in folder", "folder"), Picked::ShowInFolder(i)),
                         ],
                     })
                     .collect(),
@@ -463,13 +495,19 @@ mod tests {
         ctx: egui::Context,
         screen: egui::Rect,
         recent: usize,
+        back: bool,
         chosen: Vec<Picked>,
     }
 
     impl Drive {
         fn new(size: egui::Vec2, recent: usize) -> Drive {
-            let mut drive =
-                Drive { ctx: crate::test_support::context(), screen: egui::Rect::from_min_size(egui::Pos2::ZERO, size), recent, chosen: Vec::new() };
+            let mut drive = Drive {
+                ctx: crate::test_support::context(),
+                screen: egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+                recent,
+                back: true,
+                chosen: Vec::new(),
+            };
             drive.frame(Vec::new());
             drive
         }
@@ -477,9 +515,9 @@ mod tests {
         fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
             solidcraft_ui_registry::clear_handles();
             let input = egui::RawInput { screen_rect: Some(self.screen), focused: true, events, ..Default::default() };
-            let recent = self.recent;
+            let (recent, back) = (self.recent, self.back);
             let chosen = &mut self.chosen;
-            crate::test_support::raw_frame(&self.ctx, input, |ui| chosen.extend(show(ui, page(recent))))
+            crate::test_support::raw_frame(&self.ctx, input, |ui| chosen.extend(show(ui, page(recent, back))))
         }
 
         fn at(name: &str) -> egui::Pos2 {
@@ -496,6 +534,12 @@ mod tests {
 
         fn click(&mut self, name: &str) {
             self.click_with(name, egui::PointerButton::Primary);
+        }
+
+        fn escape(&mut self) {
+            let key =
+                |pressed| egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+            self.frame(vec![key(true), key(false)]);
         }
     }
 
@@ -559,5 +603,52 @@ mod tests {
         let page = solidcraft_ui_registry::rect_of("start:page").unwrap();
         assert!(page.contains_rect(solidcraft_ui_registry::rect_of("start:second").unwrap()));
         assert!(solidcraft_ui_registry::handle_at("start:back").is_none(), "the rail folds into the page's menu");
+    }
+
+    #[test]
+    fn start_page_without_back_draws_no_back_row() {
+        let mut drive = Drive::new(egui::vec2(1400.0, 900.0), 0);
+        drive.back = false;
+        drive.frame(Vec::new());
+        assert!(solidcraft_ui_registry::handle_at("start:back").is_none(), "no Back row without a document");
+        assert!(solidcraft_ui_registry::handle_at("start:home").is_some(), "the rest of the rail is still drawn");
+        drive.escape();
+        assert_eq!(drive.chosen, [], "Escape chooses nothing without a Back row");
+    }
+
+    #[test]
+    fn start_page_escape_chooses_back_only_when_no_page_menu_is_open() {
+        for size in [egui::vec2(1400.0, 900.0), egui::vec2(420.0, 800.0)] {
+            let mut drive = Drive::new(size, 0);
+            drive.escape();
+            assert_eq!(drive.chosen, [Picked::Back], "{size:?}");
+        }
+        let mut drive = Drive::new(egui::vec2(1400.0, 900.0), 2);
+        drive.click_with("start:recent:1", egui::PointerButton::Secondary);
+        drive.frame(Vec::new());
+        assert!(crate::Menu::any_open(&drive.ctx), "the recent row's menu is open");
+        drive.escape();
+        assert_eq!(drive.chosen, [], "Escape closes the menu, not the page");
+    }
+
+    #[test]
+    fn start_page_escape_is_left_to_a_host_that_handles_it_itself() {
+        let ctx = crate::test_support::context();
+        let key = |pressed| egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+        let mut chosen = Vec::new();
+        for events in [Vec::new(), vec![key(true), key(false)]] {
+            solidcraft_ui_registry::clear_handles();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+            let input = egui::RawInput { screen_rect: Some(screen), focused: true, events, ..Default::default() };
+            crate::test_support::raw_frame(&ctx, input, |ui| {
+                let mut page = page(0, true);
+                if let Some(back) = page.back.as_mut() {
+                    back.escape = false;
+                }
+                chosen.extend(show(ui, page));
+            });
+        }
+        assert!(solidcraft_ui_registry::handle_at("start:back").is_some(), "the Back row is still drawn");
+        assert_eq!(chosen, [], "Escape is the host's when Back's escape is off");
     }
 }

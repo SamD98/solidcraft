@@ -6,6 +6,7 @@
 //! and an arc keeps the end points it was given. (A circle's seam computed as sin 0 on one side
 //! and sin 2π on the other would otherwise lose a row of cells.)
 
+use crate::math::det;
 use std::collections::BTreeMap;
 use std::f64::consts::{FRAC_PI_2, TAU};
 
@@ -246,27 +247,33 @@ impl Convex {
     }
 }
 
-/// Points where the circle (`c`, `r`) meets the closed segment `ab`, up to two.
+/// Points where the circle (`c`, `r`) meets the closed segment `ab`, up to two, in order along
+/// the segment from `a`.
+///
+/// Steady for long segments and big radii: the foot of the centre on the line and its distance
+/// `h` come first, and the half chord is `sqrt((r - h) (r + h))`, so no term the size of `r^2`
+/// is added to one the size of the segment squared.
 pub(crate) fn circle_segment_points(c: Vec2, r: f64, a: Vec2, b: Vec2) -> ([Vec2; 2], usize) {
     let mut out = [Vec2::ZERO; 2];
     let mut n = 0;
-    let d = b - a;
-    let f = a - c;
-    let qa = d.dot(d);
-    if qa == 0.0 {
+    let len = a.distance(b);
+    let Some(u) = (b - a).normalized() else {
+        return (out, 0);
+    };
+    let normal = Vec2::new(-u.y, u.x);
+    let off = normal.dot(a - c);
+    let (rim, far) = (r - off.abs(), r + off.abs());
+    if !(rim >= 0.0) {
         return (out, 0);
     }
-    let qb = 2.0 * f.dot(d);
-    let qc = f.dot(f) - r * r;
-    let disc = qb * qb - 4.0 * qa * qc;
-    if !(disc >= 0.0) {
-        return (out, 0);
-    }
-    let sq = disc.sqrt();
-    for t in [(-qb - sq) / (2.0 * qa), (-qb + sq) / (2.0 * qa)] {
-        if (-1e-12..=1.0 + 1e-12).contains(&t) {
+    let half = (rim * far).sqrt();
+    let foot = c + normal * off;
+    let slack = 1e-12 * len;
+    for along in [-half, half] {
+        let p = foot + u * along;
+        if (-slack..=len + slack).contains(&(p - a).dot(u)) {
             if let Some(slot) = out.get_mut(n) {
-                *slot = Vec2::new(a.x + t * d.x, a.y + t * d.y);
+                *slot = p;
                 n += 1;
             }
         }
@@ -293,7 +300,7 @@ pub(crate) enum Prim {
 }
 
 fn arc_point(c: Vec2, r: f64, a: f64) -> Vec2 {
-    Vec2::new(c.x + r * a.cos(), c.y + r * a.sin())
+    Vec2::new(c.x + r * det::cos(a), c.y + r * det::sin(a))
 }
 
 /// Angles `base + k * pi/2` strictly inside the open sweep `lo..hi`, up to 8 of them.
@@ -406,7 +413,7 @@ impl Prim {
 
     /// The piece moved by the rotation of `angle` radians about the origin and then by `shift`.
     pub fn moved(&self, angle: f64, shift: Vec2) -> Prim {
-        let (s, c) = angle.sin_cos();
+        let (s, c) = det::sin_cos(angle);
         let f = |p: Vec2| Vec2::new(c * p.x - s * p.y, s * p.x + c * p.y) + shift;
         match *self {
             Prim::Line { a, b, lattice } => Prim::Line {
@@ -486,7 +493,7 @@ impl Prim {
             Prim::Line { a, b, .. } => 0.5 * cross2(a - o, b - o),
             Prim::Arc {
                 r, sweep, p0, p1, ..
-            } => 0.5 * cross2(p0 - o, p1 - o) + 0.5 * r * r * (sweep - sweep.sin()),
+            } => 0.5 * cross2(p0 - o, p1 - o) + 0.5 * r * r * (sweep - det::sin(sweep)),
         }
     }
 
@@ -531,7 +538,7 @@ impl Prim {
         let mut cuts = [0.0f64; 8];
         let mut nc = 0;
         for &a in quarters.iter().take(nq) {
-            if a.sin().abs() > 0.5 {
+            if det::sin(a).abs() > 0.5 {
                 if let Some(slot) = cuts.get_mut(nc) {
                     *slot = a;
                     nc += 1;
@@ -553,7 +560,7 @@ impl Prim {
         for &a in cuts.iter() {
             if let (Some(sa), Some(sy)) = (angles.get_mut(n), ys.get_mut(n)) {
                 *sa = a;
-                *sy = c.y + if a.sin() > 0.0 { r } else { -r };
+                *sy = c.y + if det::sin(a) > 0.0 { r } else { -r };
                 n += 1;
             }
         }
@@ -597,7 +604,12 @@ impl Prim {
                     if (ya > p.y) != (yb > p.y) {
                         let dy = p.y - c.y;
                         let dx = (r * r - dy * dy).max(0.0).sqrt();
-                        let x = c.x + if (0.5 * (a + b)).cos() > 0.0 { dx } else { -dx };
+                        let x = c.x
+                            + if det::cos(0.5 * (a + b)) > 0.0 {
+                                dx
+                            } else {
+                                -dx
+                            };
                         if x > p.x {
                             count += 1;
                         }
@@ -624,7 +636,7 @@ impl Prim {
                     };
                     let (pts, m) = circle_segment_points(c, r, a, b);
                     for q in pts.iter().take(m) {
-                        if self.contains_angle((q.y - c.y).atan2(q.x - c.x), 1e-9) {
+                        if self.contains_angle(det::atan2(q.y - c.y, q.x - c.x), 1e-9) {
                             return true;
                         }
                     }
@@ -673,7 +685,7 @@ impl Prim {
             }
             Prim::Arc { c, r, p0, p1, .. } => {
                 let v = p - c;
-                if v.length() > 0.0 && self.contains_angle(v.y.atan2(v.x), 0.0) {
+                if v.length() > 0.0 && self.contains_angle(det::atan2(v.y, v.x), 0.0) {
                     (v.length() - r).abs()
                 } else {
                     p.distance(p0).min(p.distance(p1))
@@ -687,18 +699,18 @@ impl Prim {
 
 /// A closed loop of pieces, chained end to start, with its joints welded.
 ///
-/// `curved` marks a loop that is not made of straight segments (arcs, or curves that were
-/// flattened before they got here): such a loop never snaps.
+/// `flattened` marks a loop with a curve that was flattened into short straight pieces before it
+/// got here (a curve other than a line or an arc): such a loop is followed, never snapped.
 #[derive(Clone, Debug)]
 pub(crate) struct Loop {
     pub prims: Vec<Prim>,
-    pub curved: bool,
+    pub flattened: bool,
     bounds: Bounds,
 }
 
 impl Loop {
     /// `None` for no pieces or one with a coordinate that is not finite.
-    pub fn new(mut prims: Vec<Prim>, curved: Option<bool>) -> Option<Loop> {
+    pub fn new(mut prims: Vec<Prim>, flattened: Option<bool>) -> Option<Loop> {
         let n = prims.len();
         if n == 0 {
             return None;
@@ -711,8 +723,7 @@ impl Loop {
                 *cur = cur.with_start(end);
             }
         }
-        let curved =
-            curved.unwrap_or_else(|| prims.iter().any(|p| !matches!(p, Prim::Line { .. })));
+        let flattened = flattened.unwrap_or(false);
         let mut bounds = prims.first()?.bounds();
         for p in prims.iter().skip(1) {
             bounds = bounds.union(p.bounds());
@@ -725,7 +736,7 @@ impl Loop {
         }
         Some(Loop {
             prims,
-            curved,
+            flattened,
             bounds,
         })
     }
@@ -739,7 +750,7 @@ impl Loop {
         let prims = self.prims.iter().rev().map(Prim::reversed).collect();
         Loop {
             prims,
-            curved: self.curved,
+            flattened: self.flattened,
             bounds: self.bounds,
         }
     }
@@ -781,7 +792,10 @@ impl Loop {
             } => {
                 let a = a0 + sweep * 0.5;
                 let s = if sweep > 0.0 { 1.0 } else { -1.0 };
-                (arc_point(c, r, a), Vec2::new(-a.sin() * s, a.cos() * s))
+                (
+                    arc_point(c, r, a),
+                    Vec2::new(-det::sin(a) * s, det::cos(a) * s),
+                )
             }
         };
         let ln = d.length();
@@ -802,11 +816,43 @@ impl Loop {
 pub(crate) struct Region {
     pub parts: Vec<(Loop, Vec<Loop>)>,
     pub prims: Vec<Prim>,
+    /// For each piece of `prims`: whether it belongs to a keep-out loop.
+    pub keepout: Vec<bool>,
     boxes: Vec<Bounds>,
     /// Pieces by horizontal band, so a cell only meets the pieces near it.
     rows: Vec<Vec<u32>>,
     row_y0: f64,
     row_h: f64,
+}
+
+/// For each loop, the larger loops that contain it (`areas` are the loops' absolute areas).
+fn container_lists(loops: &[Loop], areas: &[f64]) -> Vec<Vec<usize>> {
+    let probes: Vec<Vec2> = loops.iter().map(Loop::interior_probe).collect();
+    let mut containers: Vec<Vec<usize>> = Vec::new();
+    for (i, &q) in probes.iter().enumerate() {
+        let ai = areas.get(i).copied().unwrap_or(0.0);
+        containers.push(
+            loops
+                .iter()
+                .enumerate()
+                .filter(|&(j, other)| {
+                    j != i && areas.get(j).copied().unwrap_or(0.0) > ai && other.contains(q)
+                })
+                .map(|(j, _)| j)
+                .collect(),
+        );
+    }
+    containers
+}
+
+/// For each loop, whether it is a keep-out (an odd nesting depth) rather than a field: the roles
+/// [`Region::from_loops`] gives them.
+pub(crate) fn keepout_loops(loops: &[Loop]) -> Vec<bool> {
+    let areas: Vec<f64> = loops.iter().map(|l| l.signed_area().abs()).collect();
+    container_lists(loops, &areas)
+        .iter()
+        .map(|c| c.len() % 2 == 1)
+        .collect()
 }
 
 impl Region {
@@ -816,21 +862,7 @@ impl Region {
             .filter(|l| l.signed_area().abs() > EPS * EPS)
             .collect();
         let areas: Vec<f64> = loops.iter().map(|l| l.signed_area().abs()).collect();
-        let probes: Vec<Vec2> = loops.iter().map(Loop::interior_probe).collect();
-        let mut containers: Vec<Vec<usize>> = Vec::new();
-        for (i, &q) in probes.iter().enumerate() {
-            let ai = areas.get(i).copied().unwrap_or(0.0);
-            containers.push(
-                loops
-                    .iter()
-                    .enumerate()
-                    .filter(|&(j, other)| {
-                        j != i && areas.get(j).copied().unwrap_or(0.0) > ai && other.contains(q)
-                    })
-                    .map(|(j, _)| j)
-                    .collect(),
-            );
-        }
+        let containers = container_lists(&loops, &areas);
         let mut parts: BTreeMap<usize, (Loop, Vec<Loop>)> = BTreeMap::new();
         for (i, lp) in loops.iter().enumerate() {
             if containers.get(i).is_some_and(|c| c.len() % 2 == 0) {
@@ -869,6 +901,15 @@ impl Region {
                     .flat_map(|l| l.prims.iter().copied())
             })
             .collect();
+        let keepout: Vec<bool> = parts
+            .iter()
+            .flat_map(|(o, hs)| {
+                std::iter::repeat_n(false, o.prims.len()).chain(
+                    hs.iter()
+                        .flat_map(|h| std::iter::repeat_n(true, h.prims.len())),
+                )
+            })
+            .collect();
         let boxes: Vec<Bounds> = prims.iter().map(Prim::bounds).collect();
         let all = boxes.iter().copied().reduce(Bounds::union);
         let (mut rows, mut row_y0, mut row_h) = (vec![Vec::new()], 0.0, 1.0);
@@ -892,6 +933,7 @@ impl Region {
         Region {
             parts,
             prims,
+            keepout,
             boxes,
             rows,
             row_y0,
@@ -1051,7 +1093,7 @@ fn drop_collinear(lp: &[Vec2]) -> Vec<Vec2> {
         else {
             continue;
         };
-        if cross2(b - a, c - b).abs() > 1e-12 * (a.distance(b) + b.distance(c)).powi(2) {
+        if cross2(b - a, c - b).abs() > 1e-12 * det::powi(a.distance(b) + b.distance(c), 2) {
             out.push(b);
         }
     }
@@ -1060,6 +1102,6 @@ fn drop_collinear(lp: &[Vec2]) -> Vec<Vec2> {
 
 /// Rotation by `angle` of the vector `v`.
 pub(crate) fn rotate(v: Vec2, angle: f64) -> Vec2 {
-    let (s, c) = angle.sin_cos();
+    let (s, c) = det::sin_cos(angle);
     Vec2::new(c * v.x - s * v.y, s * v.x + c * v.y)
 }

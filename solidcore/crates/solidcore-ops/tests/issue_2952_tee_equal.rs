@@ -16,6 +16,10 @@
     clippy::indexing_slicing,
     clippy::disallowed_methods
 )] // test: the closed forms use roots and trigonometry
+use solidcore::math::det;
+
+#[path = "../../solidcore/tests/support/solidcraft_fixes.rs"]
+mod solidcraft_fixes;
 
 mod common;
 
@@ -37,11 +41,7 @@ const CASE: &str = "cov-junction-tee-equal-round";
 
 /// The tee with the case's half ellipse rounded `r`.
 fn rounded(r: f64) -> Body {
-    let fixes: Vec<String> = serde_json::from_str(include_str!(
-        "../../solidcore/tests/kernel_cases/fixes.json"
-    ))
-    .unwrap();
-    session::set_thread_fixes(fixes.iter().map(String::as_str)).unwrap();
+    session::set_thread_fixes(solidcraft_fixes::solidcraft_fix_names()).unwrap();
     let gz = std::fs::File::open(format!(
         "{}/../solidcore/tests/kernel_cases/fillets/{CASE}.bodies.json.gz",
         env!("CARGO_MANIFEST_DIR")
@@ -58,7 +58,7 @@ fn rounded(r: f64) -> Body {
     let picks: Vec<usize> = [30.0_f64, 45.0, 120.0]
         .iter()
         .map(|d| {
-            let (s, c) = d.to_radians().sin_cos();
+            let (s, c) = det::sin_cos(d.to_radians());
             edge_at(&body, [8.0 * s, 8.0 * c, 8.0 * s])
         })
         .collect();
@@ -90,7 +90,7 @@ fn angle_at(k: &Kernel, b: &Brep, e: EdgeId, p: Point3) -> f64 {
     };
     let n = normal(face::surface(b, *f).unwrap().unwrap());
     let m = normal(face::surface(b, *g).unwrap().unwrap());
-    n.cross(m).length().atan2(n.dot(m).abs())
+    det::atan2(n.cross(m).length(), n.dot(m).abs())
 }
 
 fn graded(r: f64) {
@@ -106,7 +106,7 @@ fn graded(r: f64) {
     let scale = 8.0 / big_r;
     for i in 1..24 {
         let th = std::f64::consts::PI * f64::from(i) / 24.0;
-        let (t, y) = (big_r * th.sin(), big_r * th.cos());
+        let (t, y) = (big_r * det::sin(th), big_r * det::cos(th));
         for q in [
             Point3::new(t, y * scale, t * scale),
             Point3::new(t * scale, y * scale, t),

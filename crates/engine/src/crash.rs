@@ -30,6 +30,9 @@
 //!   and on Windows a minidump next to the journal ([`native_paths`]); the next start puts them
 //!   into the unclean exit's report.
 //!
+//! - **Lost graphics devices** ([`device_lost`]): the app closes and starts again by itself, and
+//!   the run that lost its device writes a `device_lost` report first, so the next start offers it.
+//!
 //! Reports are folders `crashes/<time>-<signature>/` holding `report.json`, and when known
 //! `design.sc` (`design.solidcraft` in reports from earlier releases), `replay.json` and `minidump.dmp`. Nothing is ever sent anywhere.
 
@@ -43,9 +46,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
-use solidcraft_doc::Document;
+use solidcraft_doc::{Document, drawing};
 
 use crate::Session;
+use crate::io::civil;
 
 /// Reports kept (the oldest, and recovered kernel panics, go first).
 pub const MAX_REPORTS: usize = 20;
@@ -81,7 +85,7 @@ pub struct Build {
 pub struct Summary {
     /// The report's id, which `diagnostics.crash_report` reads.
     pub id: String,
-    /// `command_panic`, `panic`, `kernel_panic_recovered` or `unclean_exit`.
+    /// `command_panic`, `panic`, `kernel_panic_recovered`, `unclean_exit` or `device_lost`.
     pub kind: String,
     /// When the report was first recorded (UTC). Unclean exits are recorded at a later launch,
     /// which may be days after the session ended, rather than at the exact exit time.
@@ -98,6 +102,13 @@ pub struct Summary {
     pub path: String,
     /// `replay.json` and the design (`design.sc`) are there: the crash can be replayed.
     pub replayable: bool,
+    /// The renderer of the run that crashed, as it recorded it ([`set_environment`]), if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<String>,
+    /// The graphics failed ([`graphics_failure`]): the device was lost, the run died in a graphics
+    /// startup step, or the native crash was in a graphics driver.
+    #[serde(default)]
+    pub graphics_failure: bool,
 }
 
 struct State {
@@ -189,21 +200,6 @@ fn now() -> u64 {
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
-/// `secs` since 1970 as (year, month, day, hour, minute, second) in UTC.
-fn civil(secs: u64) -> (i64, i64, i64, u64, u64, u64) {
-    let days = i64::try_from(secs / 86_400).unwrap_or(0);
-    let rem = secs % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + i64::from(m <= 2), m, d, rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// `2026-10-12T14:03:22Z`.
@@ -482,6 +478,195 @@ pub fn end_session() {
     }
 }
 
+/// The window's graphics device was lost (#4172) and the app is closing to start again: a
+/// `device_lost` report, written now (the next start can't learn the reason any other way), so
+/// the next start offers it with this run's renderer and log as it does a crash. The same loss
+/// again (its signature: the driver's reason, digits ignored) is counted, not written again.
+/// Returns the report's id when one was written.
+pub fn device_lost(reason: &str) -> Option<String> {
+    let state = STATE.get()?;
+    let reason = limited(reason.trim(), MAX_MESSAGE);
+    let said = if reason.is_empty() { "no reason given".to_string() } else { reason.clone() };
+    let p = Panic {
+        message: format!("The graphics device was lost (the graphics driver stopped responding or was reset): {said}"),
+        location: "graphics device lost".into(),
+        thread: std::thread::current().name().unwrap_or("(unnamed)").to_string(),
+        backtrace: Vec::new(),
+        recovered: false,
+        on_pool: false,
+        signature: signature("graphics device lost", &said),
+    };
+    let known = state.known.lock().ok().and_then(|k| k.get(&p.signature).map(|e| e.1.clone()));
+    let (written, on_file) = match known {
+        Some(id) => {
+            bump(&state.dir, &id, 1);
+            (None, Some(id))
+        }
+        None => {
+            let id = write_from_journal(state, "device_lost", Some(&p));
+            (id.clone(), id)
+        }
+    };
+    // Reported (or counted): the journal left behind, should the process end before its clean
+    // exit, is not an unclean exit at the next start.
+    if let Some(id) = &on_file
+        && let Ok(mut j) = state.journal.try_lock()
+    {
+        j.record(&json!({ "reported": id }));
+    }
+    if let Some(id) = &written {
+        solidcraft_geom::note!("SolidCraft graphics: device lost; crash report {}", state.dir.join(id).display());
+    }
+    written
+}
+
+/// The startup steps that are the graphics coming up (egui-wgpu's and the app's): a run that died
+/// in one died in the graphics driver, as far as anyone can tell.
+pub const GRAPHICS_STEPS: &[&str] = &[
+    "graphics instance",
+    "window surface",
+    "adapter request",
+    "adapter chosen",
+    "device creation",
+    "egui renderer (shader compile)",
+    "surface configure",
+    "first frame (present)",
+    "viewport pipelines (shader compile)",
+    "first frame",
+];
+
+/// The start of a native crash's module name (lowercase, no folder) that is a graphics driver
+/// or graphics API runtime: Intel, NVIDIA, AMD, Apple, Mesa, and the APIs' loaders.
+const GRAPHICS_MODULES: &[&str] = &[
+    "igvk",
+    "igd",
+    "ig9icd",
+    "ig7icd",
+    "ig75icd",
+    "igxelp",
+    "igc",
+    "nvogl",
+    "nvwgf",
+    "nvd3dum",
+    "nvldumd",
+    "nvvk",
+    "nvcuda",
+    "atio",
+    "atig",
+    "atiumd",
+    "aticfx",
+    "amdvlk",
+    "amdxc",
+    "amdxx",
+    "vulkan-1",
+    "d3d12",
+    "d3d11",
+    "dxgi",
+    "opengl32",
+    "libgl",
+    "libegl",
+    "libvulkan",
+    "libnvidia",
+    "libagx",
+    "agxmetal",
+    "libmetal",
+    "radeonsi",
+    "iris_dri",
+    "swrast_dri",
+    "libvk_swiftshader",
+];
+
+/// Whether a report (`report.json`) is a graphics failure: a lost device, a run that died in a
+/// graphics startup step ([`GRAPHICS_STEPS`]), or a native crash in a graphics driver
+/// ([`GRAPHICS_MODULES`]).
+pub fn graphics_failure(report: &Value) -> bool {
+    let kind = report.get("kind").and_then(Value::as_str).unwrap_or_default();
+    if kind == "device_lost" {
+        return true;
+    }
+    if kind != "unclean_exit" {
+        return false;
+    }
+    let step = report.get("startup_phase").and_then(|p| p.get("step")).and_then(Value::as_str);
+    if step.is_some_and(|s| GRAPHICS_STEPS.contains(&s)) {
+        return true;
+    }
+    let module = report.get("native").and_then(|n| n.get("module")).and_then(Value::as_str).unwrap_or_default();
+    let short = module.rsplit(['\\', '/']).next().unwrap_or_default().to_ascii_lowercase();
+    !short.is_empty() && GRAPHICS_MODULES.iter().any(|m| short.starts_with(m))
+}
+
+/// The graphics a run recorded ([`set_environment`]): its API, adapter and driver.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Graphics {
+    /// The API as wgpu names it (`Vulkan`, `Dx12`, `Gl`, `Metal`).
+    pub api: String,
+    /// The adapter's name.
+    pub adapter: String,
+    /// `IntegratedGpu`, `DiscreteGpu`, `Cpu`, … when recorded.
+    pub device_type: Option<String>,
+    /// The driver's name and version, when recorded.
+    pub driver: Option<String>,
+}
+
+impl Graphics {
+    /// The API as the Graphics preference names it (`vulkan`, `dx12`, `gl`, `metal`).
+    pub fn api_id(&self) -> Option<&'static str> {
+        match self.api.as_str() {
+            "Vulkan" => Some("vulkan"),
+            "Dx12" => Some("dx12"),
+            "Gl" => Some("gl"),
+            "Metal" => Some("metal"),
+            _ => None,
+        }
+    }
+}
+
+/// The graphics in a renderer line ([`set_environment`]): `Renderer: <API> <adapter>
+/// (<device type>, driver <driver>)[, MSAA <n>x]`, and from earlier releases `Renderer: <API>
+/// <adapter> (<driver>), MSAA <n>x`. None for a line that names no API.
+pub fn graphics(environment: &str) -> Option<Graphics> {
+    let line = environment.trim().strip_prefix("Renderer:")?.trim();
+    let line = match line.rfind(", MSAA ") {
+        Some(i) if line[i..].ends_with('x') => &line[..i],
+        _ => line,
+    };
+    let (api, rest) = line.split_once(' ').unwrap_or((line, ""));
+    if !matches!(api, "Vulkan" | "Dx12" | "Gl" | "Metal" | "BrowserWebGpu") {
+        return None;
+    }
+    let rest = rest.trim();
+    // The last bracketed group, brackets inside it (a driver's `Mesa 25.0 (LLVM 19.1.7)`) kept.
+    let open = rest.strip_suffix(')').and_then(|body| {
+        let mut depth = 0usize;
+        for (i, c) in body.char_indices().rev() {
+            match c {
+                ')' => depth += 1,
+                '(' if depth == 0 => return Some(i),
+                '(' => depth -= 1,
+                _ => {}
+            }
+        }
+        None
+    });
+    let (adapter, inner) = match open {
+        Some(i) => (&rest[..i], Some(&rest[i + 1..rest.len() - 1])),
+        None => (rest, None),
+    };
+    let (device_type, driver) = match inner {
+        Some(inner) => match inner.split_once(", driver ") {
+            Some((t, d)) => (Some(t.trim().to_string()), Some(d.trim().to_string())),
+            None => match inner.strip_prefix("driver ") {
+                Some(d) => (None, Some(d.trim().to_string())),
+                None if inner.ends_with("Gpu") || inner == "Cpu" || inner == "Other" => (Some(inner.to_string()), None),
+                None => (None, Some(inner.trim().to_string())),
+            },
+        },
+        None => (None, None),
+    };
+    Some(Graphics { api: api.to_string(), adapter: adapter.trim().to_string(), device_type, driver: driver.filter(|d| !d.is_empty()) })
+}
+
 /// The panic hook. Returns true when the panic was recorded for a command or the kernel (which
 /// will catch it), so the default "thread panicked" message is not printed.
 fn hook(info: &std::panic::PanicHookInfo<'_>) -> bool {
@@ -494,7 +679,7 @@ fn hook(info: &std::panic::PanicHookInfo<'_>) -> bool {
     if graphics_device_lost(&message, &location) {
         // What met the loss survives it (the window's painter, a command), and the app starts
         // again as for any lost device: not a crash to report.
-        eprintln!("SolidCraft graphics: the device was lost during GPU work ({location}); starting again");
+        solidcraft_geom::note!("SolidCraft graphics: the device was lost during GPU work ({location}); starting again");
         IN_HOOK.store(false, Ordering::SeqCst);
         return true;
     }
@@ -646,7 +831,7 @@ pub(crate) fn command_begin(s: &Session, id: &str, params: &Value) {
     let ptr = std::sync::Arc::as_ptr(&s.doc) as usize;
     if ptr != j.last_doc {
         // The design changed outside commands (opened, a new tab, a dialog): what is it now?
-        j.rebase(&journal_base(s), ptr);
+        j.rebase(&journal_base(s), ptr, Some(s.ids.seed()));
     }
     j.run(id, params);
 }
@@ -679,8 +864,9 @@ pub(crate) fn accepted_command(
     let Ok(mut j) = state.journal.lock() else { return };
     let ptr = std::sync::Arc::as_ptr(before) as usize;
     if ptr != j.last_doc {
-        let base = if std::sync::Arc::ptr_eq(&s.doc, before) { journal_base(s) } else { json!("unknown") };
-        j.rebase(&base, ptr);
+        let at_session = std::sync::Arc::ptr_eq(&s.doc, before);
+        let base = if at_session { journal_base(s) } else { json!("unknown") };
+        j.rebase(&base, ptr, at_session.then(|| s.ids.seed()));
     }
     j.run(id, params);
     j.done(&Ok(()), changed);
@@ -688,14 +874,14 @@ pub(crate) fn accepted_command(
 }
 
 /// A top-level command ended: the journal records how, and panics caught inside it are reported
-/// with `before` (the design it started from) and the command, which together reproduce them.
+/// with `before` (the design it started from) and the command (its id, its parameters and the
+/// session's id seed when it started), which together reproduce them.
 pub(crate) fn command_done(
     journaled: bool,
     changed: bool,
     before: &Document,
     after: &std::sync::Arc<Document>,
-    id: &str,
-    params: &Value,
+    (id, params, ids): (&str, &Value, u64),
     outcome: std::result::Result<(), String>,
 ) {
     let Some(state) = STATE.get() else { return };
@@ -718,17 +904,20 @@ pub(crate) fn command_done(
             p.recovered = true;
         }
         let kind = if p.recovered { "kernel_panic_recovered" } else { "command_panic" };
-        let design = solidcraft_io::write_design(before);
-        let replay = json!({ "commands": [{ "command": id, "params": params }] });
+        let (openable, left_out) = drawing::openable(before);
+        // A container, as the design's own file is: it carries binary data a JSON design can't.
+        let design = solidcraft_io::write_design_container(&openable).ok();
+        let replay = json!({ "commands": [{ "command": id, "params": params }], "ids": ids });
         let recent = if journaled { read_live_journal(state).recent } else { Vec::new() };
         let extra = Extra {
             command: Some(json!({ "command": id, "params": params })),
-            design: Some(design),
+            design,
             replay: Some(replay),
             recent,
             base: json!("the design as it was when the command started"),
-            notes: Vec::new(),
-            fields: serde_json::Map::new(),
+            notes: left_out,
+            // This run, as its journal names it: the log the app keeps finds its lines by it.
+            fields: [("run".to_string(), json!({ "pid": std::process::id(), "start": utc(state.started) }))].into_iter().collect(),
             attach: Vec::new(),
         };
         write_report(state, kind, Some(&p), extra);
@@ -750,7 +939,7 @@ pub(crate) fn rebased(s: &Session, file: Option<&Path>, autosave: bool) {
         (None, _) if s.doc.features.is_empty() => json!("new"),
         _ => json!("unknown"),
     };
-    j.rebase(&base, std::sync::Arc::as_ptr(&s.doc) as usize);
+    j.rebase(&base, std::sync::Arc::as_ptr(&s.doc) as usize, Some(s.ids.seed()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -793,7 +982,7 @@ impl Journal {
             running: false,
             environment: None,
         };
-        j.rebase(&json!("new"), 0);
+        j.rebase(&json!("new"), 0, None);
         j
     }
 
@@ -809,7 +998,9 @@ impl Journal {
         self.write(&v.to_string());
     }
 
-    fn rebase(&mut self, base: &Value, doc: usize) {
+    /// A new base: `base`, the design the commands after it start from, and `ids`, the session's
+    /// id seed there.
+    fn rebase(&mut self, base: &Value, doc: usize, ids: Option<u64>) {
         if let Some(f) = &self.file
             && f.set_len(0).is_err()
         {
@@ -821,7 +1012,11 @@ impl Journal {
         self.last_doc = doc;
         let h = self.header.clone();
         self.write(&h);
-        self.record(&json!({ "base": base }));
+        let mut line = json!({ "base": base });
+        if let Some(ids) = ids {
+            line["ids"] = json!(ids);
+        }
+        self.record(&line);
         for line in [self.phase.clone(), self.environment.clone()].into_iter().flatten() {
             self.write(&line);
         }
@@ -872,6 +1067,8 @@ impl Journal {
 struct JournalRead {
     header: Value,
     base: Value,
+    /// The session's id seed at the base, when it was kept.
+    ids: Option<u64>,
     /// Commands since the base that changed something or did nothing wrong, in order.
     replay: Vec<Value>,
     /// The command that was running, if one was.
@@ -914,6 +1111,7 @@ fn read_journal_file(mut file: File) -> JournalRead {
         }
         if let Some(b) = v.get("base") {
             r.base = b.clone();
+            r.ids = v.get("ids").and_then(Value::as_u64);
             r.replay.clear();
             r.recent.clear();
             running = None;
@@ -986,6 +1184,18 @@ fn unclean_exit(dir: &Path, build: &Build, journal: &Path) {
         (None, Some(c)) => format!("while running `{c}`"),
         (None, None) => "between commands".to_string(),
     };
+    // Another version that was up and idle, with nothing a crash handler caught: an update or an
+    // installer most likely closed it, which skips the clean exit (#17890). Not a crash to offer.
+    // Only when the journal shows it: a run that never recorded getting up, or whose journal
+    // stopped recording (it may have been in a command), is still reported.
+    let up = j.phase.as_ref().is_some_and(|(p, _)| p == RUNNING);
+    if up && j.complete && native.is_none() && doing.is_none() && was != "?" && was != build.version {
+        solidcraft_geom::note!(
+            "SolidCraft: {was} (started {when}) ended without a clean exit between commands; not reported, as this is {}",
+            build.version
+        );
+        return;
+    }
     let field = |k: &str| native.as_ref().and_then(|n| n.get(k)).and_then(Value::as_str).map(|v| limited(v, 300));
     let (message, location, signature_text, backtrace) = match &native {
         Some(_) => {
@@ -1126,13 +1336,22 @@ fn from_journal(j: JournalRead) -> Extra {
         notes.push("the design changed outside commands before this; it cannot be rebuilt from the journal".into());
     }
     let mut fields = serde_json::Map::new();
+    // Which run it was: the log the app keeps finds the run's own lines by them.
+    let pid = j.header.get("pid").and_then(Value::as_u64);
+    let start = j.header.get("start").and_then(Value::as_str);
+    if pid.is_some() || start.is_some() {
+        fields.insert("run".into(), json!({ "pid": pid, "start": start }));
+    }
     if let Some((p, ms)) = j.phase.filter(|(p, _)| p != RUNNING) {
         fields.insert("startup_phase".into(), json!({ "step": p, "ms": ms }));
     }
     Extra {
         command: j.in_flight,
         design,
-        replay: replay.then(|| json!({ "commands": commands })),
+        replay: replay.then(|| match j.ids {
+            Some(ids) => json!({ "commands": commands, "ids": ids }),
+            None => json!({ "commands": commands }),
+        }),
         recent: j.recent,
         base: j.base,
         notes,
@@ -1332,6 +1551,13 @@ pub fn list(dir: &Path) -> Vec<Summary> {
                 version: v.get("app").and_then(|a| a.get("version")).and_then(Value::as_str).unwrap_or_default().to_string(),
                 path: folder.to_string_lossy().into_owned(),
                 replayable: folder.join("replay.json").is_file(),
+                renderer: v
+                    .get("system")
+                    .and_then(|s| s.get("environment"))
+                    .and_then(Value::as_str)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| limited(e, 500)),
+                graphics_failure: graphics_failure(&v),
                 id,
             })
         })

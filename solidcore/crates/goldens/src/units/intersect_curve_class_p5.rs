@@ -31,6 +31,7 @@ use solidcore::surface::plane::Plane;
 use solidcore::surface::surface::Surface;
 use solidcore::surface::volume::Volume;
 use solidcore::{Result as ScResult, SolidError};
+use solidcore::math::det;
 
 #[path = "intersect_curve_class_p5/topo.rs"]
 mod topo;
@@ -408,7 +409,7 @@ fn status(e: &SolidError) -> f64 {
 
 fn stationary_curve(dim: u64, scale: f64, angle: f64) -> ScResult<Curve> {
     let points = [0.75, 0.25, 0.75]
-        .map(|x| CPoint::new(x * scale * angle.cos(), x * scale * angle.sin(), 0., 1.));
+        .map(|x| CPoint::new(x * scale * det::cos(angle), x * scale * det::sin(angle), 0., 1.));
     Ok(Curve::from(BSplineCurve::from_data(
         dim,
         2,
@@ -455,7 +456,7 @@ fn build_pool(k: &Kernel, i: &Input) -> ScResult<Pool> {
         } else {
             Curve::from(Line::bounded(
                 Vec3::ZERO,
-                Vec3::new(i.angle.cos(), i.angle.sin(), 0.),
+                Vec3::new(det::cos(i.angle), det::sin(i.angle), 0.),
                 &Extent1d::from_min_max(0., 1.),
                 &BoundedLineOptions {
                     scale: i.scale,
@@ -519,7 +520,49 @@ fn short_ranges_ok(k: &Kernel, pool: &Pool, i: &Input) -> ScResult<bool> {
     Ok(true)
 }
 
+/// A flat case after its operation: the status, the operation's own outputs, the two
+/// classifications and the solutions (`Err` holds a deferred case's output).
+struct Ran {
+    st: f64,
+    out: Vec<f64>,
+    /// The objects the classifications refer to (read by the certificates in the tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pool: Pool,
+    cc: CurveClassification<H>,
+    other: CurveClassification<H>,
+    solutions: Vec<Solution<H>>,
+}
+
 fn rust(i: &Input) -> ScResult<Output> {
+    let Ran {
+        st,
+        mut out,
+        cc,
+        other,
+        solutions,
+        ..
+    } = match run(i)? {
+        Ok(ran) => ran,
+        Err(deferred) => return Ok(deferred),
+    };
+    out.insert(0, st);
+    put_cc(&mut out, &cc, target(i));
+    put_cc(&mut out, &other, target(i));
+    for s in solutions {
+        out.extend([
+            f64::from(s.solution_type.code()),
+            s.start.param(0)?,
+            s.start.param(1)?,
+            s.end.param(0)?,
+            s.end.param(1)?,
+            s.start.solution_value,
+            s.end.solution_value,
+        ]);
+    }
+    Ok(Output::new().values("out", out))
+}
+
+fn run(i: &Input) -> ScResult<Result<Ran, Output>> {
     let k = Kernel::default();
     let pool = build_pool(&k, i)?;
     let mut cc = setup(&k, &pool, i, false)?;
@@ -629,26 +672,19 @@ fn rust(i: &Input) -> ScResult<Output> {
         Ok(()) => 0.,
         Err(e) => {
             if let Some(deferred) = Output::unported(&e) {
-                return Ok(deferred);
+                return Ok(Err(deferred));
             }
             status(&e)
         }
     };
-    out.insert(0, st);
-    put_cc(&mut out, &cc, target(i));
-    put_cc(&mut out, &other, target(i));
-    for s in solutions {
-        out.extend([
-            f64::from(s.solution_type.code()),
-            s.start.param(0)?,
-            s.start.param(1)?,
-            s.end.param(0)?,
-            s.end.param(1)?,
-            s.start.solution_value,
-            s.end.solution_value,
-        ]);
-    }
-    Ok(Output::new().values("out", out))
+    Ok(Ok(Ran {
+        st,
+        out,
+        pool,
+        cc,
+        other,
+        solutions,
+    }))
 }
 
 impl UnitDiff for Runner {
@@ -776,5 +812,60 @@ impl UnitDiff for Runner {
             return topo::rust(t);
         }
         rust(&i).map_err(|e| HarnessError::new(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solidcore::geom::tol::scaled_zero_of_curve;
+    use solidcore::intersect::curve_class::p1::xsect_tol_2d_or_3d_for_classify_pair;
+    use solidcore::math::EFF_ZERO_PARAM;
+
+    /// #18342: each of the generated cases 76, 506, 740, 757 and 776 (a solution range of
+    /// 1e-10 in parameter on a curve of scale 1e6) keeps one short classified interval:
+    /// shorter than `SM_EFF_ZERO_PARAM` in parameter, but at least the classification's
+    /// pair tolerance and more than the curve's scaled zero long in 3D (1.0e-4 to
+    /// 6.6e-4 against at most 2e-5 and 5.2e-6). The parameter snap used to merge its two
+    /// ends, losing an overlap that the classification's own 3D tolerance tells apart.
+    #[test]
+    fn short_ranges_distinct_in_3d_stay_intervals() {
+        use PointClassType as Pc;
+        for (n, size) in [(76, 10), (506, 5), (740, 7), (757, 7), (776, 3)] {
+            let mut rng = Rng::new(CaseContext::seed_for("intersect.curve_class_p5", n));
+            let i: Input = serde_json::from_value(Runner.generate(&mut rng).unwrap()).unwrap();
+            let k = Kernel::default();
+            let ran = run(&i).unwrap().unwrap();
+            assert_eq!(ran.st, 0.0, "gen{n}");
+            assert_eq!(ran.cc.size(), size, "gen{n}");
+            let curve = ran.pool.curve(H(0, ClassObjectKind::Curve)).unwrap();
+            let scaled_zero = scaled_zero_of_curve(&k, curve).unwrap();
+            let mut short = 0;
+            for ivl in ran.cc.intervals() {
+                let (a, b) = (ivl.min(), ivl.max());
+                if b - a > EFF_ZERO_PARAM {
+                    continue;
+                }
+                short += 1;
+                let zone_a = ivl.start.obj_zone_tol_3d(&k, &ran.pool).unwrap();
+                let zone_b = ivl.end.obj_zone_tol_3d(&k, &ran.pool).unwrap();
+                let tol =
+                    xsect_tol_2d_or_3d_for_classify_pair(&k, curve, None, a, zone_a, b, zone_b)
+                        .unwrap();
+                let pa = curve.evaluate_point(&k, a).unwrap();
+                let pb = curve.evaluate_point(&k, b).unwrap();
+                let d = pa.distance(pb);
+                assert!(d >= tol && d > scaled_zero, "gen{n}: {d:e} {tol:e} {scaled_zero:e}");
+                assert!(d >= 1e-4, "gen{n}: {d:e}");
+                for pc in [&ivl.start, &ivl.mid, &ivl.end] {
+                    assert!(
+                        matches!(pc.point_class(), Pc::Curve | Pc::Surface),
+                        "gen{n}: {:?}",
+                        pc.point_class()
+                    );
+                }
+            }
+            assert_eq!(short, 1, "gen{n}");
+        }
     }
 }

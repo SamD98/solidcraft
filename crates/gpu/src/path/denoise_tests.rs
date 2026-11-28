@@ -9,6 +9,7 @@ use solidcraft_render::{
 };
 use solidcraft_viewport::{Camera, StandardView, surface::OpaqueSurface};
 use std::sync::Arc;
+use wgpu::util::DeviceExt;
 
 type Guide = [[f64; 4]; 6];
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -539,6 +540,41 @@ fn gpu_denoise_optical_guides_track_branches_and_certified_snell_endpoints() {
     let snell_y = 2.0 * incident.tan() + internal.tan();
     assert!((f64::from(guide[2][1]) - snell_y).abs() < 2e-5, "Snell displacement {guide:?} vs {snell_y}");
     assert_eq!(probe(closed_scene, JobOptions { max_depth: 2, ..options }), bypass(DenoiseGuideClass::PathDepth));
+}
+
+#[test]
+fn gpu_denoise_guides_classify_the_flake_under_the_pixel_as_the_cpu_does() {
+    use solidcraft_viewport::{clear_coat::ClearCoat, flakes::FlakeLayer};
+    let Some(context) = context() else { return };
+    let mut image = request(1);
+    image.camera.pitch = std::f64::consts::FRAC_PI_2 - 0.4;
+    image.camera.yaw = 0.0;
+    image.camera.fov = 0.4;
+    let options = JobOptions { samples: 1, max_depth: 4, denoise: true, ..Default::default() };
+    let probe = |surface: OpaqueSurface| {
+        let mut body = optical_plane(0.0, Vec3::ZERO);
+        body.surface = Some(surface);
+        let bounds = body.mesh.bounds();
+        let task = Task::new(context.clone(), ProductScene { meshes: vec![body], bounds }, image.clone(), options, CancelToken::default()).unwrap();
+        let filter = task.denoiser.as_ref().unwrap();
+        filter.generate_guides(&task).unwrap();
+        read_guides(&context, &filter._guides)
+    };
+    // Rough paint under a rough coat is filtered; full coverage puts the pixel on a flake.
+    let paint = OpaqueSurface::new(Vec3::new(0.1, 0.2, 0.5), 0.0, 0.7, 1.5).unwrap().with_clear_coat(ClearCoat::new(1.0, 0.3, 1.5).unwrap());
+    let flakes = |metallic: f64, roughness: f64| FlakeLayer::new(1.0, 0.1, 0.0, 0.0, Vec3::new(0.9, 0.8, 0.7), metallic, roughness).unwrap();
+    let plain = probe(paint);
+    assert_eq!(plain[0], [0.1, 0.2, 0.5, 1.0], "unflaked paint keeps its guide");
+    // A sharp metal flake is not rough paint: the filter must not clamp its sparkle.
+    let mut sharp = vec![[0.0; 4]; 6];
+    sharp[0][0] = DenoiseGuideClass::UnsupportedMaterial.code() as f32;
+    assert_eq!(probe(paint.with_flakes(flakes(1.0, 0.1))), sharp);
+    // A rough dielectric flake is filtered with the flake's own colour, as on the CPU.
+    let rough = probe(paint.with_flakes(flakes(0.0, 0.6)));
+    // The flake colour is stored in 16-bit steps.
+    assert!(rough[0][..3].iter().zip([0.9, 0.8, 0.7]).all(|(a, b)| (a - b).abs() < 1e-4), "{:?}", rough[0]);
+    assert_eq!(rough[0][3], 1.0);
+    assert_eq!(&rough[1][..3], &plain[1][..3], "the guide normal stays the surface normal");
 }
 
 #[test]

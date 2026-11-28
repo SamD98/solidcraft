@@ -23,13 +23,14 @@
 use solidcore::boolean::api_brep::boolean_difference;
 use solidcore::curve::curve::{Curve, CurveKind};
 use solidcore::geom::axis2_placement::Axis2Placement;
+use solidcore::math::det;
 use solidcore::math::{Point2, Point3, Vec3};
 use solidcore::primitive::api_curves::create_line_segment;
 use solidcore::primitive::api_primitives as api;
 use solidcore::sweep::api_brep::create_linear_sweep;
 use solidcore::topology::brep::p1::faces;
 use solidcore::topology::brep::p5::transform;
-use solidcore::topology::brep::validation::{check_brep, CheckLevel};
+use solidcore::topology::brep::validation::{check_brep, CheckLevel, PointerCheck};
 use solidcore::topology::edgeuse::p1 as eu1;
 use solidcore::topology::{Brep, EdgeuseId, EdgeuseOwner};
 use solidcore::Kernel;
@@ -60,7 +61,7 @@ fn bored_plate_turn(k: &mut Kernel, turn: f64) -> Brep {
     let mut bore = api::create_cylinder(k, Point3::new(0.0, 0.0, 0.0), 1.0, 12.0).unwrap();
     // the bore's z axis onto +y (through the 4 thickness), its x axis turned `turn`
     // degrees from the plate's u axis about that z axis
-    let (c, s) = (turn.cos(), turn.sin());
+    let (c, s) = (det::cos(turn), det::sin(turn));
     let frame = Axis2Placement::new(
         Point3::new(30.0, -1.0, 2.0),
         Vec3::new(c, 0.0, -s),
@@ -128,7 +129,7 @@ fn trim_face_extents(k: &Kernel, b: &Brep, eu: EdgeuseId) -> (f64, f64) {
 }
 
 struct Measured {
-    pointers_status: i32,
+    pointers: PointerCheck,
     assert_valid: Option<bool>,
     lines: Vec<String>,
     before: Vec<(EdgeuseId, Vec<Vec3>)>,
@@ -154,8 +155,8 @@ fn measure_turn(turn: f64) -> Measured {
     let lines = check.lines();
     let after = hole_trims(&body);
     eprintln!(
-        "pointers_status {} assert_valid {:?}, {} line(s) {:#?}",
-        check.pointers_status,
+        "pointers {:?} assert_valid {:?}, {} line(s) {:#?}",
+        check.pointers,
         check.assert_valid,
         lines.len(),
         lines
@@ -166,7 +167,7 @@ fn measure_turn(turn: f64) -> Measured {
         }
     }
     Measured {
-        pointers_status: check.pointers_status,
+        pointers: check.pointers,
         assert_valid: check.assert_valid,
         lines,
         before,
@@ -191,7 +192,7 @@ fn wr406_bored_plate_check_keeps_the_hole_trims() {
     // with no report (upstream moves each one's first-end control point onto the chord
     // and reports two kinks)
     let on = measure();
-    assert_eq!(on.pointers_status, 1000);
+    assert_eq!(on.pointers, PointerCheck::Passed);
     assert_eq!(on.assert_valid, Some(true));
     assert!(on.lines.is_empty(), "{:#?}", on.lines);
     assert_eq!(on.before, on.after, "the check left the trims alone");
@@ -203,7 +204,7 @@ fn wr406_bored_plate_check_keeps_the_hole_trims() {
 #[test]
 fn wr406_axis_aligned_bore_keeps_the_check_clean() {
     let m = measure_turn(0.0);
-    assert_eq!(m.pointers_status, 1000);
+    assert_eq!(m.pointers, PointerCheck::Passed);
     assert_eq!(m.assert_valid, Some(true));
     assert!(m.lines.is_empty(), "{:#?}", m.lines);
     assert_eq!(m.before, m.after, "the check did not touch the trims");

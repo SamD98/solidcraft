@@ -39,6 +39,7 @@ use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::geom::axis2_placement::Axis2Placement;
 use solidcore::kernel::UpstreamFixes;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3};
 use solidcore::primitive::api_curves::create_line_segment;
 use solidcore::primitive::api_primitives as api;
@@ -105,8 +106,9 @@ fn expected_volume(offset: f64) -> f64 {
         0.0
     } else {
         let c = -offset / k;
-        let a = c / 2.0 * (R * R - c * c).sqrt() + R * R / 2.0 * (c / R).asin() + PI / 4.0 * R * R;
-        -offset * a + k / 3.0 * (R * R - c * c).powf(1.5)
+        let a =
+            c / 2.0 * (R * R - c * c).sqrt() + R * R / 2.0 * det::asin(c / R) + PI / 4.0 * R * R;
+        -offset * a + k / 3.0 * det::powf(R * R - c * c, 1.5)
     };
     BOX_SIZE.0 * BOX_SIZE.1 * BOX_SIZE.2 - slab + ungula
 }
@@ -206,8 +208,7 @@ fn cut(tool: Tool, offset: f64, fixes: &UpstreamFixes) -> (f64, usize) {
 /// The case of the issue: the cap centre exactly on the box's top face plane, so the
 /// cap is bisected by that face and the seam's end lies on cylinder, cap plane and face
 /// at once. One closed solid of 1486369.884 mm3, not a refusal, however the tool is
-/// built and whichever upstream fixes are on (SolidCraft runs all but its held-back
-/// ones).
+/// built and whichever upstream fixes are on (SolidCraft runs all of them).
 #[test]
 fn cap_centre_on_the_top_face_leaves_one_closed_solid() {
     let want = expected_volume(0.0);

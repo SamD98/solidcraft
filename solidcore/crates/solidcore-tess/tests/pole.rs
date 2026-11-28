@@ -3,6 +3,7 @@
 //! the planner's layout either way, named in the plan's stats.
 
 #![allow(clippy::panic, clippy::indexing_slicing)] // test helpers
+use solidcore::math::det;
 
 mod pole_faces;
 
@@ -43,7 +44,7 @@ fn angle(a: Vec3, b: [f64; 3]) -> f64 {
         a.x * b.y - a.y * b.x,
     );
     let sin = (cross.x * cross.x + cross.y * cross.y + cross.z * cross.z).sqrt();
-    sin.atan2(a.x * b.x + a.y * b.y + a.z * b.z)
+    det::atan2(sin, a.x * b.x + a.y * b.y + a.z * b.z)
 }
 
 /// The parameters of `f`'s pole nodes.
@@ -202,16 +203,16 @@ fn a_pole_of_order_four_is_meshed_with_its_triangles_mean_normal_and_named() {
 }
 
 /// The cone whose apex is of third order (both first derivatives vanish there) is planned like
-/// the other faces, 592 triangles a quarter, and meshed whole: its apex takes the limit rule.
+/// the other faces, 560 triangles a quarter, and meshed whole: its apex takes the limit rule.
 #[test]
-fn the_cone_apex_of_third_order_is_meshed_on_its_592_triangles() {
+fn the_cone_apex_of_third_order_is_meshed_on_its_560_triangles() {
     let (p, stats) = planned(Kind::Cone);
     assert!(stats.unmeshed.is_empty(), "{:?}", stats.unmeshed);
     let (m, refused) = p.evaluate();
     assert!(refused.is_empty(), "{refused:?}");
     for f in &p.faces {
-        assert_eq!(f.triangles.len(), 592, "face {}", f.face);
-        assert_eq!(face_triangles(&m, f.face).len(), 592, "face {}", f.face);
+        assert_eq!(f.triangles.len(), 560, "face {}", f.face);
+        assert_eq!(face_triangles(&m, f.face).len(), 560, "face {}", f.face);
     }
 }
 
@@ -277,7 +278,7 @@ fn a_pole_across_a_closed_spline_s_end_has_the_limit_normal_between_its_corners(
                 }
                 let th = pole_faces::closed_angle(vs.iter().sum::<f64>() / vs.len() as f64);
                 let r = std::f64::consts::FRAC_1_SQRT_2;
-                let exact = [-th.cos() * r, -th.sin() * r, r].map(|x| x * sign);
+                let exact = [-det::cos(th) * r, -det::sin(th) * r, r].map(|x| x * sign);
                 worst = worst.max(angle(m.normals[mt[c] as usize], exact));
             }
         }

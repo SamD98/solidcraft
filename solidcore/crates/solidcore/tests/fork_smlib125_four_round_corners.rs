@@ -33,6 +33,7 @@ use solidcore::blend::fillet_solver::p1::FilletSurfaceGeneratorType;
 use solidcore::boolean::api_brep::boolean_difference;
 use solidcore::curve::curve::Curve;
 use solidcore::kernel::{Kernel, KernelOptions, UpstreamFixes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3};
 use solidcore::nurbs::knots::Side;
 use solidcore::primitive::api_curves::create_line_segment;
@@ -46,14 +47,12 @@ use solidcore::topology::face::p2 as face2;
 use solidcore::topology::{edge, Brep, EdgeId, FaceId};
 use std::f64::consts::PI;
 
-/// Every opt-in fix on but `geometric_g2_continuity`.
+/// Every opt-in fix on.
 fn kernel() -> Kernel {
     let mut k = Kernel::new(&KernelOptions::default());
     let mut f = UpstreamFixes::default();
     for &name in UpstreamFixes::NAMES {
-        if name != "geometric_g2_continuity" {
-            *f.flag_mut(name).unwrap() = true;
-        }
+        *f.flag_mut(name).unwrap() = true;
     }
     k.fixes = f;
     // (the log changes no result: issue_2489_blend_faces_are_definitions)
@@ -132,7 +131,7 @@ fn apex_normals(leans: &[f64], pocket: bool) -> Vec<Vec3> {
         .map(|k| {
             let a = 2.0 * PI * k as f64 / n as f64;
             let s = if pocket { -1.0 } else { 1.0 };
-            unit(Vec3::new(s * a.cos(), s * a.sin(), leans[k]))
+            unit(Vec3::new(s * det::cos(a), s * det::sin(a), leans[k]))
         })
         .collect()
 }

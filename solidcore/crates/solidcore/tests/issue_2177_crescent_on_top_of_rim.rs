@@ -5,8 +5,8 @@
 //! Upstream `CloseIntersectionLoop` relates the rim's long arc, the sole cylinder edge
 //! between the crescent's corners, with the crescent's bottom r 6 arc, so the result
 //! has an edge 38.16 off its face (level-2 check `#59`/`#82`), a UV trim of degree 3
-//! with 2 points and `brep_volume` fails with 1001. With
-//! `Kernel::fixes.close_loop_relates_only_coincident_edges` the union passes the
+//! with 2 points and `brep_volume` fails with 1001. With the fix (the only path since
+//! its flag was retired) the union passes the
 //! level-2 check, every UV trim has at least order points and the volume is exact.
 
 #![allow(
@@ -21,6 +21,7 @@ use solidcore::curve::curve::{Curve, CurveKind};
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::geom::axis2_placement::Axis2Placement;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::primitive::api_curves::create_arc;
 use solidcore::primitive::api_primitives::create_cylinder;
 use solidcore::sweep::api_brep::create_linear_sweep;
@@ -39,8 +40,8 @@ const PRISM: f64 = 5.0;
 /// The crescent's area: the r 6 disc centred at (10, 0) less the r 10 disc.
 fn crescent_area() -> f64 {
     let (d, r) = (R, R_CRESCENT);
-    let lens = r * r * ((d * d + r * r - R * R) / (2.0 * d * r)).acos()
-        + R * R * ((d * d + R * R - r * r) / (2.0 * d * R)).acos()
+    let lens = r * r * det::acos((d * d + r * r - R * R) / (2.0 * d * r))
+        + R * R * det::acos((d * d + R * R - r * r) / (2.0 * d * R))
         - 0.5 * ((-d + r + R) * (d + r - R) * (d - r + R) * (d + r + R)).sqrt();
     std::f64::consts::PI * r * r - lens
 }
@@ -56,12 +57,11 @@ fn volume(k: &Kernel, b: &mut Brep) -> solidcore::Result<f64> {
 }
 
 /// The union of the cylinder and the crescent prism on its top rim.
-fn union(fixed: bool) -> (Kernel, Brep) {
+fn union() -> (Kernel, Brep) {
     let mut k = Kernel::default();
-    k.fixes.close_loop_relates_only_coincident_edges = fixed;
     let y = (R * R - 8.2 * 8.2).sqrt();
-    let big = y.atan2(8.2).to_degrees();
-    let small = y.atan2(8.2 - R).to_degrees();
+    let big = det::atan2(y, 8.2).to_degrees();
+    let small = det::atan2(y, 8.2 - R).to_degrees();
     let inner = Curve::from(create_arc(Vec3::new(0.0, 0.0, 0.0), R, -big, big).unwrap());
     let outer = Curve::from(create_arc(Vec3::new(R, 0.0, 0.0), R_CRESCENT, -small, small).unwrap());
     let mut tool = create_linear_sweep(
@@ -122,7 +122,7 @@ fn short_trims(k: &mut Kernel, u: &mut Brep) -> Vec<String> {
 
 #[test]
 fn crescent_on_top_of_the_rim_is_exact_with_the_fix() {
-    let (mut k, mut u) = union(true);
+    let (mut k, mut u) = union();
     let c = check_brep(&mut k, &mut u, CheckLevel::Level2).unwrap();
     assert_eq!(c.failure_count(), 0, "{:?}", c.lines());
     let bad = short_trims(&mut k, &mut u);
@@ -133,16 +133,4 @@ fn crescent_on_top_of_the_rim_is_exact_with_the_fix() {
         (v - want).abs() <= 1e-6 * want,
         "volume {v}, expected {want}"
     );
-}
-
-#[test]
-fn crescent_on_top_of_the_rim_keeps_upstream_behaviour_without_the_fix() {
-    let (mut k, mut u) = union(false);
-    // at the default fixes the check stops at the short trim (1001 from
-    // `BSplineCurve::evaluate_point`); with the check-status fixes on it reports
-    // SmBrep test #59 (edge offset 38.16)
-    let clean =
-        check_brep(&mut k, &mut u, CheckLevel::Level2).is_ok_and(|c| c.failure_count() == 0);
-    assert!(!clean, "upstream's union now checks clean");
-    assert!(volume(&k, &mut u).is_err());
 }

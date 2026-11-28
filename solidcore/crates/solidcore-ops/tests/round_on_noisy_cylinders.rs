@@ -14,6 +14,10 @@
     clippy::indexing_slicing,
     clippy::disallowed_methods
 )] // test
+use solidcore::math::det;
+
+#[path = "../../solidcore/tests/support/solidcraft_fixes.rs"]
+mod solidcraft_fixes;
 
 mod common;
 
@@ -28,7 +32,7 @@ use solidcore_record::brep::Brep as Record;
 const TANGENT: f64 = 0.5 * std::f64::consts::PI / 180.0;
 
 fn lean() -> f64 {
-    10f64.to_radians().tan()
+    det::tan(10f64.to_radians())
 }
 
 /// The edge nearest `p`.
@@ -108,11 +112,7 @@ fn exact_wedge() -> Body {
 
 #[test]
 fn rounds_as_the_exact_wedge_does() {
-    let fixes: Vec<String> = serde_json::from_str(include_str!(
-        "../../solidcore/tests/kernel_cases/fixes.json"
-    ))
-    .unwrap();
-    session::set_thread_fixes(fixes.iter().map(String::as_str)).unwrap();
+    session::set_thread_fixes(solidcraft_fixes::solidcraft_fix_names()).unwrap();
     let record: Record =
         serde_json::from_str(include_str!("data/raked_wedge_noisy_cylinders.json")).unwrap();
     let (noisy, _) = Body::from_record(&record, true).unwrap();

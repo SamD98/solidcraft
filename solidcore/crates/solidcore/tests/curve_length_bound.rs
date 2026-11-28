@@ -12,6 +12,7 @@ use solidcore::curve::length_bound::MAX_PIECES;
 use solidcore::error::curve::CurveFailure;
 use solidcore::error::Reason;
 use solidcore::geom::extent1d::Extent1d;
+use solidcore::math::det;
 use solidcore::math::Point3;
 use solidcore::nurbs::b_spline_curve::BSplineCurve;
 use solidcore::nurbs::crv_basic::Curve as Nurb;
@@ -54,7 +55,7 @@ fn quadratic_root_integral(a: f64, b: f64, c: f64) -> f64 {
         let s = (a * t * t + b * t + c).sqrt();
         let u = 2.0 * a * t + b;
         let disc = 4.0 * a * c - b * b;
-        u * s / (4.0 * a) + disc / (8.0 * a.powf(1.5)) * (2.0 * a.sqrt() * s + u).ln()
+        u * s / (4.0 * a) + disc / (8.0 * det::powf(a, 1.5)) * det::ln(2.0 * a.sqrt() * s + u)
     };
     f(1.0) - f(0.0)
 }
@@ -279,7 +280,7 @@ fn the_cone_frustum_arc_floor_follows_the_floor_law() {
     let k = Kernel::default();
     let arc = cone_arc();
     let ivl = Extent1d::from_min_max(1.0, 1.25);
-    let rt = 10.0 - 6.0 * (std::f64::consts::PI / 6.0).tan();
+    let rt = 10.0 - 6.0 * det::tan(std::f64::consts::PI / 6.0);
     let exact = 0.5 * std::f64::consts::PI * rt;
     let b = arc.length_bound(&k, &ivl, 4e-8).unwrap();
     println!(
@@ -295,7 +296,7 @@ fn the_cone_frustum_arc_floor_follows_the_floor_law() {
         },
         other => panic!("not refused: {other:?}"),
     };
-    let predicted = 9.672_260_325_999_105e-8 * (21.0_f64 / 375.0).powf(2.0 / 3.0);
+    let predicted = 9.672_260_325_999_105e-8 * det::powf(21.0_f64 / 375.0, 2.0 / 3.0);
     println!("FLOOR cone arc floor={floor:e} pieces={pieces} predicted={predicted:e}");
     let ratio = floor / predicted;
     assert!(
@@ -303,4 +304,86 @@ fn the_cone_frustum_arc_floor_follows_the_floor_law() {
         "floor {floor:e}, predicted {predicted:e}"
     );
     assert!(pieces <= MAX_PIECES, "{pieces}");
+}
+
+/// Asking whether the length is at most a limit is settled from the enclosure, where asking for a
+/// bracket that narrow is refused: the zigzag above is near 400 long and a bracket 1e-8 wide is
+/// refused at the piece cap, while "at most 1e-8" is settled at once from its lower end. A
+/// parabola's exact length, from closed form, is settled either side of by the one end that
+/// proves it. And a degenerate curve, whose whole extent lies within the bound's own rounding so
+/// no piece carries an upper end, settles neither, and stops at the pieces the caller allows.
+#[test]
+fn a_length_limit_is_settled_from_the_enclosure_where_narrowing_to_it_is_not() {
+    let k = Kernel::default();
+    let n: i32 = 200;
+    let points: Vec<[f64; 3]> = (0..n)
+        .map(|i| {
+            [
+                0.01 * f64::from(i),
+                if i % 2 == 0 { 1.0 } else { -1.0 },
+                0.0,
+            ]
+        })
+        .collect();
+    let mut knots = vec![0.0; 4];
+    knots.extend((1..n - 3).map(f64::from));
+    knots.extend(vec![f64::from(n - 3); 4]);
+    let zigzag = spline(&points, 3, &knots);
+    let ivl = zigzag.natural_interval();
+    match zigzag.length_bound(&k, &ivl, 1e-8) {
+        Err(SolidError::Failed(f)) => assert!(matches!(
+            f.reason,
+            Reason::Curve(CurveFailure::LengthPastPieceCap { .. })
+        )),
+        other => panic!("narrowing to 1e-8 is not refused: {other:?}"),
+    }
+    assert_eq!(
+        zigzag
+            .proved_length_at_most(&k, &ivl, 1e-8, MAX_PIECES)
+            .unwrap(),
+        Some(false),
+        "at most 1e-8, settled from the lower end"
+    );
+
+    let parabola = spline(
+        &[[0.0, 0.0, 0.0], [1.0, 2.0, 0.0], [3.0, 0.0, 0.0]],
+        2,
+        &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+    );
+    let exact = 3.754_636_412_317_107;
+    let pivl = parabola.natural_interval();
+    assert_eq!(
+        parabola
+            .proved_length_at_most(&k, &pivl, 0.5 * exact, MAX_PIECES)
+            .unwrap(),
+        Some(false),
+        "a limit below {exact}"
+    );
+    assert_eq!(
+        parabola
+            .proved_length_at_most(&k, &pivl, 2.0 * exact, MAX_PIECES)
+            .unwrap(),
+        Some(true),
+        "a limit above {exact}"
+    );
+
+    // one point written four times: every piece's chord is within its own rounding, so none
+    // carries an upper end and no halving settles it
+    let point = spline(
+        &[
+            [1.0, 2.0, 3.0],
+            [1.0, 2.0, 3.0],
+            [1.0, 2.0, 3.0],
+            [1.0, 2.0, 3.0],
+        ],
+        3,
+        &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+    );
+    assert_eq!(
+        point
+            .proved_length_at_most(&k, &point.natural_interval(), 1e-6, 64)
+            .unwrap(),
+        None,
+        "a degenerate curve settles neither, and stops at the pieces allowed"
+    );
 }

@@ -25,6 +25,7 @@ use solidcore::boolean::api_brep::boolean_union;
 use solidcore::curve::curve::Curve;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3};
 use solidcore::primitive::api_curves as curves;
 use solidcore::query::api_queries::get_edges;
@@ -102,15 +103,8 @@ fn front_top(b: &Brep) -> EdgeId {
 /// concave chamfer's cone and round's torus about the disc's axis, the cap's cover).
 fn kernel() -> Kernel {
     let mut k = Kernel::default();
-    k.fixes.fillet_nx1_tangent_side_edge = true;
-    k.fixes.fillet_nx1_opposite_continuation_side_edge = true;
-    k.fixes.fillet_nx1_tangent_corner_edge = true;
     k.fixes.fillet_trace_reaches_rails = true;
-    k.fixes.fillet_rail_end_on_continued_surface = true;
-    k.fixes.fillet_run_on_past_far_end_only = true;
-    k.fixes.fillet_run_on_bspline_trims = true;
     k.fixes.fillet_chamfer_cone_on_arc = true;
-    k.fixes.cover_wraps_across_closed_seam = true;
     k
 }
 
@@ -169,8 +163,8 @@ fn concave_volume(h: impl Fn(f64) -> f64) -> f64 {
     peg_volume()
         + simpson(
             |s| {
-                let r = 10.0 - 2.0 * s.sin();
-                h(r) * r * 2.0 * (8.0 / r).asin() * 2.0 * s.cos()
+                let r = 10.0 - 2.0 * det::sin(s);
+                h(r) * r * 2.0 * det::asin(8.0 / r) * 2.0 * det::cos(s)
             },
             0.0,
             PI / 2.0,

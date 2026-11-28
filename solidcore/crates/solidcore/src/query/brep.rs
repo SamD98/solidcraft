@@ -12,6 +12,8 @@
 //! | [`lock_bounding_box`]                        | `SmBrep::LockBoundingBox`                      |
 //! | [`unlock_bounding_box`]                      | `SmBrep::UnLockBoundingBox`                    |
 //! | [`BrepQuery::point_3d_classify`]             | `SmBrep::Point3DClassify`                      |
+//! | [`BrepQuery::first_face_hit`], [`Ray`], [`FaceRayHit`] | (none: the first face a ray meets, on `SmBrep::RayFire`'s solve) |
+//! | [`face_hits`], [`FaceHit`]                   | (none: every face a ray meets, on `SmApiIntersectCurveFace` per face) |
 //! | [`BrepQuery`], [`BrepIdentity`]              | the B-rep's `SM_OC_BREP` cache (`CacheMakeOrValidate`) and pointer identities |
 //! | [`LazyBrep`]                                 | the `this` of the `const` box methods, which may edit the B-rep |
 //! | [`BrepClassifier`]                           | `Point3DClassify` on a B-rep held `const` (its lazily made UV trim curves on a copy) |
@@ -37,18 +39,14 @@
 //!   the B-rep from its `const` methods). [`calculate_bounding_box`] and
 //!   [`calculate_tight_bounding_box`] take a [`LazyBrep`]: pass `&mut Brep` for the
 //!   upstream behaviour; with `&Brep` the edits are made on a private copy and lost.
-//! - **Ignored statuses.** [`calculate_tight_bounding_box`] ignores the statuses of the
-//!   edge and face boxes, as upstream, and keeps what a failed call leaves: the
-//!   previous face's box after a failed loose face box (upstream writes it only on
-//!   success), the box of the face's vertices and edges after a failure in the
-//!   surface part of the tight face box
-//!   ([`crate::query::face::p3::calculate_tight_bounding_box_into`]), the loose box
-//!   after a failed tight edge box. A failed loose edge box leaves the freshly
-//!   initialised (empty) box: every `CalculateBoundingBox` override (`SmCurve`,
-//!   `SmBSplineCurve`, `SmLine`, `SmHermiteCurve`, `SmCrvOnSurf`, `SmCompositeCurve`)
-//!   fails only before it writes the caller's box. [`SolidError::Unported`] still
-//!   propagates. With `UpstreamFixes::brep_edit_statuses_pass_on` (fork 60a8a51) the
-//!   four statuses are passed on.
+//! - **Planar faces.** [`calculate_tight_bounding_box`] does not solve the tight box of a
+//!   planar face with an edge curve: that box is the face's vertices and edge boxes, which
+//!   the vertex and edge passes have taken, or passed over where an edge's loose box lay
+//!   inside. Upstream solves it, and with it each of the face's edges again. A failure
+//!   only that second solve of an edge would meet is not met.
+//! - **Passed-on statuses.** Upstream [`calculate_tight_bounding_box`] ignores the
+//!   statuses of the edge and face boxes and keeps what a failed call leaves. As the
+//!   fork does (60a8a51), the four statuses are passed on instead.
 //! - **Point classification.** [`BrepQuery::point_3d_classify`] returns the
 //!   classification instead of filling the caller's (every upstream caller constructs a
 //!   fresh one just before and drops it on failure), with [`EntityRef`] objects. Its
@@ -100,18 +98,27 @@ pub use ray::{
 
 use core::cell::OnceCell;
 
-use crate::error::{ignore_status, ignored, native_failure, EntityRef, Result, SolidError};
+use crate::curve::curve::Curve;
+use crate::error::intersect::IntersectFailure;
+use crate::error::query::QueryFailure;
+use crate::error::{native_failure, EntityRef, Result, SolidError};
 use crate::geom::attribute::{Attribute, AttributeValue, Behavior};
 use crate::geom::extent3d::Extent3d;
 use crate::geom::global_solver::{SolutionRequested, SolverOperation};
 use crate::geom::object::ObjectRef;
+use crate::geom::tol::{brep_zone_tol_3d, SmallTopoType};
+use crate::intersect::api_intersectors::{
+    intersect_curve_face, intersect_curve_face_within, CurveHits,
+};
 use crate::intersect::point_class::{PointClassType, PointClassification};
 use crate::intersect::topology_solver::p1::TopologySolver;
 use crate::intersect::topology_solver::p2::TopologySolveOptions;
 use crate::kernel::Kernel;
-use crate::math::{Point2, Point3, Vec3, BIG_DOUBLE};
+use crate::math::{Point2, Point3, Vec3, BIG_DOUBLE, EFF_ZERO};
 use crate::nurbs::b_spline_curve::BoundingBoxRequest;
 use crate::nurbs::knots::Side;
+use crate::primitive::api_curves::create_line_segment;
+use crate::query::api_queries::surface_closest_point;
 use crate::query::edge as qe;
 use crate::query::face::{p1 as qf1, p3 as qf3};
 use crate::surface::surface::Surface;
@@ -119,10 +126,12 @@ use crate::topology::brep::{p1 as bp1, p2 as bp2};
 use crate::topology::brep_cache::{
     arena_identity, make_brep_cache, BrepCache, BrepObjects, CacheObject, CacheSource,
 };
-use crate::topology::{edge, face, vertex, Brep, BrepId, NamingScheme, RegionId};
+use crate::topology::{edge, face, vertex, Brep, BrepId, FaceId, NamingScheme, RegionId};
 
 const OP_TIGHT_BOX: &str = "query::brep::calculate_tight_bounding_box";
 const OP_CLASSIFY: &str = "query::brep::BrepQuery::point_3d_classify";
+const OP_RAY: &str = "query::brep::Ray::new";
+const OP_FIRST_HIT: &str = "query::brep::BrepQuery::first_face_hit";
 const OP_EVAL_POINT: &str = "query::brep::evaluate_surface_point";
 const OP_EVAL_NORMAL: &str = "query::brep::evaluate_surface_normal";
 const OP_EVAL_DERIVS: &str = "query::brep::evaluate_surface_derivatives";
@@ -249,8 +258,9 @@ pub fn calculate_bounding_box<'a>(
 
 /// `SmBrep::CalculateTightBoundingBox`: the union of the vertex points, then of the
 /// tight box of every edge and face whose loose box is not already inside the box so
-/// far (the locked box is not used, nothing is expanded). The statuses of the edge and
-/// face boxes are ignored (see the module's deviations).
+/// far (the locked box is not used, nothing is expanded). A planar face with an edge
+/// curve is not solved: the vertex and edge passes have taken its box (see the module's
+/// deviations). The statuses of the edge and face boxes are ignored (also there).
 ///
 /// # Errors
 ///
@@ -274,43 +284,33 @@ pub fn calculate_tight_bounding_box<'a>(
     for e in bp1::edges(b, None)? {
         k.check_cancelled(OP_TIGHT_BOX)?;
         // (CalculateBoundingBox initialises the box first)
-        let mut edge_bbox = ignored(crate::error::passed_on(
-            qe::calculate_bounding_box(k, b, e, NORMAL_BOX, false),
-            k.fixes.brep_edit_statuses_pass_on,
-        )?)?
-        .and_then(|boxes| boxes.normal)
-        .unwrap_or_default();
+        let mut edge_bbox = qe::calculate_bounding_box(k, b, e, NORMAL_BOX, false)?
+            .normal
+            .unwrap_or_default();
         if edge_bbox.is_contained_by(&brep_bbox, 0.0) {
             continue;
         }
-        // (an edge without curve, or a failure, leaves the loose box)
-        if let Some(Some(tight)) = ignored(crate::error::passed_on(
-            qe::calculate_tight_bounding_box(k, b, e),
-            k.fixes.brep_edit_statuses_pass_on,
-        )?)? {
+        // (an edge without curve leaves the loose box)
+        if let Some(tight) = qe::calculate_tight_bounding_box(k, b, e)? {
             edge_bbox = tight;
         }
         brep_bbox = brep_bbox.union(&edge_bbox);
     }
 
-    // Union all of the Tight Face bounding boxes (`rFaceBBox` is kept from face to
-    // face).
-    let mut face_bbox = Extent3d::new();
+    // Union all of the Tight Face bounding boxes (upstream keeps `rFaceBBox` from face
+    // to face, which matters only after a failure; the fork passes failures on).
     for f in bp1::faces(b, None)? {
         k.check_cancelled(OP_TIGHT_BOX)?;
-        if let Some(loose) = ignored(crate::error::passed_on(
-            qf1::calculate_bounding_box(k, lb.get(), f, false),
-            k.fixes.brep_edit_statuses_pass_on,
-        )?)? {
-            face_bbox = loose;
-        }
+        let mut face_bbox = qf1::calculate_bounding_box(k, lb.get(), f, false)?;
         if face_bbox.is_contained_by(&brep_bbox, 0.0) {
             continue;
         }
-        ignore_status(crate::error::passed_on(
-            qf3::calculate_tight_bounding_box_into(k, &mut lb, f, &mut face_bbox),
-            k.fixes.brep_edit_statuses_pass_on,
-        )?)?;
+        // Not upstream: a planar face's box is its vertices' and edges', which the box has
+        // already, and solving it would solve each of its curved edges again.
+        if qf3::adds_nothing_to_brep_box(k, lb.get(), f)? {
+            continue;
+        }
+        qf3::calculate_tight_bounding_box_into(k, &mut lb, f, &mut face_bbox)?;
         brep_bbox = brep_bbox.union(&face_bbox);
     }
 
@@ -471,7 +471,7 @@ impl<'a> ProvenBrepIdentity<'a> {
                     .edges()
                     .get(e)
                     .and_then(|edge| edge.curve.as_ref())
-                    .and_then(crate::curve::curve::p2::Curve::owner)
+                    .and_then(Curve::owner)
                     .is_some_and(|actual| actual == base_keys(CacheObject::Edge(e))),
                 EntityRef::Face(f) => b
                     .faces()
@@ -541,6 +541,249 @@ const CLASSIFY_RAYS: [(Vec3, Vec3); 3] = [
     (Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
     (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0)),
 ];
+
+/// A ray (not upstream): a finite origin and a unit direction, so a distance along it is its
+/// parameter. Made only by [`Ray::new`], which refuses what is no ray.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ray {
+    origin: Point3,
+    direction: Vec3,
+}
+
+impl Ray {
+    /// The ray from `origin` along `direction`, made unit at any finite length
+    /// ([`Vec3::length_and_unit`]).
+    ///
+    /// # Errors
+    ///
+    /// [`SolidError::InvalidInput`] for a coordinate that is not finite, or a direction of no
+    /// length: one whose length is below `SM_EFF_ZERO` ([`EFF_ZERO`]).
+    pub fn new(origin: Point3, direction: Vec3) -> Result<Self> {
+        let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+        if !(finite(origin) && finite(direction)) {
+            return Err(SolidError::invalid_input(
+                OP_RAY,
+                "a coordinate that is not finite",
+            ));
+        }
+        let no_length = || SolidError::invalid_input(OP_RAY, "a direction of no length");
+        let (length, direction) = direction.length_and_unit().ok_or_else(no_length)?;
+        if length < EFF_ZERO {
+            return Err(no_length());
+        }
+        Ok(Self { origin, direction })
+    }
+
+    /// Where the ray starts.
+    #[must_use]
+    pub const fn origin(&self) -> Point3 {
+        self.origin
+    }
+
+    /// Its unit direction.
+    #[must_use]
+    pub const fn direction(&self) -> Vec3 {
+        self.direction
+    }
+}
+
+/// The first face a ray meets ([`BrepQuery::first_face_hit`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FaceRayHit {
+    /// The face.
+    pub face: FaceId,
+    /// The (u, v) of the face's surface at the hit.
+    pub uv: Point2,
+    /// The surface's point there.
+    pub point: Point3,
+    /// The ray's parameter at the hit: its distance from the origin along the ray.
+    pub distance: f64,
+}
+
+/// A point where a ray meets a face ([`face_hits`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FaceHit {
+    /// The face.
+    pub face: FaceId,
+    /// The point on the ray where it meets the face.
+    pub point: Point3,
+    /// Its distance from the ray's origin along the ray.
+    pub distance: f64,
+}
+
+/// (Not upstream) Every point where `ray` meets a face of `b`, nearest first. The ray, as a
+/// segment from its origin past the far side of `b`'s box ([`calculate_bounding_box`], the
+/// default options), is solved against each face both by [`intersect_curve_face`] (its fixed
+/// `0.001`, which finds a shallow crossing) and by its solve within the B-rep's zone tolerance
+/// ([`brep_zone_tol_3d`], the tolerance of [`BrepQuery::first_face_hit`]; it finds a grazing
+/// one), and a point found is a hit only where it lies on `b`'s boundary within that
+/// tolerance: a ray passing the body farther off meets nothing, one
+/// within it touches it, and one crossing a face at a grazing angle meets it at each crossing.
+/// A point is a hit of every face meeting there: the face it lies in, both faces of an edge,
+/// every face round a vertex. Points of one face within twice the tolerance of each other (a
+/// crossing solved at both parameters of a seam or pole, or found again from a neighbouring
+/// face) are one hit. So a face the ray crosses twice (a cylinder's side) gives two hits, a
+/// crossing on its seam or a sphere's pole one, and a ray through an edge or a vertex, or
+/// grazing an edge from outside, one hit of each face there, at one point and distance. Hits
+/// at one distance are in the faces' order (`GetFaces`); [`BrepQuery::first_face_hit`] names
+/// one of them, its solve's first. A hit at the ray's origin is at distance 0. Where the ray
+/// lies along a face within the tolerance over a stretch, that face has no hit along the
+/// stretch, its ends included, except at an end where the ray goes into or out of it: one
+/// inside the face, one on its own seam or pole where no other stretch of it goes on, or one
+/// on an edge whose other face the ray lies along there too (a rim grazed); not one at the
+/// segment's ends. So a ray grazing a curved face within the tolerance meets it twice. Empty
+/// when the ray meets no face, including a ray that starts past the box. The solves may make
+/// missing UV trim curves on `b`.
+///
+/// [`intersect_curve_face`]: crate::intersect::api_intersectors::intersect_curve_face
+///
+/// # Errors
+///
+/// Those of the box, the segment and the solves (a face without a surface among them),
+/// except a face's [`IntersectFailure::NoIntersection`], which is no hit; those of the
+/// stretches' evaluations, the cache, the boundary solve of each point, the faces of its
+/// vertex or edge and the seam and pole checks.
+pub fn face_hits(k: &Kernel, b: &mut Brep, ray: Ray) -> Result<Vec<FaceHit>> {
+    let corners = calculate_bounding_box(k, &mut *b, BoundingBoxOptions::default())?.corners();
+    let reach = corners
+        .iter()
+        .fold(0.0_f64, |m, c| m.max(c.distance(ray.origin)));
+    if reach <= EFF_ZERO {
+        return Ok(Vec::new());
+    }
+    let far = 2.0 * reach;
+    let segment: Curve = create_line_segment(ray.origin, ray.origin + ray.direction * far)?.into();
+    let tolerance = brep_zone_tol_3d(k, b, SmallTopoType::NormalSize);
+    let along_ray = |p: Point3| (p - ray.origin).dot(ray.direction);
+    let faces = bp1::faces(b, None)?;
+    let mut points = Vec::new();
+    // each stretch the ray lies along a face: the face and its range along the ray
+    let mut stretches: Vec<(FaceId, f64, f64)> = Vec::new();
+    let mut ends: Vec<(FaceId, Point3)> = Vec::new();
+    for &f in &faces {
+        if let Some(found) = solved(intersect_curve_face_within(k, &segment, b, f, tolerance))? {
+            for curve in &found.curves {
+                let interval = curve.natural_interval();
+                let p = curve.evaluate_point(k, interval.min())?;
+                let q = curve.evaluate_point(k, interval.max())?;
+                let (s, t) = (along_ray(p), along_ray(q));
+                stretches.push((f, s.min(t), s.max(t)));
+                for (end, at) in [(p, s), (q, t)] {
+                    if at > tolerance && at < far - tolerance {
+                        ends.push((f, end));
+                    }
+                }
+            }
+            points.extend(found.points);
+        }
+        // the 0.001 solve finds the shallow crossings the zone-tolerance one misses; its
+        // points off the body fail the boundary check below
+        if let Some(found) = solved(intersect_curve_face(k, &segment, b, f))? {
+            points.extend(found.points);
+        }
+    }
+    if points.is_empty() && ends.is_empty() {
+        return Ok(Vec::new());
+    }
+    // each hit with its face's place in `faces`, for ties
+    let mut hits: Vec<(Option<usize>, FaceHit)> = Vec::new();
+    let query = BrepQuery::of_brep(b);
+    let on_stretch = |face: FaceId, at: f64| {
+        stretches
+            .iter()
+            .any(|&(g, s, t)| g == face && at >= s - tolerance && at <= t + tolerance)
+    };
+    // another stretch of the face starts where this one ends (split at its seam or pole)
+    let goes_on = |face: FaceId, end: Point3| {
+        ends.iter()
+            .filter(|&&(g, p)| g == face && p.distance(end) <= 2.0 * tolerance)
+            .count()
+            > 1
+    };
+    // a stretch's end where the ray goes into or out of its face
+    for &(f, end) in &ends {
+        let at = along_ray(end);
+        let entity = query.entity_at(k, b, end, tolerance)?;
+        let seam_or_pole = match entity {
+            Some(EntityRef::Edge(e)) => edge::face_on_both_sides(b, e, f)?,
+            Some(EntityRef::Vertex(v)) => vertex::is_on_pole(k, b, v)?,
+            _ => false,
+        };
+        let crossing = if seam_or_pole {
+            !goes_on(f, end)
+        } else {
+            match entity {
+                Some(EntityRef::Face(g)) => g == f,
+                // a rim grazed: the face beyond the edge lies along the ray there too
+                Some(EntityRef::Edge(e)) => edge::faces(b, e, None)?
+                    .into_iter()
+                    .any(|g| g != f && on_stretch(g, at)),
+                _ => false,
+            }
+        };
+        if crossing {
+            add_hit(&mut hits, &faces, f, end, at, tolerance);
+        }
+    }
+    for point in points {
+        let distance = along_ray(point).max(0.0);
+        let faces_there = match query.entity_at(k, b, point, tolerance)? {
+            Some(EntityRef::Vertex(v)) => vertex::faces(b, v)?,
+            Some(EntityRef::Edge(e)) => edge::faces(b, e, None)?,
+            Some(EntityRef::Face(f)) => vec![f],
+            _ => Vec::new(),
+        };
+        for face in faces_there {
+            if !on_stretch(face, distance) {
+                add_hit(&mut hits, &faces, face, point, distance, tolerance);
+            }
+        }
+    }
+    hits.sort_by(|(r, p), (s, q)| p.distance.total_cmp(&q.distance).then(r.cmp(s)));
+    Ok(hits.into_iter().map(|(_, h)| h).collect())
+}
+
+/// Adds the hit of `face` at `point` to [`face_hits`]' `hits`, with the face's place in
+/// `faces`, unless `face` has one within twice `tolerance` of it: two solved points of one
+/// crossing are each within the tolerance of it.
+fn add_hit(
+    hits: &mut Vec<(Option<usize>, FaceHit)>,
+    faces: &[FaceId],
+    face: FaceId,
+    point: Point3,
+    distance: f64,
+    tolerance: f64,
+) {
+    let again = hits
+        .iter()
+        .any(|(_, h)| h.face == face && h.point.distance(point) <= 2.0 * tolerance);
+    if !again {
+        hits.push((
+            faces.iter().position(|&g| g == face),
+            FaceHit {
+                face,
+                point,
+                distance,
+            },
+        ));
+    }
+}
+
+/// A curve/face solve's hits, none for its [`IntersectFailure::NoIntersection`].
+fn solved(found: Result<CurveHits>) -> Result<Option<CurveHits>> {
+    match found {
+        Ok(found) => Ok(Some(found)),
+        Err(e)
+            if matches!(
+                e.intersect_failure(),
+                Some(IntersectFailure::NoIntersection)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// A B-rep's queries over its cache: the identities and the `SM_OC_BREP` cache, which
 /// upstream builds when a query first needs it and keeps on the B-rep
@@ -707,6 +950,161 @@ impl<'a> BrepQuery<'a> {
         )
     }
 
+    /// (Not upstream) The first face of `b` that `ray` meets, with the (u, v) of the face's
+    /// surface there, the surface's point and the distance along the ray; `None` when the ray
+    /// meets no face. The hits are the ray fire's solve ([`bp2::ray_fire`]'s: the B-rep point
+    /// solve, [`SolverOperation::Rayfire`], every solution), each a face's surface met by the
+    /// ray (`GlobalLineIntersect`) inside the face's trim, at the B-rep's zone tolerance
+    /// ([`brep_zone_tol_3d`]) plus the face's own, and no farther behind the origin than the
+    /// solve's zero. Each is a hit of the faces at its point as [`face_hits`] finds them:
+    /// those of the vertex, edge or face there at the zone tolerance, else those of the
+    /// solution's own vertex, edge or face (a ray through a seam, an edge or a corner meets
+    /// each face there). The first is the nearest, and of hits at one distance the one on
+    /// the first face in `b`'s face order (`GetFaces`), as `face_hits` orders them. Its
+    /// (u, v) is the solution's when the solution is on that face, else that of the face's
+    /// surface point nearest the ray's point there; a face without one is passed over for
+    /// the next hit. Its distance is the solution's, clamped at 0 (a hit within the solve's
+    /// zero behind the origin is at the origin), and its point is the surface's at its
+    /// (u, v). A sheet is hit from either side. The solve may make missing UV trim curves
+    /// on `b`, as a ray fire does.
+    ///
+    /// # Errors
+    ///
+    /// [`SolidError::InvalidInput`] for a hit face without a surface; those of the cache, the
+    /// solve and the surface's evaluation.
+    pub fn first_face_hit(&self, k: &Kernel, b: &mut Brep, ray: Ray) -> Result<Option<FaceRayHit>> {
+        let tolerance = brep_zone_tol_3d(k, b, SmallTopoType::NormalSize);
+        let identity = self.effective_identity();
+        let cache = self.cache(k, b)?;
+        let vectors = [ray.direction];
+        let solutions = ray::solve_mutable_brep_point_kept(
+            k,
+            b,
+            &identity,
+            cache,
+            &self.face_caches,
+            ray.origin,
+            TopologySolveOptions {
+                operation: SolverOperation::Rayfire,
+                requested: SolutionRequested::All,
+                tolerance_3d: tolerance,
+                best_answer_so_far_sq: BIG_DOUBLE,
+                opt_vectors: &vectors,
+            },
+        )?;
+        let order = bp1::faces(b, None)?;
+        let rank = |f: FaceId| order.iter().position(|&g| g == f).unwrap_or(usize::MAX);
+        let all = solutions.as_slice();
+        // nearest first; the solutions at one distance are taken together, and those of a
+        // farther distance only when no nearer one gives a hit
+        let mut nearest_first: Vec<(f64, usize)> = all
+            .iter()
+            .enumerate()
+            .map(|(index, solution)| (solution.start.solution_value, index))
+            .collect();
+        nearest_first.sort_by(|p, q| p.0.total_cmp(&q.0));
+        for at_one_distance in nearest_first.chunk_by(|p, q| p.0.total_cmp(&q.0).is_eq()) {
+            // the faces at each solution's point as `face_hits` finds them: those of the
+            // vertex, edge or face there at the zone tolerance (`entity_at`, its errors
+            // returned as `face_hits` returns them), else those of the solution's own
+            // vertex, edge or face
+            let mut met: Vec<(usize, FaceId, f64, usize)> = Vec::new();
+            for &(distance, index) in at_one_distance {
+                let Some(solution) = all.get(index) else {
+                    continue;
+                };
+                let on_ray = ray.origin + ray.direction * distance;
+                let entity = match self.entity_at(k, b, on_ray, tolerance)? {
+                    Some(entity) => Some(entity),
+                    None => solution
+                        .objects
+                        .first()
+                        .copied()
+                        .flatten()
+                        .and_then(|object| bp2::cache_entity(object).ok()),
+                };
+                let faces = match entity {
+                    Some(EntityRef::Vertex(v)) => vertex::faces(b, v).unwrap_or_default(),
+                    Some(EntityRef::Edge(e)) => edge::faces(b, e, None).unwrap_or_default(),
+                    Some(EntityRef::Face(f)) => vec![f],
+                    _ => Vec::new(),
+                };
+                for face in faces {
+                    met.push((rank(face), face, distance, index));
+                }
+            }
+            // at one distance in `GetFaces` order, as `face_hits` orders its hits
+            met.sort_by_key(|hit| hit.0);
+            for (_, face, distance, index) in met {
+                let Some(solution) = all.get(index) else {
+                    continue;
+                };
+                let surface = face::p2::surface(b, face)?.ok_or_else(|| {
+                    SolidError::invalid_input(OP_FIRST_HIT, "a face without a surface")
+                })?;
+                // the solution's (u, v) when it is a solution on this face; else that of
+                // the surface's point nearest the ray's point there, and a face without
+                // one is passed over
+                let uv = match solution.objects.first().copied().flatten() {
+                    Some(CacheObject::Face(f)) if f == face => {
+                        Point2::new(solution.start.param(0)?, solution.start.param(1)?)
+                    }
+                    _ => {
+                        let on_ray = ray.origin + ray.direction * distance;
+                        let nearest = surface_closest_point(k, surface, on_ray).ok();
+                        let Some(&uv) = nearest.as_ref().and_then(|n| n.uvs.first()) else {
+                            continue;
+                        };
+                        uv
+                    }
+                };
+                return Ok(Some(FaceRayHit {
+                    face,
+                    uv,
+                    point: surface.evaluate_point(k, uv)?,
+                    distance: distance.max(0.0),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// (Not upstream) The lowest dimensional vertex, edge or face of `b` within `tolerance`
+    /// of `point` (the boundary solve of [`Self::point_3d_classify`]); none when it is on no
+    /// face.
+    fn entity_at(
+        &self,
+        k: &Kernel,
+        b: &mut Brep,
+        point: Point3,
+        tolerance: f64,
+    ) -> Result<Option<EntityRef>> {
+        let identity = self.effective_identity();
+        let cache = self.cache(k, b)?;
+        let solutions = ray::solve_mutable_brep_point_kept(
+            k,
+            b,
+            &identity,
+            cache,
+            &self.face_caches,
+            point,
+            TopologySolveOptions {
+                operation: SolverOperation::Intersect,
+                requested: SolutionRequested::Single,
+                tolerance_3d: tolerance,
+                best_answer_so_far_sq: 0.0,
+                opt_vectors: &[],
+            },
+        )?;
+        let Some(object) = solutions
+            .get(0)
+            .and_then(|s| s.objects.first().copied().flatten())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(bp2::cache_entity(object)?))
+    }
+
     /// `SmBrep::Point3DClassify`: classifies `point` (zone tolerance
     /// `point_zone_tol_3d`) against `b`, the B-rep this query was built for. With
     /// `do_boundary_intersections` the lowest dimensional vertex, edge or face the point
@@ -812,7 +1210,7 @@ impl<'a> BrepQuery<'a> {
             if let Some(sol) = solutions.get(0) {
                 // Just grab the first one -- we asked for Single.
                 let object = sol.objects[0].ok_or_else(|| {
-                    SolidError::query_missing(OP_CLASSIFY, "the object the ray solution hit")
+                    crate::error::Failure::new(OP_CLASSIFY, QueryFailure::Defect { why: "the B-rep point solve fills the first object slot of each solution it returns" }).with_status(crate::error::SM_ERR_NULL_POINTER).into_error()
                 })?;
                 pc.load_from_intersection(
                     point_zone_tol_3d,
@@ -880,9 +1278,8 @@ impl<'a> BrepQuery<'a> {
             }
         }
 
-        let region = region.ok_or_else(|| {
-            SolidError::query_failed(OP_CLASSIFY, "no ray fired from the point found its region")
-        })?;
+        let region =
+            region.ok_or_else(|| SolidError::query(OP_CLASSIFY, QueryFailure::RegionNotFound))?;
 
         // load output
         pc.set_class_object(PointClassType::Region, Some(EntityRef::Region(region)));
@@ -970,6 +1367,10 @@ pub enum LazyBrep<'a> {
         /// Its private copy, made at the first edit.
         copy: Option<Box<Brep>>,
     },
+    /// A B-rep read only, with its UV trim curves made: an edit is not made, on it or on
+    /// a copy; the query that would make one returns
+    /// [`SolidError::PreparationRequired`] instead.
+    Prepared(&'a Brep),
 }
 
 impl<'a> From<&'a mut Brep> for LazyBrep<'a> {
@@ -991,6 +1392,7 @@ impl LazyBrep<'_> {
         match self {
             Self::Own(b) => b,
             Self::Shared { source, copy } => copy.as_deref().unwrap_or(source),
+            Self::Prepared(b) => b,
         }
     }
 
@@ -999,7 +1401,8 @@ impl LazyBrep<'_> {
     ///
     /// # Errors
     ///
-    /// Those of [`Brep::clone_standing_for_self`], at the first edit of a shared B-rep.
+    /// Those of [`Brep::clone_standing_for_self`], at the first edit of a shared B-rep;
+    /// [`SolidError::PreparationRequired`] for a [`LazyBrep::Prepared`] one.
     pub fn get_mut(&mut self) -> Result<&mut Brep> {
         match self {
             Self::Own(b) => Ok(b),
@@ -1007,6 +1410,9 @@ impl LazyBrep<'_> {
                 Some(c) => Ok(c),
                 slot @ None => Ok(slot.insert(Box::new(source.clone_standing_for_self()?))),
             },
+            Self::Prepared(_) => Err(SolidError::PreparationRequired {
+                operation: OP_TIGHT_BOX,
+            }),
         }
     }
 }
@@ -1343,6 +1749,7 @@ mod tests {
     use super::*;
     use crate::geom::extent2d::Extent2d;
     use crate::geom::vector2d::Vec2;
+    use crate::math::det;
     use crate::surface::plane::p1::Plane;
 
     fn unit_plane() -> Surface {
@@ -1499,6 +1906,834 @@ mod tests {
             .unwrap();
         assert_eq!(inside.object(), solid);
         assert!(trim_count(&b) > 0, "the trims are made on the box itself");
+    }
+
+    /// A ray that enters a 100 mm cube 0.001 mm from a vertical edge and leaves 0.001 mm from
+    /// the same edge: the entry point is not on the edge (it is 0.001 mm off it, far outside
+    /// the edge's tolerance), so the hit is a hit on the face it enters, and the ray start is
+    /// outside the cube. (The solve reports the nearest hit only here, so the hit is not moved
+    /// onto the edge whatever tolerance the move is held to; that is covered where a ray meets
+    /// two faces on an edge, `a_long_thin_elliptic_prism_faces_out_and_cuts_a_block`.)
+    #[test]
+    fn a_ray_entering_near_an_edge_hits_the_face() {
+        let mut k = Kernel::default();
+        let mut b =
+            crate::primitive::api_primitives::create_box(&mut k, Point3::ZERO, 100.0, 100.0, 100.0)
+                .unwrap();
+        let query = BrepQuery::of_brep(&b);
+        let outside = b.infinite_region();
+        let start = Point3::new(-30.0, 30.001, 50.0);
+        let direction = Vec3::new(1.0, -1.0, 0.0).unitize().unwrap();
+        let hit = query
+            .ray_fire_live(&k, &mut b, start, direction, 1e-6)
+            .unwrap();
+        assert_eq!(hit.region, outside, "the ray starts outside the cube");
+        assert_eq!(
+            hit.intersection.point_class(),
+            PointClassType::Face,
+            "{:?}",
+            hit.intersection
+        );
+    }
+
+    /// A ray along +x at y = 3, z = 10 crosses the side of the radius-5 cylinder about z at
+    /// x = -4 and x = 4 (a 3-4-5 triangle): from x = -20 the first face hit is the side at
+    /// (-4, 3, 10), 16 along the ray, its surface at the hit's (u, v) on the ray (within the
+    /// B-rep's zone tolerance) and at that point;
+    /// from the axis, the far side at 4; from x = 20 facing away, nothing. What is no ray is
+    /// refused before any solve.
+    #[test]
+    fn the_first_face_a_ray_meets_is_the_nearer_of_its_hits() {
+        let mut k = Kernel::default();
+        let mut b =
+            crate::primitive::api_primitives::create_cylinder(&mut k, Point3::ZERO, 5.0, 20.0)
+                .unwrap();
+        let query = BrepQuery::of_brep(&b);
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let ray = |o: Point3| Ray::new(o, x).unwrap();
+        let near = query
+            .first_face_hit(&k, &mut b, ray(Point3::new(-20.0, 3.0, 10.0)))
+            .unwrap()
+            .unwrap();
+        assert!(
+            near.point.distance(Point3::new(-4.0, 3.0, 10.0)) < 1e-9,
+            "{near:?}"
+        );
+        assert!((near.distance - 16.0).abs() < 1e-9, "{near:?}");
+        let surface = face::p2::surface(&b, near.face).unwrap().unwrap();
+        let on = surface.evaluate_point(&k, near.uv).unwrap();
+        let along = on - Point3::new(-20.0, 3.0, 10.0);
+        let off_line = (along - x * along.dot(x)).length();
+        let zone = brep_zone_tol_3d(&k, &b, SmallTopoType::NormalSize);
+        assert!(off_line <= zone, "{on:?} is {off_line} off the ray");
+        assert!(on.distance(Point3::new(-4.0, 3.0, 10.0)) < 1e-9, "{on:?}");
+        let far = query
+            .first_face_hit(&k, &mut b, ray(Point3::new(0.0, 3.0, 10.0)))
+            .unwrap()
+            .unwrap();
+        assert!(
+            far.point.distance(Point3::new(4.0, 3.0, 10.0)) < 1e-9,
+            "{far:?}"
+        );
+        assert_eq!(far.face, near.face);
+        assert_eq!(
+            query
+                .first_face_hit(&k, &mut b, ray(Point3::new(20.0, 3.0, 10.0)))
+                .unwrap(),
+            None
+        );
+        let refused = |r: Result<Ray>| matches!(r, Err(SolidError::InvalidInput { .. }));
+        assert!(refused(Ray::new(Point3::ZERO, Vec3::ZERO)));
+        assert!(refused(Ray::new(Point3::new(f64::NAN, 0.0, 0.0), x)));
+        assert!(refused(Ray::new(
+            Point3::ZERO,
+            Vec3::new(0.0, f64::INFINITY, 0.0)
+        )));
+    }
+
+    /// Every face a ray meets, nearest first: along +x at y = 3, z = 10 from x = -20 the
+    /// radius-5 cylinder about z gives its side twice, at x = -4 (16 along) and x = 4 (24
+    /// along), the first where `first_face_hit` lands; from the axis only x = 4; facing away,
+    /// none. Up from (0.6, 0.8, -5) through the 10 x 10 x 10 box at (-5, -5, 0) and a sphere
+    /// of radius 2 at (0, 0, 20), one B-rep of two lumps: the box's bottom (5) and top (15),
+    /// then the sphere, 1 off its axis, at 25 -/+ sqrt(3).
+    #[test]
+    fn every_face_a_ray_meets_comes_nearest_first() {
+        let mut k = Kernel::default();
+        let mut b =
+            crate::primitive::api_primitives::create_cylinder(&mut k, Point3::ZERO, 5.0, 20.0)
+                .unwrap();
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        let along = |k: &Kernel, b: &mut Brep, o: Point3, d: Vec3| {
+            face_hits(k, b, Ray::new(o, d).unwrap())
+                .unwrap()
+                .iter()
+                .map(|h| (h.distance, h.point, h.face))
+                .collect::<Vec<_>>()
+        };
+        let hits = along(&k, &mut b, Point3::new(-20.0, 3.0, 10.0), x);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for (hit, (at, distance)) in hits.iter().zip([(-4.0, 16.0), (4.0, 24.0)]) {
+            assert!((hit.0 - distance).abs() < 1e-9, "{hits:?}");
+            assert!(
+                hit.1.distance(Point3::new(at, 3.0, 10.0)) < 1e-9,
+                "{hits:?}"
+            );
+        }
+        let first = BrepQuery::of_brep(&b)
+            .first_face_hit(
+                &k,
+                &mut b,
+                Ray::new(Point3::new(-20.0, 3.0, 10.0), x).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.face, hits[0].2);
+        assert!(first.point.distance(hits[0].1) < 1e-9, "{first:?} {hits:?}");
+        let hits = along(&k, &mut b, Point3::new(0.0, 3.0, 10.0), x);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!((hits[0].0 - 4.0).abs() < 1e-9, "{hits:?}");
+        assert!(along(&k, &mut b, Point3::new(20.0, 3.0, 10.0), x).is_empty());
+        let block = crate::primitive::api_primitives::create_box(
+            &mut k,
+            Point3::new(-5.0, -5.0, 0.0),
+            10.0,
+            10.0,
+            10.0,
+        )
+        .unwrap();
+        let ball = crate::primitive::api_primitives::create_sphere(
+            &mut k,
+            Point3::new(0.0, 0.0, 20.0),
+            2.0,
+        )
+        .unwrap();
+        let mut two = crate::boolean::api_brep::boolean_union(&mut k, block, ball).unwrap();
+        // 1 off the sphere's axis (0.6, 0.8), clear of its poles: sqrt(3) each side of z = 20
+        let hits = along(
+            &k,
+            &mut two,
+            Point3::new(0.6, 0.8, -5.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+        assert_eq!(hits.len(), 4, "{hits:?}");
+        let r = 3.0_f64.sqrt();
+        for (hit, want) in hits.iter().zip([5.0, 15.0, 25.0 - r, 25.0 + r]) {
+            assert!((hit.0 - want).abs() < 1e-9, "{hits:?}");
+        }
+    }
+
+    /// The rays of the #21325 review. Along +x at y = 0, z = 10 the radius-5 cylinder about z
+    /// is crossed at x = -5 and on its seam at x = 5: two hits, at 15 and 25, and the same
+    /// two from x = 20 the other way. Up the axis of the radius-2 sphere at (0, 0, 20) from
+    /// the origin: its poles once each, at 18 and 22; along +x at z = 20, (2, 0, 20) on its
+    /// seam once. Past the side y = 5 of the cube [-5, 5]^3 by 5e-4, outside the zone
+    /// tolerance, nothing, as for `first_face_hit`. From (1, 1, 1) through the corner
+    /// (5, 5, 5) the three faces there at that point and one distance, 4 sqrt 3, in the faces'
+    /// order; from (1, 1, 0) through the edge x = y = 5 its two faces at (5, 5, 0), 4 sqrt 2.
+    #[test]
+    fn a_ray_through_a_seam_pole_edge_or_corner_hits_each_face_there_once() {
+        let mut k = Kernel::default();
+        let along = |k: &Kernel, b: &mut Brep, o: [f64; 3], d: [f64; 3]| {
+            let ray = Ray::new(Point3::new(o[0], o[1], o[2]), Vec3::new(d[0], d[1], d[2]));
+            face_hits(k, b, ray.unwrap()).unwrap()
+        };
+        let at = |hits: &[FaceHit], want: &[(f64, [f64; 3])]| {
+            assert_eq!(hits.len(), want.len(), "{hits:?}");
+            for (hit, (distance, [x, y, z])) in hits.iter().zip(want) {
+                assert!((hit.distance - distance).abs() < 1e-9, "{hits:?}");
+                assert!(
+                    hit.point.distance(Point3::new(*x, *y, *z)) < 1e-9,
+                    "{hits:?}"
+                );
+            }
+        };
+        let mut tube =
+            crate::primitive::api_primitives::create_cylinder(&mut k, Point3::ZERO, 5.0, 20.0)
+                .unwrap();
+        let hits = along(&k, &mut tube, [-20.0, 0.0, 10.0], [1.0, 0.0, 0.0]);
+        at(
+            &hits,
+            &[(15.0, [-5.0, 0.0, 10.0]), (25.0, [5.0, 0.0, 10.0])],
+        );
+        let hits = along(&k, &mut tube, [20.0, 0.0, 10.0], [-1.0, 0.0, 0.0]);
+        at(
+            &hits,
+            &[(15.0, [5.0, 0.0, 10.0]), (25.0, [-5.0, 0.0, 10.0])],
+        );
+
+        let mut ball = crate::primitive::api_primitives::create_sphere(
+            &mut k,
+            Point3::new(0.0, 0.0, 20.0),
+            2.0,
+        )
+        .unwrap();
+        let hits = along(&k, &mut ball, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        at(&hits, &[(18.0, [0.0, 0.0, 18.0]), (22.0, [0.0, 0.0, 22.0])]);
+        let hits = along(&k, &mut ball, [-20.0, 0.0, 20.0], [1.0, 0.0, 0.0]);
+        at(
+            &hits,
+            &[(18.0, [-2.0, 0.0, 20.0]), (22.0, [2.0, 0.0, 20.0])],
+        );
+
+        let mut cube = crate::primitive::api_primitives::create_box(
+            &mut k,
+            Point3::new(-5.0, -5.0, -5.0),
+            10.0,
+            10.0,
+            10.0,
+        )
+        .unwrap();
+        let past = [-20.0, 5.0005, 0.0];
+        assert!(along(&k, &mut cube, past, [1.0, 0.0, 0.0]).is_empty());
+        let first = |b: &mut Brep, o: [f64; 3], d: [f64; 3]| {
+            let ray = Ray::new(Point3::new(o[0], o[1], o[2]), Vec3::new(d[0], d[1], d[2]));
+            BrepQuery::of_brep(b)
+                .first_face_hit(&k, b, ray.unwrap())
+                .unwrap()
+        };
+        assert_eq!(first(&mut cube, past, [1.0, 0.0, 0.0]), None);
+        let order = bp1::faces(&cube, None).unwrap();
+        let rank = |f: FaceId| order.iter().position(|&g| g == f).unwrap();
+        for (o, d, faces, distance, [x, y, z]) in [
+            (
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                3,
+                4.0 * 3.0_f64.sqrt(),
+                [5.0, 5.0, 5.0],
+            ),
+            (
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                2,
+                4.0 * 2.0_f64.sqrt(),
+                [5.0, 5.0, 0.0],
+            ),
+        ] {
+            let hits = along(&k, &mut cube, o, d);
+            assert_eq!(hits.len(), faces, "{hits:?}");
+            assert!((hits[0].distance - distance).abs() < 1e-9, "{hits:?}");
+            assert!(
+                hits[0].point.distance(Point3::new(x, y, z)) < 1e-9,
+                "{hits:?}"
+            );
+            for pair in hits.windows(2) {
+                assert_eq!(pair[0].point, pair[1].point, "{hits:?}");
+                assert_eq!(pair[0].distance, pair[1].distance, "{hits:?}");
+                assert!(rank(pair[0].face) < rank(pair[1].face), "{hits:?}");
+            }
+            let one = first(&mut cube, o, d).unwrap();
+            assert!(hits.iter().any(|h| h.face == one.face), "{one:?} {hits:?}");
+        }
+    }
+
+    /// The rays of the #21603 review. Along +x at z = 10, y = 4.9999 the radius-5 cylinder
+    /// about z is crossed at a grazing angle at x = -+sqrt(25 - 4.9999^2), about 0.0316: two
+    /// hits, the first where `first_face_hit` lands; the same for the radius-2 sphere at
+    /// (0, 0, 20) along +x at y = 1.999, z = 20. Through the axis of the radius-4e-4 cylinder
+    /// from 20 away, its two crossings 8e-4 apart are two hits, at 19.9996 and 20.0004, the
+    /// first where `first_face_hit` lands. At y = 4.99999 the ray is within the tolerance of
+    /// the cylinder's side over a stretch: its two ends, 20 -+ sqrt(25 - y^2), are the hits.
+    /// Through the hole of the torus of radii 10 and 2 about z, along +x at y = 7.99999, the
+    /// outer crossings at 20 -+ sqrt(144 - y^2) and the ends of the stretch past the hole at
+    /// 20 -+ sqrt(64 - y^2): four hits of its one face. Along +x in the plane z = 5 of the cube
+    /// [-5, 5]^3, the ray lies along that face: only the sides x = -5 and x = 5, at 15 and 25.
+    #[test]
+    fn a_grazing_or_close_pair_of_crossings_are_hits_and_a_stretch_along_a_face_is_none() {
+        let mut k = Kernel::default();
+        let ray = |o: [f64; 3]| Ray::new(Point3::new(o[0], o[1], o[2]), Vec3::new(1.0, 0.0, 0.0));
+        let both = |k: &Kernel, b: &mut Brep, o: [f64; 3]| {
+            let hits = face_hits(k, b, ray(o).unwrap()).unwrap();
+            let first = BrepQuery::of_brep(b)
+                .first_face_hit(k, b, ray(o).unwrap())
+                .unwrap()
+                .unwrap();
+            (hits, first)
+        };
+        let mut tube =
+            crate::primitive::api_primitives::create_cylinder(&mut k, Point3::ZERO, 5.0, 20.0)
+                .unwrap();
+        let mut ball = crate::primitive::api_primitives::create_sphere(
+            &mut k,
+            Point3::new(0.0, 0.0, 20.0),
+            2.0,
+        )
+        .unwrap();
+        let mut thin = crate::primitive::api_primitives::create_cylinder(
+            &mut k,
+            Point3::new(1.0, 0.0, 0.0),
+            4e-4,
+            1.0,
+        )
+        .unwrap();
+        for (b, o, half) in [
+            (
+                &mut tube,
+                [-20.0, 4.9999, 10.0],
+                (25.0 - 4.9999_f64 * 4.9999).sqrt(),
+            ),
+            (
+                &mut ball,
+                [-20.0, 1.999, 20.0],
+                (4.0 - 1.999_f64 * 1.999).sqrt(),
+            ),
+            (&mut thin, [-19.0, 0.0, 0.5], 4e-4),
+        ] {
+            let (hits, first) = both(&k, b, o);
+            assert_eq!(hits.len(), 2, "{hits:?}");
+            assert!((hits[0].distance - (20.0 - half)).abs() < 1e-6, "{hits:?}");
+            assert!((hits[1].distance - (20.0 + half)).abs() < 1e-6, "{hits:?}");
+            assert!(
+                (first.distance - hits[0].distance).abs() < 1e-6,
+                "{first:?} {hits:?}"
+            );
+        }
+        let close = |hits: &[FaceHit], want: &[f64]| {
+            assert_eq!(hits.len(), want.len(), "{hits:?}");
+            for (hit, distance) in hits.iter().zip(want) {
+                assert!((hit.distance - distance).abs() < 1e-6, "{hits:?}");
+            }
+        };
+        let (hits, first) = both(&k, &mut tube, [-20.0, 4.99999, 10.0]);
+        let half = (25.0 - 4.99999_f64 * 4.99999).sqrt();
+        close(&hits, &[20.0 - half, 20.0 + half]);
+        assert!(
+            (first.distance - hits[0].distance).abs() < 1e-6,
+            "{first:?} {hits:?}"
+        );
+        let mut ring =
+            crate::primitive::api_primitives::create_torus(&mut k, Point3::ZERO, 10.0, 2.0)
+                .unwrap();
+        let (hits, first) = both(&k, &mut ring, [-20.0, 7.99999, 0.0]);
+        let outer = (144.0 - 7.99999_f64 * 7.99999).sqrt();
+        let inner = (64.0 - 7.99999_f64 * 7.99999).sqrt();
+        close(
+            &hits,
+            &[20.0 - outer, 20.0 - inner, 20.0 + inner, 20.0 + outer],
+        );
+        assert!(
+            (first.distance - hits[0].distance).abs() < 1e-6,
+            "{first:?} {hits:?}"
+        );
+
+        let mut cube = crate::primitive::api_primitives::create_box(
+            &mut k,
+            Point3::new(-5.0, -5.0, -5.0),
+            10.0,
+            10.0,
+            10.0,
+        )
+        .unwrap();
+        let hits = face_hits(&k, &mut cube, ray([-20.0, 0.0, 5.0]).unwrap()).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!((hits[0].distance - 15.0).abs() < 1e-9, "{hits:?}");
+        assert!((hits[1].distance - 25.0).abs() < 1e-9, "{hits:?}");
+        assert_ne!(hits[0].face, hits[1].face, "{hits:?}");
+    }
+
+    /// The rays of the third #21603 review. Along +z at x = 1.99999, y = 0, the ray grazes
+    /// the radius-2 sphere's equator in its seam's half-plane: the ends of its stretch, on the
+    /// seam, are its crossings 20 -+ sqrt(4 - x^2). Along +x at y = 4.99999, z = 19.999995 it
+    /// grazes the rim of the radius-5 cylinder of height 20: the ends of the side's stretch
+    /// are its crossings 20 -+ sqrt(25 - y^2). At a slope e of 1e-3 and 1e-4, up the cylinder
+    /// from (0, 5 - 30e, -20) along (0, e, 1), it enters the bottom at 20 sqrt(1 + e^2) and
+    /// crosses the side at a shallow angle at 30 sqrt(1 + e^2); from (0, 5 + 5e, 5) along
+    /// (0, -e, 1) it enters the side at 5 sqrt(1 + e^2) and leaves the top at
+    /// 15 sqrt(1 + e^2), its side crossing on a span join of the side's surface (#21621). The
+    /// first hit of each where `first_face_hit` lands, and on the shallow rays at the same face.
+    #[test]
+    fn a_ray_grazing_a_seam_or_a_rim_or_crossing_a_wall_shallowly_meets_it() {
+        let mut k = Kernel::default();
+        let hits_and_first = |k: &Kernel, b: &mut Brep, o: [f64; 3], d: [f64; 3]| {
+            let ray = || Ray::new(Point3::new(o[0], o[1], o[2]), Vec3::new(d[0], d[1], d[2]));
+            let hits = face_hits(k, b, ray().unwrap()).unwrap();
+            let first = BrepQuery::of_brep(b)
+                .first_face_hit(k, b, ray().unwrap())
+                .unwrap()
+                .unwrap();
+            (hits, first)
+        };
+        let close = |hits: &[FaceHit], want: &[f64]| {
+            assert_eq!(hits.len(), want.len(), "{hits:?}");
+            for (hit, distance) in hits.iter().zip(want) {
+                assert!((hit.distance - distance).abs() < 1e-6, "{hits:?}");
+            }
+        };
+        let mut ball =
+            crate::primitive::api_primitives::create_sphere(&mut k, Point3::ZERO, 2.0).unwrap();
+        let (hits, first) = hits_and_first(&k, &mut ball, [1.99999, 0.0, -20.0], [0.0, 0.0, 1.0]);
+        let half = (4.0 - 1.99999_f64 * 1.99999).sqrt();
+        close(&hits, &[20.0 - half, 20.0 + half]);
+        assert!(
+            (first.distance - hits[0].distance).abs() < 1e-6,
+            "{first:?} {hits:?}"
+        );
+
+        let mut tube =
+            crate::primitive::api_primitives::create_cylinder(&mut k, Point3::ZERO, 5.0, 20.0)
+                .unwrap();
+        let (hits, first) =
+            hits_and_first(&k, &mut tube, [-20.0, 4.99999, 19.999995], [1.0, 0.0, 0.0]);
+        let half = (25.0 - 4.99999_f64 * 4.99999).sqrt();
+        close(&hits, &[20.0 - half, 20.0 + half]);
+        assert!(
+            (first.distance - hits[0].distance).abs() < 1e-6,
+            "{first:?} {hits:?}"
+        );
+
+        for e in [1e-3, 1e-4] {
+            let stretch = (1.0_f64 + e * e).sqrt();
+            let (hits, first) =
+                hits_and_first(&k, &mut tube, [0.0, 5.0 - 30.0 * e, -20.0], [0.0, e, 1.0]);
+            close(&hits, &[20.0 * stretch, 30.0 * stretch]);
+            assert!(
+                (first.distance - hits[0].distance).abs() < 1e-6 && first.face == hits[0].face,
+                "{e} {first:?} {hits:?}"
+            );
+            let (hits, first) =
+                hits_and_first(&k, &mut tube, [0.0, 5.0 + 5.0 * e, 5.0], [0.0, -e, 1.0]);
+            close(&hits, &[5.0 * stretch, 15.0 * stretch]);
+            assert!(
+                (first.distance - hits[0].distance).abs() < 1e-6 && first.face == hits[0].face,
+                "{e} {first:?} {hits:?}"
+            );
+        }
+    }
+
+    /// #21621 and the #22030 reviews: shallow rays through a cylinder's side. On the
+    /// cylinder of radius r and height 4r about z, the ray through p = r(cos t, sin t, 0) +
+    /// (0, 0, 2r) on its side along d = c r̂ + s t̂ + ẑ (r̂ and t̂ the radial and tangent
+    /// directions at p; c = -e inward, e outward), from p - rd. At p + kd its
+    /// squared distance from the axis is r^2 + 2rck + (c^2 + s^2)k^2, so it crosses the side
+    /// at k = 0 and at k = -2rc / (c^2 + s^2). A hit is a point of the side within T (the
+    /// zone tolerance plus the side's) of the ray, so its k is where that distance is within
+    /// T of r: between the roots for r + T and not between those for r - T; both queries
+    /// give the side first, at a k in that set's piece around the first crossing past the
+    /// origin (k = -r), and `first_face_hit`'s point is the surface's at its (u, v), within
+    /// T of the ray. The origin is outside the side for every inward ray, and inside it
+    /// for an outward one only where c^2 + s^2 < 2c (the unskewed ones among them).
+    /// Unskewed and inward, the ray then leaves through the top at k = 2r, within T. The
+    /// rays, each inward and outward unless said: on radius 5, e = 1e-4, 1e-3 and 2e-3,
+    /// s = 0, +-0.003, +-0.01, +-0.05, at t = 0 (the seam), 45, 89, 90, 180 and 270 degrees
+    /// (90, 180 and 270 the joins of the side surface's spans), the unskewed one at 270
+    /// degrees at e = 1e-4 outward only; on radius 500, 5000 and 50000, e = 1e-5,
+    /// s = 0.01, at 67.5 degrees, inward only; on radius 50000, e = 1e-3 and 1e-4,
+    /// s = +-0.1, at 67.5, 80, 85 and 90; on radius 0.5, e = 1e-4, s = +-0.01, at 89 and
+    /// 90. `first_face_hit`'s distance is its point's from the origin, within T. Every ray
+    /// that misses is listed.
+    #[test]
+    fn a_shallow_ray_meets_a_cylinder_side_at_its_seam_and_span_joins() {
+        let mut k = Kernel::default();
+        // the roots of a k^2 + b k = rhs, least first (b is never 0 here)
+        let roots = |a: f64, b: f64, rhs: f64| -> Option<(f64, f64)> {
+            let disc = b * b + 4.0 * a * rhs;
+            if disc < 0.0 {
+                return None;
+            }
+            let q = -0.5 * (b + b.signum() * disc.sqrt());
+            let (k1, k2) = (q / a, -rhs / q);
+            Some((k1.min(k2), k1.max(k2)))
+        };
+        // each ray's directions: `true` is inward (c = -e)
+        let (both, inward_only, outward_only): (&[bool], &[bool], &[bool]) =
+            (&[true, false], &[true], &[false]);
+        let mut cases = Vec::new();
+        for e in [1e-4, 1e-3, 2e-3] {
+            for degrees in [0.0_f64, 45.0, 89.0, 90.0, 180.0, 270.0] {
+                for skew in [0.0, 0.003, -0.003, 0.01, -0.01, 0.05, -0.05] {
+                    let unskewed_at_270 = e == 1e-4 && degrees == 270.0 && skew == 0.0;
+                    let inwards = if unskewed_at_270 { outward_only } else { both };
+                    cases.push((5.0, e, skew, degrees, inwards));
+                }
+            }
+        }
+        for r in [500.0, 5000.0, 50000.0] {
+            cases.push((r, 1e-5, 0.01, 67.5, inward_only));
+        }
+        for e in [1e-3, 1e-4] {
+            for degrees in [67.5, 80.0, 85.0, 90.0] {
+                for skew in [0.1, -0.1] {
+                    cases.push((50000.0, e, skew, degrees, both));
+                }
+            }
+        }
+        for degrees in [89.0, 90.0] {
+            for skew in [0.01, -0.01] {
+                cases.push((0.5, 1e-4, skew, degrees, both));
+            }
+        }
+        let mut bodies: Vec<(f64, Brep, FaceId, FaceId, f64)> = Vec::new();
+        let mut misses = Vec::new();
+        for (r, e, skew, degrees, inwards) in cases {
+            if !bodies.iter().any(|body| body.0 == r) {
+                let mut tube = crate::primitive::api_primitives::create_cylinder(
+                    &mut k,
+                    Point3::ZERO,
+                    r,
+                    4.0 * r,
+                )
+                .unwrap();
+                let middle = Point3::new(0.0, 0.0, 2.0 * r);
+                let mut face_along = |d: Vec3| {
+                    let ray = Ray::new(middle, d).unwrap();
+                    BrepQuery::of_brep(&tube)
+                        .first_face_hit(&k, &mut tube, ray)
+                        .unwrap()
+                        .unwrap()
+                        .face
+                };
+                let side = face_along(Vec3::new(1.0, 1.0, 0.0));
+                let top = face_along(Vec3::new(0.0, 0.0, 1.0));
+                let within = brep_zone_tol_3d(&k, &tube, SmallTopoType::NormalSize)
+                    + face::p2::tolerance(&tube, side).unwrap();
+                bodies.push((r, tube, side, top, within));
+            }
+            let Some((_, tube, side, top, within)) = bodies.iter_mut().find(|body| body.0 == r)
+            else {
+                continue;
+            };
+            let (side, top, within) = (*side, *top, *within);
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            let radial = Vec3::new(cos, sin, 0.0);
+            let tangent = Vec3::new(-sin, cos, 0.0);
+            let p = Point3::new(r * cos, r * sin, 2.0 * r);
+            for &inward in inwards {
+                let c = if inward { -e } else { e };
+                let d = radial * c + tangent * skew + Vec3::new(0.0, 0.0, 1.0);
+                let length = d.length();
+                let ray = Ray::new(p - d * r, d).unwrap();
+                let at = (r, e, skew, degrees, inward);
+                let (a, b) = (c * c + skew * skew, 2.0 * r * c);
+                let first = [0.0, -b / a]
+                    .into_iter()
+                    .filter(|&k1| k1 > -r)
+                    .fold(f64::INFINITY, f64::min);
+                let (p1, p2) = roots(a, b, (r + within).powi(2) - r * r).unwrap();
+                let (lo, hi) = match roots(a, b, (r - within).powi(2) - r * r) {
+                    Some((q1, _)) if first <= q1 => (p1, q1),
+                    Some((_, q2)) if first >= q2 => (q2, p2),
+                    Some(_) => (first, first),
+                    None => (p1, p2),
+                };
+                let slack = 1e-9 * (1.0 + r);
+                let in_band = |distance: f64| {
+                    let k1 = distance / length - r;
+                    k1 >= lo - slack && k1 <= hi + slack
+                };
+                let hits = face_hits(&k, tube, ray).unwrap();
+                if !hits
+                    .first()
+                    .is_some_and(|h| h.face == side && in_band(h.distance))
+                {
+                    misses.push(format!("face_hits {at:?}: {hits:?}, k in [{lo}, {hi}]"));
+                }
+                if skew == 0.0 && inward {
+                    let top_at = 3.0 * r * length;
+                    let leaves = hits.get(1).is_some_and(|h| {
+                        h.face == top && (h.distance - top_at).abs() <= within * length
+                    });
+                    if hits.len() != 2 || !leaves {
+                        misses.push(format!("face_hits top {at:?}: {hits:?}"));
+                    }
+                }
+                let found = BrepQuery::of_brep(tube)
+                    .first_face_hit(&k, tube, ray)
+                    .unwrap();
+                let Some(first_hit) = found else {
+                    misses.push(format!("first_face_hit {at:?}: none, k in [{lo}, {hi}]"));
+                    continue;
+                };
+                let surface = face::p2::surface(tube, side).unwrap().unwrap();
+                let w = first_hit.point - ray.origin;
+                let off_ray = (w - ray.direction * w.dot(ray.direction)).length();
+                if first_hit.face != side
+                    || !in_band(first_hit.distance)
+                    || surface.evaluate_point(&k, first_hit.uv).unwrap() != first_hit.point
+                    || off_ray > within
+                    || (w.length() - first_hit.distance).abs() > within
+                {
+                    misses.push(format!(
+                        "first_face_hit {at:?}: {first_hit:?}, k in [{lo}, {hi}]"
+                    ));
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} misses:\n{}",
+            misses.len(),
+            misses.join("\n")
+        );
+    }
+
+    /// Rays through the middle of each edge and each corner of the box [0, 10]^3, from
+    /// three directions each, and the #22030 review's rays: through the box's edges and
+    /// corners, and from (5 + 5 cos 45, 5 sin 45, 25) and (10, 0, 25) along (-5, 0, -5)
+    /// through the top rim of the radius-5 cylinder of height 20, the second on its seam.
+    /// `first_face_hit` names the face `face_hits` gives first, at its distance within
+    /// twice the zone tolerance, with its point the surface's at its (u, v).
+    #[test]
+    fn first_face_hit_at_an_edge_or_corner_is_face_hits_first() {
+        let mut k = Kernel::default();
+        let mut block =
+            crate::primitive::api_primitives::create_box(&mut k, Point3::ZERO, 10.0, 10.0, 10.0)
+                .unwrap();
+        let mut tube =
+            crate::primitive::api_primitives::create_cylinder(&mut k, Point3::ZERO, 5.0, 20.0)
+                .unwrap();
+        let half = 0.5_f64.sqrt();
+        let mut rays = vec![
+            ([20.0, 12.0, 5.0], [-10.0, -2.0, 0.0], false),
+            ([20.0, 15.0, 5.0], [-10.0, -5.0, 0.0], false),
+            ([15.0, 20.0, 5.0], [-5.0, -10.0, 0.0], false),
+            ([20.0, 15.0, 17.0], [-10.0, -5.0, -7.0], false),
+            ([20.0, 20.0, 20.0], [-1.0, -1.0, -1.0], false),
+            ([-5.0, 5.0, 15.0], [5.0, 0.0, -5.0], false),
+            (
+                [5.0 + 5.0 * half, 5.0 * half, 25.0],
+                [-5.0, 0.0, -5.0],
+                true,
+            ),
+            ([10.0, 0.0, 25.0], [-5.0, 0.0, -5.0], true),
+        ];
+        let out = |c: f64| {
+            if c == 0.0 {
+                -1.0
+            } else if c == 10.0 {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        for x in [0.0, 5.0, 10.0] {
+            for y in [0.0, 5.0, 10.0] {
+                for z in [0.0, 5.0, 10.0] {
+                    let n = [out(x), out(y), out(z)];
+                    if n.iter().filter(|&&c| c != 0.0).count() < 2 {
+                        continue;
+                    }
+                    for w in [[1.0, 1.0, 1.0], [1.0, 0.5, 0.25], [0.25, 1.0, 0.5]] {
+                        let o = [
+                            x + 10.0 * n[0] * w[0],
+                            y + 10.0 * n[1] * w[1],
+                            z + 10.0 * n[2] * w[2],
+                        ];
+                        rays.push((o, [x - o[0], y - o[1], z - o[2]], false));
+                    }
+                }
+            }
+        }
+        let mut misses = Vec::new();
+        for (o, d, on_tube) in rays {
+            let b = if on_tube { &mut tube } else { &mut block };
+            let within = 2.0 * brep_zone_tol_3d(&k, b, SmallTopoType::NormalSize);
+            let ray = Ray::new(Point3::new(o[0], o[1], o[2]), Vec3::new(d[0], d[1], d[2])).unwrap();
+            let hits = face_hits(&k, b, ray).unwrap();
+            let first = BrepQuery::of_brep(b).first_face_hit(&k, b, ray).unwrap();
+            let Some(first) = first else {
+                misses.push(format!("{o:?} {d:?}: no first hit, {hits:?}"));
+                continue;
+            };
+            let surface = face::p2::surface(b, first.face).unwrap().unwrap();
+            let same = hits.first().is_some_and(|h| {
+                h.face == first.face && (h.distance - first.distance).abs() <= within
+            });
+            if !same || surface.evaluate_point(&k, first.uv).unwrap() != first.point {
+                misses.push(format!("{o:?} {d:?}: {first:?}, {hits:?}"));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} misses:\n{}",
+            misses.len(),
+            misses.join("\n")
+        );
+    }
+
+    /// Shallow chords of a cylinder's side. On the cylinder of radius r and height 4r about
+    /// z, the ray through p = r(cos θ, sin θ, 0) + (0, 0, 2r) on its side along
+    /// d = c r̂ + s t̂ + ẑ (r̂ and t̂ the radial and tangent directions at p; c = −e inward,
+    /// +e outward), from p − r d. At p + k d its squared distance from the axis is
+    /// r² + 2rck + (c² + s²)k², so it crosses the side at k = 0 and at k = −2rc / (c² + s²),
+    /// and halfway between them it is r c² / (2(c² + s²)) inside the side (2.5e-4 at r = 500,
+    /// up to 2.5e-2 at r = 50000, against T = 2e-5: two transversal crossings, no touch).
+    /// A hit is a point of the side within T (the zone tolerance plus the side's) of the ray,
+    /// so its k is where that distance is within T of r: between the roots for r + T and
+    /// not between those for r − T. Both queries give the side first, at a k in that set's
+    /// piece around the first crossing past the origin (k = −r), and `first_face_hit`'s point
+    /// is the surface's at its (u, v), within T of the ray. The rays: on r = 500, 5000 and
+    /// 50000, e = 1e-5, s = ±0.01, θ = 67.5°, 80° and 85°.
+    #[test]
+    fn a_shallow_chord_of_a_cylinder_side_meets_it_first_at_its_first_crossing() {
+        let mut k = Kernel::default();
+        // the roots of a k² + b k = rhs, least first (b is never 0 here)
+        let roots = |a: f64, b: f64, rhs: f64| -> Option<(f64, f64)> {
+            let disc = b * b + 4.0 * a * rhs;
+            if disc < 0.0 {
+                return None;
+            }
+            let q = -0.5 * (b + b.signum() * disc.sqrt());
+            let (k1, k2) = (q / a, -rhs / q);
+            Some((k1.min(k2), k1.max(k2)))
+        };
+        let mut cases = Vec::new();
+        for r in [500.0, 5000.0, 50000.0] {
+            for degrees in [67.5_f64, 80.0, 85.0] {
+                for skew in [0.01, -0.01] {
+                    cases.push((r, 1e-5, skew, degrees));
+                }
+            }
+        }
+        let mut bodies: Vec<(f64, Brep, FaceId, f64)> = Vec::new();
+        let mut misses = Vec::new();
+        for (r, e, skew, degrees) in cases {
+            if !bodies.iter().any(|body| body.0 == r) {
+                let mut tube = crate::primitive::api_primitives::create_cylinder(
+                    &mut k,
+                    Point3::ZERO,
+                    r,
+                    4.0 * r,
+                )
+                .unwrap();
+                let middle = Point3::new(0.0, 0.0, 2.0 * r);
+                let mut face_along = |d: Vec3| {
+                    let ray = Ray::new(middle, d).unwrap();
+                    BrepQuery::of_brep(&tube)
+                        .first_face_hit(&k, &mut tube, ray)
+                        .unwrap()
+                        .unwrap()
+                        .face
+                };
+                let side = face_along(Vec3::new(1.0, 1.0, 0.0));
+                let within = brep_zone_tol_3d(&k, &tube, SmallTopoType::NormalSize)
+                    + face::p2::tolerance(&tube, side).unwrap();
+                bodies.push((r, tube, side, within));
+            }
+            let (_, tube, side, within) = bodies.iter_mut().find(|body| body.0 == r).unwrap();
+            let (side, within) = (*side, *within);
+            let (sin, cos) = det::sin_cos(degrees.to_radians());
+            let radial = Vec3::new(cos, sin, 0.0);
+            let tangent = Vec3::new(-sin, cos, 0.0);
+            let p = Point3::new(r * cos, r * sin, 2.0 * r);
+            for inward in [true, false] {
+                let c = if inward { -e } else { e };
+                let d = radial * c + tangent * skew + Vec3::new(0.0, 0.0, 1.0);
+                let length = d.length();
+                let ray = Ray::new(p - d * r, d).unwrap();
+                let at = (r, e, skew, degrees, inward);
+                let (a, b) = (c * c + skew * skew, 2.0 * r * c);
+                let first = [0.0, -b / a]
+                    .into_iter()
+                    .filter(|&k1| k1 > -r)
+                    .fold(f64::INFINITY, f64::min);
+                let (p1, p2) = roots(a, b, det::powi(r + within, 2) - r * r).unwrap();
+                let (lo, hi) = match roots(a, b, det::powi(r - within, 2) - r * r) {
+                    Some((q1, _)) if first <= q1 => (p1, q1),
+                    Some((_, q2)) if first >= q2 => (q2, p2),
+                    Some(_) => (first, first),
+                    None => (p1, p2),
+                };
+                let slack = 1e-9 * (1.0 + r);
+                let in_band = |distance: f64| {
+                    let k1 = distance / length - r;
+                    k1 >= lo - slack && k1 <= hi + slack
+                };
+                let hits = face_hits(&k, tube, ray).unwrap();
+                if !hits
+                    .first()
+                    .is_some_and(|h| h.face == side && in_band(h.distance))
+                {
+                    misses.push(format!("face_hits {at:?}: {hits:?}, k in [{lo}, {hi}]"));
+                }
+                let found = BrepQuery::of_brep(tube)
+                    .first_face_hit(&k, tube, ray)
+                    .unwrap();
+                let Some(first_hit) = found else {
+                    misses.push(format!("first_face_hit {at:?}: none, k in [{lo}, {hi}]"));
+                    continue;
+                };
+                let surface = face::p2::surface(tube, side).unwrap().unwrap();
+                let w = first_hit.point - ray.origin;
+                let off_ray = (w - ray.direction * w.dot(ray.direction)).length();
+                if first_hit.face != side
+                    || !in_band(first_hit.distance)
+                    || surface.evaluate_point(&k, first_hit.uv).unwrap() != first_hit.point
+                    || off_ray > within
+                {
+                    misses.push(format!(
+                        "first_face_hit {at:?}: {first_hit:?}, k in [{lo}, {hi}]"
+                    ));
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} misses:\n{}",
+            misses.len(),
+            misses.join("\n")
+        );
+    }
+
+    /// A ray's direction is made unit whatever its finite length: (1e200, 0, 0), whose squared
+    /// length overflows, is the unit +x; one shorter than `EFF_ZERO`, such as (1e-200, 0, 0) or
+    /// (1e-13, 0, 0), is refused, while (2e-12, 0, 0) is a ray along +x.
+    #[test]
+    fn a_ray_direction_is_unit_at_any_finite_length_and_refused_below_zero() {
+        let unit = |d: Vec3| Ray::new(Point3::ZERO, d).map(|r| r.direction());
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(unit(Vec3::new(1e200, 0.0, 0.0)), Ok(x));
+        assert_eq!(unit(Vec3::new(-1e300, 0.0, 0.0)), Ok(-x));
+        let huge = unit(Vec3::new(1e308, 1e308, 0.0)).unwrap();
+        let half = core::f64::consts::FRAC_1_SQRT_2;
+        assert!(
+            (huge - Vec3::new(half, half, 0.0)).length() < 1e-15,
+            "{huge:?}"
+        );
+        assert!((unit(Vec3::new(2e-12, 0.0, 0.0)).unwrap() - x).length() < 1e-15);
+        let refused = |d: Vec3| matches!(unit(d), Err(SolidError::InvalidInput { .. }));
+        assert!(refused(Vec3::new(1e-200, 0.0, 0.0)));
+        assert!(refused(Vec3::new(1e-13, 0.0, 0.0)));
     }
 
     /// A query keeps the face caches its ray solves build (upstream keeps them on the

@@ -43,8 +43,7 @@ use solidcore::blend::fillet_geom::p1::{
     FilletGeomId, FilletGeomType, FilletVertex, FilletVertexType, FilletVertexuse,
 };
 use solidcore::blend::fillet_solver::p1::{
-    FilletExecutiveRef, FilletSolver, FilletSolverOps, FilletSurfaceGenerator,
-    OffsetSurfaceSlot,
+    FilletExecutiveRef, FilletSolver, FilletSolverOps, FilletSurfaceGenerator, OffsetSurfaceSlot,
 };
 use solidcore::blend::fillet_solver::p2::SolverErrorObject;
 use solidcore::curve::curve::Curve;
@@ -77,6 +76,7 @@ use super::topology_edgeuse_p1::{
     gen_surface, sel, surface_of, BrepIn, BssIn, CrvIn, SrfIn, FILES,
 };
 use crate::{HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Largest `extra` (unknowns beyond the two UV points) of the shim's solver.
 const MAX_EXTRA: usize = 5;
@@ -1003,7 +1003,11 @@ fn rust_run(i: &Inputs, o: &mut Vec<f64>) -> Result<Result<(), SolidError>, Harn
             )?;
             let empty = Brep::new();
             let index = usize::try_from(*index).map_err(|_| harness("index"))?;
-            match fs.base.fillet_corner(&empty, index, &solidcore::blend::fillet_geom::p3::NoCorners) {
+            match fs.base.fillet_corner(
+                &empty,
+                index,
+                &solidcore::blend::fillet_geom::p3::NoCorners,
+            ) {
                 Ok(c) => {
                     o.push(b(c.is_none()));
                     o.push(fs.jacobian_size().unwrap_or(0) as f64);
@@ -1561,7 +1565,7 @@ fn gen_torus(rng: &mut Rng) -> Inputs {
     };
     let mut ts = vec![
         tsect([rho, 0.0], [0.0, r], 0.0),
-        tsect([rho * phi.cos(), rho * phi.sin()], [0.0, r], 1.0),
+        tsect([rho * det::cos(phi), rho * det::sin(phi)], [0.0, r], 1.0),
     ];
     if on_axis {
         if let Some(t) = ts.first_mut() {

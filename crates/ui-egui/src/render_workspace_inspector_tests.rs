@@ -939,7 +939,13 @@ fn native_cpu_legacy_dimensions_remain_checkable_renderable_and_saveable_with_bo
     for (width, height, progressive, identity_output) in [(16384, 1, false, false), (1, 16384, true, true), (8192, 8192, true, false)] {
         let mut h = fixture();
         h.app.render_workspace.view.live_paused = true;
-        h.app.session.set_render_job_host(Some(CpuHost::for_platform().unwrap())).unwrap();
+        let host = CpuHost::for_platform().unwrap();
+        h.app.session.set_render_job_host(Some(host.clone())).unwrap();
+        h.app.render_workspace.image_host = Some(host);
+        if super::super::image_host(&h.app, ImageMethod::CpuRaytrace).is_err() {
+            eprintln!("legacy native dimension test requires raytrace-cpu");
+            return;
+        }
         let mut options = json!({"budget":"workstation","threads":1});
         if progressive {
             options["progressive"] = json!({"samples_per_pixel":32,"seed":81});
@@ -2219,13 +2225,13 @@ fn appearance_inspector_real_controls_switch_targets_inspect_chain_and_edit_fini
     assert_ne!(h.app.session.doc.appearances.bodies["Subject"].pbr.unwrap().roughness(), 0.32);
     let edited_undo = h.app.session.undo.len();
     h.step(&json!({"click":{"handle":format!("dialog::{}",h.app.tr("render.pick_body"))}})).unwrap();
-    assert!(h.app.ui.pick_bodies);
+    assert!(h.app.picks_bodies());
     assert_eq!(h.app.session.undo.len(), edited_undo);
     h.step(&json!({"click":{"handle":format!("dialog::{}",h.app.tr("render.pick_component"))}})).unwrap();
-    assert!(h.app.ui.pick_components);
+    assert!(h.app.picks_components());
     assert!(h.widget(h.app.tr("render.inspector_pick_target")).is_some(), "root bodies have no component override target");
     h.step(&json!({"click":{"handle":format!("dialog::{}",h.app.tr("render.pick_face"))}})).unwrap();
-    assert!(!h.app.ui.pick_components && !h.app.ui.pick_bodies);
+    assert!(!h.app.picks_components() && !h.app.picks_bodies());
     h.step(&json!({"click":{"handle":format!("dialog::{}",h.app.tr("render.pick_body"))}})).unwrap();
     assert_eq!(h.app.session.undo.len(), edited_undo);
     appearance_inspector_capture(&mut h, "body");
@@ -2772,7 +2778,7 @@ fn appearance_editor_e2_sections_are_ordered_collapsed_and_expand_for_each_metho
             super::super::selection_editor(&mut h.app, &selection);
         }
         if matches!(h.app.session.selection.first(), Some(Sel::Body { .. })) {
-            h.app.ui.pick_components = true;
+            h.app.ui.render_pick = "component".into();
         }
         h.frames(3);
         assert!(h.widget(h.app.tr("render.appearance_editor.body_reason")).is_some());
@@ -4060,7 +4066,7 @@ mod saved_clear_coat_contract {
             scalar(&mut h, "render:coat:weight", "0.63", true);
             scalar(&mut h, "render:coat:roughness", "0.61", true);
             scalar(&mut h, "render:coat:ior-field", "1.7", false);
-            let expected = CoatMaterial { weight: 0.63, roughness: 0.61, ior: 1.7 };
+            let expected = CoatMaterial { weight: 0.63, roughness: 0.61, ior: 1.7, flakes: None };
             let request = super::super::super::image_request(&h.app).unwrap();
             assert!(setups::has_runtime_inputs(&h.app), "portable coat drafts remain unsaved for review/navigation");
             assert!(!setups::requires_runtime_request(&h.app), "stable coat preview does not require ordinal override capture");
@@ -4097,6 +4103,30 @@ mod saved_clear_coat_contract {
             h.frames(5);
             assert!(Arc::ptr_eq(&reopened, &h.app.session.doc), "hydrating saved coat numbers never writes on paint");
             assert!(h.app.render_workspace.view.materials.bindings.is_empty());
+            assert_eq!(super::super::super::image_request(&h.app).unwrap()["settings"]["coats"][0]["coat"], json!(expected));
+        }
+    }
+    #[test]
+    fn actual_flake_controls_save_their_numbers_with_the_coat_and_reopen_hydrated() {
+        for gpu in [false, true] {
+            let mut h = body_editor(gpu, false);
+            reveal_coat(&mut h);
+            click(&mut h, "render:coat:enable");
+            assert!(crate::scenario::rect_of("render:flakes:enable").is_some());
+            click(&mut h, "render:flakes:enable");
+            scalar(&mut h, "render:flakes:coverage", "0.55", true);
+            scalar(&mut h, "render:flakes:spread", "0.7", true);
+            scalar(&mut h, "render:flakes:size", "0.2", false);
+            let flakes = solidcraft_engine::doc::render_coat::FlakeMaterial { coverage: 0.55, spread: 0.7, size_mm: 0.2, ..Default::default() };
+            let expected = CoatMaterial { flakes: Some(flakes), ..Default::default() };
+            assert_eq!(super::super::super::image_request(&h.app).unwrap()["settings"]["coats"][0]["coat"], json!(expected));
+            click(&mut h, "render:coat:save");
+            assert_eq!(authored(&h), expected);
+            let saved = h.app.session.doc.clone();
+            let loaded = solidcraft_engine::io::read_design(&solidcraft_engine::io::write_design_container(&saved).unwrap()).unwrap();
+            h.app.session = solidcraft_engine::Session::new(loaded);
+            setups::load(&mut h.app);
+            h.frames(5);
             assert_eq!(super::super::super::image_request(&h.app).unwrap()["settings"]["coats"][0]["coat"], json!(expected));
         }
     }

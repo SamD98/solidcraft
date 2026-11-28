@@ -38,6 +38,7 @@ use solidcore::topology::{
 use solidcore::{EntityRef, SolidError};
 
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// The unit runner.
 pub struct Runner;
@@ -469,7 +470,7 @@ fn turn(rng: &mut Rng, d: [f64; 3], deg: f64) -> [f64; 3] {
     let ([d0, d1, d2], [r0, r1, r2]) = (d, r);
     let dot = d0 * r0 + d1 * r1 + d2 * r2;
     let [p0, p1, p2] = unit3([r0 - dot * d0, r1 - dot * d1, r2 - dot * d2]);
-    let (c, sn) = (deg.to_radians().cos(), deg.to_radians().sin());
+    let (c, sn) = (det::cos(deg.to_radians()), det::sin(deg.to_radians()));
     unit3([c * d0 + sn * p0, c * d1 + sn * p1, c * d2 + sn * p2])
 }
 
@@ -969,7 +970,7 @@ fn build_chain(
 /// order.
 fn own_brep(i: &Inputs) -> Result<crate::own_builder::RustBrep<OwnBrep>, HarnessError> {
     use crate::own_builder::{build_as, counts, failed_output, finish, in_new_brep, Built};
-    let mut k = Kernel::default();
+    let mut k = crate::runner_kernel();
     let built = match &i.brep {
         BrepIn::Chain { closed, segs } => {
             let curves = segs
@@ -1017,6 +1018,30 @@ fn own_brep(i: &Inputs) -> Result<crate::own_builder::RustBrep<OwnBrep>, Harness
 
 /// A Rust B-rep, the inexactly held face surface subclass and its entity counts.
 type OwnBrep = (Brep, Option<i64>, [usize; 10]);
+
+/// What a `Gaps` case computes, for the convex hull certificate of the vertex row
+/// `surf_sphere150_rebuild_v3_gaps` (`largest_gap`): the B-rep the case builds, the vertex,
+/// the largest gap it holds and every gap it lists, made as [`run_rust`] makes them (on [`crate::runner_kernel`]s).
+///
+/// # Panics
+///
+/// When the case is not a `Gaps` case or its build or query fails.
+#[cfg(test)]
+pub(crate) fn wr57_gaps(case: &Case) -> (Brep, VertexId, Option<vx::HeldGap>, Vec<vx::HeldGap>) {
+    let i: Inputs = case.parse().expect("the inputs");
+    let Ok((mut b, _, c)) = own_brep(&i).expect("the B-rep") else {
+        panic!("{}: the build failed", case.name);
+    };
+    let Ok(OpIn::Gaps { v, has_tol, tol, .. }) = resolve(&i.op, c, &b) else {
+        panic!("{}: not a gaps case", case.name);
+    };
+    let k = crate::runner_kernel();
+    let v = VertexId::from_index(v as u32);
+    let t = has_tol.then_some(solidcore::geom::tol::tol3d(tol));
+    let mut list = Vec::new();
+    let max = vx::max_up_dim_gap_3d(&k, &mut b, v, Some(&mut list), t).expect("the gaps");
+    (b, v, max, list)
+}
 
 /// A chain segment's B-spline curve, as the shim's `read_curve` makes it.
 fn chain_curve(c: &CrvIn) -> Result<SmCurve, HarnessError> {
@@ -1104,7 +1129,7 @@ fn opt_id<I>(x: i64, f: impl Fn(u32) -> I) -> Option<I> {
 }
 
 fn run_rust_op(b: &mut Brep, op: &OpIn) -> Result<Output, Fail> {
-    let k = Kernel::default();
+    let k = crate::runner_kernel();
     let vid = |x: i64| VertexId::from_index(x as u32);
     let body: Vec<f64> = match op {
         OpIn::Query { v } => {
@@ -1474,3 +1499,7 @@ impl UnitDiff for Runner {
         serde_json::to_value(i).ok()
     }
 }
+
+#[cfg(test)]
+#[path = "topology_vertex/largest_gap.rs"]
+mod largest_gap;

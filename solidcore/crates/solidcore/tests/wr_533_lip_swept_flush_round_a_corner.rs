@@ -9,19 +9,16 @@
 //! on the block's rim arc within tolerance and crosses it twice, 0.05 apart, at the arc's
 //! middle. The union splits the rim arc there. Upstream's `UpdateEdges` moves the coincident
 //! edge definition along the whole arc to the piece under its midpoint, the 0.05 piece, whose
-//! vertices are not its ends, and the imprint finds no vertex for them. With
-//! `Kernel::fixes.boolean_splits_definition_across_split` the definition is split with its
-//! edge, and the union is the block and the lip side by side.
+//! vertices are not its ends, and the imprint finds no vertex for them. The port splits the
+//! definition with its edge, and the union is the block and the lip side by side.
 //!
 //! Since a sweep along lines and arcs is built to its definition (#2572), the lip lies exactly flush
 //! on the rim: the rim arc is not crossed twice, the 0.05 piece does not arise, and the union
-//! is built with the flag off too. The flag's case (the definition across a split lying on a
-//! piece that is not under the arc's midpoint) has no input here any more: it needed the
-//! fitted net's crossing, and a sweep this kernel builds from its definition has none.
-//!
-//! Before that, on a default kernel the port refused the union in `make_faceuse` (1001) where the C++
-//! returned 1006. With `proto_vertex_miss_is_false` (WR-73) also on, the union succeeds with
-//! or without this flag, with the same body, so the test keeps every other flag off.
+//! is built with upstream's re-pointing too. The split's case (the definition across a split
+//! lying on a piece that is not under the arc's midpoint) has no input here any more: it
+//! needed the fitted net's crossing, and a sweep this kernel builds from its definition has
+//! none; the unit test `update_edges_splits_a_definition_across_the_split_point` in
+//! `topology/proto_topology/p2.rs` pins it.
 
 #![allow(
     clippy::unwrap_used,
@@ -38,6 +35,7 @@ use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::geom::axis2_placement::Axis2Placement;
 use solidcore::geom::extent1d::Extent1d;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3, PI};
 use solidcore::nurbs::b_spline_curve::BSplineCurve;
 use solidcore::primitive::primitive_creation::SweepOptions;
@@ -60,8 +58,8 @@ fn line(a: (f64, f64), b: (f64, f64), z: f64) -> Line {
 /// starting at `a0`, as the capi builds it.
 fn arc(k: &Kernel, c: (f64, f64), z: f64, nz: f64, r: f64, a0: f64, a1: f64) -> Ellipse {
     // the capi's x0 = ref cos a0 + (axis x ref) sin a0 and y0 = axis x x0, with ref +x
-    let x0 = Vec3::new(a0.cos(), nz * a0.sin(), 0.0);
-    let y0 = Vec3::new(-a0.sin(), nz * a0.cos(), 0.0);
+    let x0 = Vec3::new(det::cos(a0), nz * det::sin(a0), 0.0);
+    let y0 = Vec3::new(-det::sin(a0), nz * det::cos(a0), 0.0);
     let frame = Axis2Placement::new(Point3::new(c.0, c.1, z), x0, y0);
     let degrees = Extent1d::from_min_max(0.0, (a1 - a0).to_degrees());
     Ellipse::create_canonical_circle(k, &frame, r, Some(&degrees), None).unwrap()
@@ -144,35 +142,30 @@ fn closed_form() -> f64 {
 }
 
 #[test]
-fn wr_533_lip_swept_flush_round_a_corner_joins_with_either_setting() {
+fn wr_533_lip_swept_flush_round_a_corner_joins() {
     let want = closed_form();
-    for fix in [false, true] {
-        let mut k = Kernel::default();
-        k.fixes.boolean_splits_definition_across_split = fix;
-        let a = block(&mut k);
-        let b = lip(&mut k);
-        let joined = boolean_union(&mut k, a, b);
-        let mut r = joined.unwrap();
-        let got = volume(&k, &mut r);
-        let check = check_brep(&mut k, &mut r, CheckLevel::Level2).unwrap();
-        eprintln!("volume {got}, the block and the lip {want}");
-        assert!(check.is_valid(), "{:?}", check.lines());
-        assert!(
-            (got - want).abs() <= 1e-6 * want,
-            "volume {got}, the block and the lip {want}"
-        );
-    }
+    let mut k = Kernel::default();
+    let a = block(&mut k);
+    let b = lip(&mut k);
+    let joined = boolean_union(&mut k, a, b);
+    let mut r = joined.unwrap();
+    let got = volume(&k, &mut r);
+    let check = check_brep(&mut k, &mut r, CheckLevel::Level2).unwrap();
+    eprintln!("volume {got}, the block and the lip {want}");
+    assert!(check.is_valid(), "{:?}", check.lines());
+    assert!(
+        (got - want).abs() <= 1e-6 * want,
+        "volume {got}, the block and the lip {want}"
+    );
 }
 
-/// The fix's observable at the topology level (#1954): with the definition split with its
-/// edge, the union is a body of the block's and the lip's faces, edges and vertices. Off,
-/// the union produces no body to count (the test above pins its refusal). Pins the exact
-/// counts, so a result that agrees in volume but leaves the rim arc and the lip's edge
-/// joined differently still fails.
+/// The union at the topology level (#1954): a body of the block's and the lip's faces,
+/// edges and vertices. The split no longer arises here (see the module docs), so this pins
+/// the topology, not the fix. The exact counts mean a result that agrees in volume but
+/// joins the rim arc and the lip's edge differently still fails.
 #[test]
 fn wr_533_lip_swept_flush_round_a_corner_has_the_block_and_lip_topology() {
     let mut k = Kernel::default();
-    k.fixes.boolean_splits_definition_across_split = true;
     let a = block(&mut k);
     let b = lip(&mut k);
     let mut r = boolean_union(&mut k, a, b).unwrap();

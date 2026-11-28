@@ -1,5 +1,4 @@
-//! WR-707 addendum: with `fixes.fillet_refuse_rounds_breaking_through`, a blend whose
-//! section runs off its face (past a cliff, into a hole or an opening) is not refused for
+//! WR-707 addendum: a blend whose section runs off its face (past a cliff, into a hole or an opening) is not refused for
 //! breaking through. Only a section that leaves the part through a face and comes back
 //! into it (a hollow behind a wall it opens, #2299) breaks through.
 //!
@@ -22,6 +21,7 @@ use solidcore::boolean::api_brep::{boolean_difference, boolean_union};
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::kernel::UpstreamFixes;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::Point3;
 use solidcore::primitive::api_primitives::{create_box, create_cylinder};
 use solidcore::query::api_queries::edge_closest_point;
@@ -32,12 +32,11 @@ use solidcore::topology::EdgeId;
 use solidcore::{Brep, Kernel, SolidError};
 use std::f64::consts::PI;
 
-fn kernel(fix: bool) -> Kernel {
-    let mut k = Kernel::default();
-    let mut fixes = UpstreamFixes::all();
-    fixes.fillet_refuse_rounds_breaking_through = fix;
-    k.fixes = fixes;
-    k
+fn kernel() -> Kernel {
+    Kernel {
+        fixes: UpstreamFixes::all(),
+        ..Kernel::default()
+    }
 }
 
 fn pick(k: &Kernel, b: &Brep, q: [f64; 3]) -> EdgeId {
@@ -86,9 +85,9 @@ fn volume(k: &Kernel, b: &mut Brep) -> f64 {
     brep_volume(k, b, 1e-8, &attrs).unwrap()
 }
 
-/// Builds with the flag, one lump, `check_brep` clean, to `want` within `rel`; the result.
+/// Builds, one lump, `check_brep` clean, to `want` within `rel`; the result.
 fn builds(case: fn(&mut Kernel) -> (Brep, solidcore::Result<()>), want: f64, rel: f64) -> Brep {
-    let mut k = kernel(true);
+    let mut k = kernel();
     let (mut b, built) = case(&mut k);
     built.unwrap();
     let infinite = b.infinite_region();
@@ -214,8 +213,7 @@ fn a_round_running_over_a_hole_builds() {
         (want - 7580.287315360674).abs() <= 1e-10 * want,
         "closed form {want}"
     );
-    // the round's B-spline intersection with the hole's wall leaves 3.4e-9 rel (the same
-    // without the flag)
+    // the round's B-spline intersection with the hole's wall leaves 3.4e-9 rel
     builds(over_hole, want, 1e-8);
 }
 
@@ -225,7 +223,7 @@ fn a_round_running_over_a_hole_builds() {
 /// `pi int_2^12 ((17 - sqrt(144 - w^2))^2 - 25) dw` from 16000 - 250 pi.
 #[test]
 fn a_round_of_a_hole_rim_past_the_plate_bottom_builds() {
-    let s = 36.0 * PI - (140.0_f64.sqrt() + 72.0 * (1.0_f64 / 6.0).asin());
+    let s = 36.0 * PI - (140.0_f64.sqrt() + 72.0 * det::asin(1.0_f64 / 6.0));
     let removed = PI * (2640.0 - 34.0 * s + 1440.0 - (1728.0 - 8.0) / 3.0);
     let want = 16000.0 - 250.0 * PI - removed;
     assert!(
@@ -234,9 +232,7 @@ fn a_round_of_a_hole_rim_past_the_plate_bottom_builds() {
     );
     builds(
         |k| {
-            // the round on the continued wall; with `fillet_round_ends_on_outline` it ends on
-            // the body's outline (`wr730_round_ends_on_outline.rs`)
-            k.fixes.fillet_round_ends_on_outline = false;
+            // the round on the continued wall, trimmed at its crease
             let plate = cuboid(k, [0.0, 0.0, 0.0], [40.0, 40.0, 10.0]);
             let hole = post(k, [20.0, 20.0, -1.0], 5.0, 12.0);
             let mut b = boolean_difference(k, plate, hole).unwrap();
@@ -254,7 +250,7 @@ fn a_round_of_a_hole_rim_past_the_plate_bottom_builds() {
 /// 338 pi.
 #[test]
 fn a_round_of_a_disc_rim_past_its_wall_builds() {
-    let s = 3.125 * PI / 2.0 - (0.5 * 6.0_f64.sqrt() / 2.0 + 3.125 * 0.2_f64.asin());
+    let s = 3.125 * PI / 2.0 - (0.5 * 6.0_f64.sqrt() / 2.0 + 3.125 * det::asin(0.2_f64));
     let removed = PI * (58.75 * 2.0 - 21.0 * s - (12.5 - (15.625 - 0.125) / 3.0));
     let want = 338.0 * PI - removed;
     assert!(
@@ -263,9 +259,7 @@ fn a_round_of_a_disc_rim_past_its_wall_builds() {
     );
     builds(
         |k| {
-            // the round on the continued wall; with `fillet_round_ends_on_outline` it ends on
-            // the body's outline (`wr730_round_ends_on_outline.rs`)
-            k.fixes.fillet_round_ends_on_outline = false;
+            // the round on the continued wall, trimmed at its crease
             let mut b = post(k, [0.0, 0.0, 0.0], 13.0, 2.0);
             // a point of the rim away from the seam, which also passes through (13, 0, 2)
             let built = blend(k, &mut b, &[[0.0, 13.0, 2.0]], 2.5, 1);
@@ -281,7 +275,7 @@ fn a_round_of_a_disc_rim_past_its_wall_builds() {
 /// 2 sqrt 2 / (sqrt 2 - 1) (`wr707_round_breaking_through.rs`), with the same fit.
 #[test]
 fn a_round_breaking_into_a_hollow_is_still_refused() {
-    let mut k = kernel(true);
+    let mut k = kernel();
     let outer = cuboid(&mut k, [-52.0, -32.0, 0.0], [104.0, 64.0, 42.0]);
     let inner = cuboid(&mut k, [-50.0, -30.0, -1.0], [100.0, 60.0, 41.0]);
     let mut b = boolean_difference(&mut k, outer, inner).unwrap();
@@ -316,9 +310,9 @@ fn block_with_hole(k: &mut Kernel, z0: f64, height: f64) -> (Brep, solidcore::Re
 fn hole_overlap(top: f64, theta0: f64) -> f64 {
     integrate(
         |t: f64| {
-            let y = 18.2 + t.sin();
+            let y = 18.2 + det::sin(t);
             let low = 6.0 + (16.0 - (y - 16.0) * (y - 16.0)).sqrt();
-            2.0 * t.cos() * t.cos() * (top - low)
+            2.0 * det::cos(t) * det::cos(t) * (top - low)
         },
         theta0,
         PI / 2.0,
@@ -338,25 +332,19 @@ fn a_round_over_a_through_hole_between_its_rails_builds() {
 
 /// A blind pocket from below, its ceiling at z = 9.5 under the blended top face: the
 /// section breaks through the pocket's ceiling and wall, faces that share no edge with
-/// the blended faces. Refused; without the flag the round builds without trimming them,
-/// 0.83 short of the closed form 8000 - 9.5 pi - (16 - 4 pi) 40 plus the removed section
-/// inside the pocket (above y = 16 + sqrt(16 - 3.5^2), where it reaches below 9.5).
+/// the blended faces. Refused. (Historical, measured at the merge base with the refusal
+/// off, a path that no longer exists: built anyway, the round was not trimmed by them and
+/// came 0.83 short of the closed form 8000 - 9.5 pi - (16 - 4 pi) 40 plus the removed
+/// section inside the pocket, above y = 16 + sqrt(16 - 3.5^2), where it reaches below 9.5.)
 #[test]
 fn a_round_opening_a_blind_pocket_is_refused() {
-    let y = 16.0 + (16.0_f64 - 3.5 * 3.5).sqrt();
-    let want = 8000.0 - 9.5 * PI - (16.0 - 4.0 * PI) * 40.0 + hole_overlap(9.5, (y - 18.2).asin());
-    let mut k = kernel(true);
+    let mut k = kernel();
     let (_, built) = block_with_hole(&mut k, -1.0, 10.5);
     let err = built.expect_err("refused");
     let SolidError::FilletRefused { reason, .. } = err else {
         panic!("{err:?}");
     };
     assert_eq!(reason, Some(NoRoomReason::BreaksThrough));
-    let mut k = kernel(false);
-    let (mut b, built) = block_with_hole(&mut k, -1.0, 10.5);
-    built.unwrap();
-    let v = volume(&k, &mut b);
-    assert!((v - want).abs() > 0.5, "{v} vs {want}");
 }
 
 /// An 80 x 5 x 5 bar, its long top edge (y = 0, z = 5) rounded R10, wider than both faces
@@ -378,9 +366,7 @@ fn a_round_wider_than_both_its_faces_builds() {
     assert!((want - 630.293125).abs() < 1e-3, "closed form {want}");
     builds(
         |k| {
-            // the round on the continued wall; with `fillet_round_ends_on_outline` it ends on
-            // the body's outline (`wr730_round_ends_on_outline.rs`)
-            k.fixes.fillet_round_ends_on_outline = false;
+            // the round on the continued wall, trimmed at its crease
             let mut b = cuboid(k, [0.0, 0.0, 0.0], [80.0, 5.0, 5.0]);
             let built = blend(k, &mut b, &[[40.0, 0.0, 5.0]], 10.0, 1);
             (b, built)
@@ -392,7 +378,7 @@ fn a_round_wider_than_both_its_faces_builds() {
 
 /// `int sqrt(81 - u^2) du`, the area under the arc of radius 9.
 fn arc_area(u: f64) -> f64 {
-    0.5 * (u * (81.0 - u * u).sqrt() + 81.0 * (u / 9.0).asin())
+    0.5 * (u * (81.0 - u * u).sqrt() + 81.0 * det::asin(u / 9.0))
 }
 
 /// The 20 x 4 x 10 block with the slot x 8..12 under a bridge 1 thick, and a rib 0.05
@@ -401,16 +387,14 @@ fn arc_area(u: f64) -> f64 {
 /// `scenario_round_over_a_thin_rib_not_a_cut`, tangency-labs/smlib@02b6103). Its top
 /// front edge (y = 0, z = 10) rounded r9.
 fn thin_rib(k: &mut Kernel) -> (Brep, solidcore::Result<()>) {
-    // the round past the cliff; with `fillet_round_ends_on_outline` it ends on the body's
-    // outline, as on main (`wr730_round_ends_on_outline.rs`)
-    k.fixes.fillet_round_ends_on_outline = false;
+    // the round past the cliff, on the continued wall
     let block = cuboid(k, [0.0, 0.0, 0.0], [20.0, 4.0, 10.0]);
     let slot = cuboid(k, [8.0, -1.0, -1.0], [4.0, 6.0, 10.0]);
     let bridged = boolean_difference(k, block, slot).unwrap();
-    let arc = |t: f64| (9.0 - 9.0 * t.cos(), 1.0 + 9.0 * t.sin());
+    let arc = |t: f64| (9.0 - 9.0 * det::cos(t), 1.0 + 9.0 * det::sin(t));
     let (y1, z1) = arc(22.5_f64.to_radians());
     let (y2, z2) = arc(33.75_f64.to_radians());
-    let len = (y2 - y1).hypot(z2 - z1);
+    let len = det::hypot(y2 - y1, z2 - z1);
     let (dy, dz) = ((y2 - y1) / len, (z2 - z1) / len);
     let h = 0.05;
     let mut rib = cuboid(k, [0.0, 0.0, 0.0], [4.0, len + 2.0, h]);
@@ -437,7 +421,7 @@ fn thin_rib(k: &mut Kernel) -> (Brep, solidcore::Result<()>) {
 #[test]
 fn a_round_past_a_thin_rib_across_its_slot_builds() {
     let area = 40.0 - (4.0 + arc_area(9.0) - arc_area(5.0));
-    let d = 9.0 * 5.625_f64.to_radians().cos();
+    let d = 9.0 * det::cos(5.625_f64.to_radians());
     let lens = 2.0 * (arc_area(d + 0.025) - arc_area(d - 0.025));
     let want = 656.0 - 16.0 * area - 16.0 + 4.0 * lens;
     assert!((want - 401.198953621465).abs() < 1e-9, "closed form {want}");
@@ -455,23 +439,18 @@ fn a_round_past_a_thin_rib_across_its_slot_builds() {
 }
 
 /// The hollows of #2328 that the rule above keeps refused: each void piece lies behind a
-/// wall running from a rail, which the round would cut through. Without the flag the first
+/// wall running from a rail, which the round would cut through. Built anyway, the first
 /// two fail in `trim_at_creases` and the third builds 0.6 % short with its cavity closed.
-/// Refused with `fillet_round_ends_on_outline` too.
 #[test]
 fn hollows_behind_a_wall_stay_refused() {
     // a closed cavity and a pocket open from below behind the cliff (r9), and a closed
-    // cavity under the top face (r3), each with and without the outline round
-    for ((o, s, r), outline) in [
+    // cavity under the top face (r3)
+    for (o, s, r) in [
         ([5.0, 1.0, 5.0], [10.0, 1.0, 3.0], 9.0),
         ([5.0, 1.0, -1.0], [10.0, 1.0, 9.0], 9.0),
         ([5.0, 0.3, 7.5], [10.0, 0.7, 2.0], 3.0),
-    ]
-    .into_iter()
-    .flat_map(|case| [(case, true), (case, false)])
-    {
-        let mut k = kernel(true);
-        k.fixes.fillet_round_ends_on_outline = outline;
+    ] {
+        let mut k = kernel();
         let block = cuboid(&mut k, [0.0, 0.0, 0.0], [20.0, 4.0, 10.0]);
         let hollow = cuboid(&mut k, o, s);
         let mut b = boolean_difference(&mut k, block, hollow).unwrap();
@@ -479,6 +458,6 @@ fn hollows_behind_a_wall_stay_refused() {
         let SolidError::FilletRefused { reason, .. } = err else {
             panic!("{err:?}");
         };
-        assert_eq!(reason, Some(NoRoomReason::BreaksThrough), "{o:?} {outline}");
+        assert_eq!(reason, Some(NoRoomReason::BreaksThrough), "{o:?}");
     }
 }

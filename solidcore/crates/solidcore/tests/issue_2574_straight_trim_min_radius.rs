@@ -4,7 +4,7 @@
 //! where its objective cannot be evaluated.
 //!
 //! The curve is the mapped UV trim of a face of `issue_1945_fork_1207_step4`'s result
-//! built without `oscillating_skips_failed_guesses` (its `run(false)`), read out of the
+//! built with the former N-D fix disabled (its historical `run(false)`), read out of the
 //! check: a 2D cubic with 13 control points of weight 1, all at y = 2 sqrt 2, x rising
 //! unevenly from 5.6e-15 to 4.70465, over four spans joined `C0` (interior knots of
 //! multiplicity 3 = p).
@@ -41,6 +41,7 @@ use solidcore::curve::curve::Curve;
 use solidcore::geom::assert_array::{AssertArray, ObjectKey};
 use solidcore::geom::solution_array::{ObjectKind, SolutionObject};
 use solidcore::kernel::{Kernel, KernelOptions};
+use solidcore::math::det;
 use solidcore::nurbs::b_spline_curve::BSplineCurve;
 use solidcore::nurbs::math::{CPoint, NOZ};
 
@@ -177,7 +178,7 @@ impl SolutionObject for TrimCurve {
 
 /// A kernel whose only opt-in fix is the one the radius test needs: it reads the search's
 /// minimum radius (WR-382). The search itself takes no value from a failed evaluation by
-/// default since #2574, so `oscillating_skips_failed_guesses` stays off here.
+/// default since #2574; the N-D correction is also unconditional since #2782.
 fn check_kernel() -> Kernel {
     Kernel::new(&KernelOptions::default())
 }
@@ -369,7 +370,7 @@ fn the_check_still_reports_a_tight_bend_next_to_a_domain_end() {
 
         // closed form at the bend's end: a radius of 1.5 h at a speed of 3 h
         let d = curve.evaluate(bend_t, 2, false, false).unwrap();
-        let radius = d[1].length().powi(3) / d[1].cross(d[2]).length();
+        let radius = det::powi(d[1].length(), 3) / d[1].cross(d[2]).length();
         assert!(
             (radius - 1.5 * BEND_H).abs() <= 1e-12 * radius,
             "radius {radius:e} at the bend, not 1.5 h"

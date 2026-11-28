@@ -50,26 +50,35 @@
 //!   test (its sweep amount is unused); `SM_DEBUG_CODE` blocks, `SM_ASSERT`s and
 //!   `smos_WriteBuffer` messages are dropped.
 //! - **Analytic revolutions** (not upstream: WR-448, tangency-labs/solidcore#545;
-//!   SolidCraft change, tangency-labs/smlib 0b143f7). With
-//!   [`RotationalSweepGeometry::set_analytic_revolutions`] (off by default, so the
-//!   default follows `c9c5979`; `PrimitiveCreation`'s partial rotational sweep sets it
-//!   from `Kernel::fixes.revolve_analytic_profile_faces`), `EdgeSweepHigher` gives a line or circular arc its
+//!   SolidCraft change, tangency-labs/smlib 0b143f7; the only path since
+//!   tangency-labs/solidcraft#14425). With `make_analytics` set (the default),
+//!   `EdgeSweepHigher` gives a line or circular arc its
 //!   cylinder, cone, sphere or torus in the B-spline surface's layout (a line
 //!   falling along the axis: the reversed line's, its cylinder or cone built from the
 //!   low end and never inside out, as 9853e54's `AnalyticSurface`, #1463) instead of
 //!   `CopyAndAddAnalytics` of the B-spline. The trims are the analytic surface's own
 //!   boundary; the normal is the analytic surface's, taken before the copy as the
 //!   fork does (`AnalyticSurface` replaces `sm_CreateRotSrf`).
+//! - **Omitted corner on a closed path.** A closed path of lines and arcs
+//!   sets [`RotationalSweepGeometry::set_omitted_corner_scale`] to the path arc's
+//!   radius. On-axis tests use the larger of [`omitted_corner_band`] and the sweep
+//!   tolerance, so a corner under 0.5 mm keeps the base test. Side curves
+//!   inside that band are the corner the sweep already omits, and
+//!   [`cover_axis_chords`] covers that chord. A plain revolve leaves the scale
+//!   unset: on-axis tests use `eps` and side curves use `start_curve_tol`.
+//!   The walls are not moved. Not upstream.
 //! - **Recursion.** None.
 
 use crate::curve::curve::p8::CurveIntersectOptions;
 use crate::curve::curve::{Curve, CurveKind};
 use crate::curve::line::Line;
-use crate::error::{Result, SolidError};
+use crate::error::sweep::SweepFailure;
+use crate::error::{Result, SolidError, SM_ERR, SM_ERR_NULL_POINTER};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::geom_utility::p1::{line_closest_point, line_point_distance};
 use crate::geom::solution_array::{ObjectKind, SolutionObject, SolutionType};
+use crate::geom::tol::{size_estimate_to_zone_tol_3d, zone_tol3d, TOL_GAP_GAIN};
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
 use crate::math::{EFF_ZERO, EFF_ZERO_DEG, EFF_ZERO_SQRT, PI};
@@ -79,6 +88,7 @@ use crate::nurbs::b_spline_surface::{BSplineSurface, SurfParamType};
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::nurbs::knots::Side;
 use crate::surface::surface::Surface;
+use crate::topology::brep::p1 as brep_p1;
 use crate::topology::{edge, face, vertex, Brep, EdgeId, FaceId, VertexId};
 
 use super::analytic_revolution::analytic_revolution;
@@ -150,16 +160,32 @@ impl SolutionObject for CurveHandle {
     }
 }
 
+/// [`SweepFailure::EdgeWithoutCurve`] for the caller's edge `e`, with the `SM_ERR` of
+/// upstream's `return SE(SM_ERR)` there.
+fn edge_without_curve(op: &'static str, e: EdgeId) -> SolidError {
+    SolidError::sweep_with_status(op, SweepFailure::EdgeWithoutCurve { edge: e }, SM_ERR)
+}
+
+/// [`SweepFailure::EdgeEndsOffCurve`]: the swept boundary's ends are `distance` from the
+/// edge's vertices, more than `eps`.
+fn ends_off_curve(distance: f64, eps: f64) -> SolidError {
+    SolidError::sweep(
+        OP_EDGE_HIGHER,
+        SweepFailure::EdgeEndsOffCurve {
+            distance,
+            tolerance: eps,
+        },
+    )
+}
+
 /// `sm_CheckEdgeCurveLine`: whether the edge curve is a line over `interval` (five
-/// samples, tolerance `eps`).
-fn check_edge_curve_line(curve: Option<&Curve>, interval: &Extent1d, eps: f64) -> Result<bool> {
-    let Some(curve) = curve else {
-        return Err(SolidError::sweep_failed(OP_LINE, "the edge has no curve"));
-    };
+/// samples, tolerance `eps`). Its callers check first that the edge has a curve
+/// (upstream's first test here).
+fn check_edge_curve_line(curve: &Curve, interval: &Extent1d, eps: f64) -> Result<bool> {
     let Some(bsp) = bspline_curve_of(curve) else {
-        return Err(SolidError::sweep_failed(
+        return Err(SolidError::sweep(
             OP_LINE,
-            "the edge's curve has no B-spline form",
+            SweepFailure::CurveWithoutBSplineForm { entity: None },
         ));
     };
     // SmLine::IsSegmentLine (virtual dispatch): the SmLine branch returns TRUE after
@@ -187,15 +213,100 @@ struct VerticesOnAxis {
 
 /// The start vertex of `e` and its other vertex (upstream dereferences both).
 fn start_and_other(b: &Brep, e: EdgeId, op: &'static str) -> Result<(VertexId, VertexId)> {
-    let start = edge::start_vertex(b, e)?
-        .ok_or_else(|| SolidError::sweep_missing(op, "the edge's start vertex"))?;
-    let end = edge::other_vertex(b, e, Some(start))?
-        .ok_or_else(|| SolidError::sweep_missing(op, "the edge's end vertex"))?;
+    let start = edge::start_vertex(b, e)?.ok_or_else(|| {
+        SolidError::sweep_null_defect(op, "the edge's start vertex was read through its edge uses, and every edge of a B-rep the kernel keeps has one")
+    })?;
+    let end = edge::other_vertex(b, e, Some(start))?.ok_or_else(|| {
+        SolidError::sweep_null_defect(op, "the edge's other vertex was read through its edge uses after its start vertex, and every edge of a B-rep the kernel keeps has one (its start vertex again when closed)")
+    })?;
     Ok((start, end))
 }
 
-/// `sm_CheckEdgeVerticesOnAxis`: whether the edge's end vertices are within `eps` of
-/// the axis and, for a line, whether it is parallel or perpendicular to the axis.
+/// Radius that still counts as a corner axis, from the path arc's radius.
+///
+/// The zone is [`size_estimate_to_zone_tol_3d`] of that radius, never the body's
+/// tolerance. A quarter turn of radius `r` leaves a gap of `r * sqrt(2)`, which
+/// that zone accepts only while `r` is under about `zone / sqrt(2)`, so the band
+/// is `zone * sqrt(2)`. A plain revolve does not use this.
+#[must_use]
+pub(crate) fn omitted_corner_band(feature_scale: f64) -> f64 {
+    size_estimate_to_zone_tol_3d(feature_scale) * (2.0_f64).sqrt()
+}
+
+/// The vertex tolerance that covers the chord of a turn of `angle` radians at
+/// radius `dist`.
+///
+/// The chord is `dist * 2 * |sin(angle / 2)|`. A quarter turn is `dist * sqrt(2)`.
+/// The check accepts a gap only up to half the vertex tolerance, so the cover is
+/// twice that chord times [`TOL_GAP_GAIN`].
+#[must_use]
+pub(crate) fn chord_cover_tolerance(k: &Kernel, dist: f64, angle: f64) -> f64 {
+    let chord = dist * 2.0 * (angle * 0.5).sin().abs();
+    zone_tol3d(k, 2.0 * chord * TOL_GAP_GAIN)
+}
+
+/// Grow each vertex of `b` within `band` of the axis through `centre` along
+/// `axis` to [`chord_cover_tolerance`] for a turn of `angle` radians. A vertex
+/// already at least that large is left as it is. Walls are not moved. `band` is
+/// [`omitted_corner_band`] of the path arc; a plain revolve does not call this.
+///
+/// # Errors
+///
+/// Those of the vertex queries.
+pub(crate) fn cover_axis_chords(
+    k: &Kernel,
+    b: &mut Brep,
+    centre: Point3,
+    axis: Vec3,
+    angle: f64,
+    band: f64,
+) -> Result<()> {
+    for v in brep_p1::vertices(b, None)? {
+        let point = vertex::point(b, v)?;
+        let (dist, _) = line_point_distance(centre, axis, point);
+        if dist.partial_cmp(&band) != Some(std::cmp::Ordering::Less) {
+            continue;
+        }
+        let cover = chord_cover_tolerance(k, dist, angle);
+        vertex::set_tolerance(b, v, cover, true, false)?;
+    }
+    Ok(())
+}
+
+/// Tolerance for dropping a side curve that is the omitted corner.
+///
+/// With no band, the edge tolerance: a plain revolve. With one, a quarter-turn's
+/// control polygon is point-sized once its box is under the band, and only while
+/// both ends lie inside it. The outer wall's arc stays. The stored edge tolerance
+/// is unchanged.
+fn side_curve_degeneracy_tol(
+    k: &Kernel,
+    base_pt: Point3,
+    axis: Vec3,
+    curve: &Curve,
+    edge_tol: f64,
+    band: Option<f64>,
+) -> Result<f64> {
+    let Some(band) = band else {
+        return Ok(edge_tol);
+    };
+    let ivl = curve.natural_interval();
+    let start = curve.evaluate_point(k, ivl.min())?;
+    let end = curve.evaluate_point(k, ivl.max())?;
+    let (start_dist, _) = line_point_distance(base_pt, axis, start);
+    let (end_dist, _) = line_point_distance(base_pt, axis, end);
+    if start_dist < band && end_dist < band {
+        Ok(band.max(edge_tol))
+    } else {
+        Ok(edge_tol)
+    }
+}
+
+/// `sm_CheckEdgeVerticesOnAxis`: whether the edge's end vertices are within
+/// `on_axis` of the axis and, for a line, whether it is parallel or perpendicular
+/// to the axis. `on_axis` is the larger of the tolerance and the closed path's
+/// corner band. A band below the tolerance does not narrow the test. A plain
+/// revolve passes `eps`. The line-length test stays on `eps`.
 fn check_edge_vertices_on_axis(
     base_pt: Point3,
     axis: Vec3,
@@ -203,6 +314,7 @@ fn check_edge_vertices_on_axis(
     e: EdgeId,
     edge_is_line: bool,
     eps: f64,
+    on_axis: f64,
 ) -> Result<VerticesOnAxis> {
     // init output
     let mut out = VerticesOnAxis {
@@ -221,10 +333,10 @@ fn check_edge_vertices_on_axis(
     let (end_dist, _) = line_point_distance(base_pt, axis, end_pt);
 
     // set output: remember if EdgeEndPoints are on rotation axis
-    if start_dist < eps {
+    if start_dist < on_axis {
         out.start_on = true;
     }
-    if end_dist < eps {
+    if end_dist < on_axis {
         out.end_on = true;
     }
 
@@ -254,11 +366,13 @@ fn check_edge_on_axis(
     axis: Vec3,
     b: &Brep,
     e: EdgeId,
+    curve: &Curve,
     edge_is_line: bool,
     eps: f64,
+    on_axis: f64,
 ) -> Result<bool> {
     // see if edge->EndVertices are on rotation axis
-    let on = check_edge_vertices_on_axis(base_pt, axis, b, e, edge_is_line, eps)?;
+    let on = check_edge_vertices_on_axis(base_pt, axis, b, e, edge_is_line, eps, on_axis)?;
 
     // low work - either endVertex is not on rotation axis
     if !on.start_on || !on.end_on {
@@ -270,15 +384,16 @@ fn check_edge_on_axis(
         return Ok(true);
     }
 
-    // arrive here when non-linear edge has both endpoints on the rotation axis
-    let curve = edge::curve(b, e)?
-        .ok_or_else(|| SolidError::sweep_missing(OP_ON_AXIS, "the edge's curve"))?;
+    // arrive here when non-linear edge has both endpoints on the rotation axis (the
+    // edge's curve, `curve`, is the one its callers checked it has)
 
     // line->Vertex end points
-    let start_vtx = edge::vertex(b, e)?
-        .ok_or_else(|| SolidError::sweep_missing(OP_ON_AXIS, "the edge's start vertex"))?;
-    let end_vtx = edge::other_vertex(b, e, Some(start_vtx))?
-        .ok_or_else(|| SolidError::sweep_missing(OP_ON_AXIS, "the edge's end vertex"))?;
+    let start_vtx = edge::vertex(b, e)?.ok_or_else(|| {
+        SolidError::sweep_null_defect(OP_ON_AXIS, "the edge's vertex was read through its edge uses, and every edge of a B-rep the kernel keeps has one")
+    })?;
+    let end_vtx = edge::other_vertex(b, e, Some(start_vtx))?.ok_or_else(|| {
+        SolidError::sweep_null_defect(OP_ON_AXIS, "the edge's other vertex was read through its edge uses after its first, and every edge of a B-rep the kernel keeps has one (its first again when closed)")
+    })?;
     let start_pt = vertex::point(b, start_vtx)?;
     let end_pt = vertex::point(b, end_vtx)?;
 
@@ -329,13 +444,10 @@ fn check_edge_on_axis(
         return Ok(false);
     }
 
-    // Must be coincident segment
-    let first = solutions.get(0).ok_or_else(|| {
-        SolidError::sweep_failed(
-            OP_ON_AXIS,
-            "the edge's line does not meet the rotation axis along a segment",
-        )
-    })?;
+    // Must be coincident segment (the test above leaves exactly one solution)
+    let [first] = solutions.as_slice() else {
+        return Ok(false);
+    };
 
     // Get start and end parameters of range on axis
     let axis_on_start = first.start.param(1)?;
@@ -345,9 +457,9 @@ fn check_edge_on_axis(
     // we had above
     if axis_on_start > line_min + eps || axis_on_end < line_max - eps {
         // 'RotSweep: edge crosses axis, xsection IGNORED'
-        return Err(SolidError::sweep_failed(
+        return Err(SolidError::sweep(
             OP_ON_AXIS,
-            "the edge crosses the rotation axis",
+            SweepFailure::EdgeCrossesRotationAxis,
         ));
     }
     Ok(true)
@@ -373,8 +485,13 @@ pub(crate) fn create_rot_srf(
             line_with_nurb = l.base_with_nurb()?;
             &*line_with_nurb
         }
-        _ => bspline_curve_of(curve)
-            .ok_or_else(|| SolidError::sweep_missing(OP_ROT_SRF, "the curve's B-spline form"))?,
+        _ => bspline_curve_of(curve).ok_or_else(|| {
+            SolidError::sweep_with_status(
+                OP_ROT_SRF,
+                SweepFailure::CurveWithoutBSplineForm { entity: None },
+                SM_ERR_NULL_POINTER,
+            )
+        })?,
     };
 
     // pass the call along (an SmLine generator parallel to the axis gets an arc
@@ -482,9 +599,10 @@ pub struct RotationalSweepGeometry {
     angle: f64,
     /// `m_dEps`: the tolerance for geometry on the axis, zero sweep lengths, lines.
     eps: f64,
-    /// SolidCraft change (tangency-labs/smlib 0b143f7): sweep a line or circular arc
-    /// to its analytic surface (see [`Self::set_analytic_revolutions`]).
-    analytic_revolutions: bool,
+    /// Closed path of lines and arcs: [`omitted_corner_band`] of the path
+    /// arc's radius. `None` on a plain revolve, where on-axis tests use `eps` and
+    /// side curves use `start_curve_tol`.
+    omitted_corner_band: Option<f64>,
 }
 
 impl RotationalSweepGeometry {
@@ -499,35 +617,33 @@ impl RotationalSweepGeometry {
             axis: axis.unitize_or_z(),
             angle: angle_deg,
             eps,
-            analytic_revolutions: false,
+            omitted_corner_band: None,
         }
     }
 
     /// `Copy`: a new sweep geometry from this one's data (the axis is unitized again)
-    /// with the same analytics settings.
+    /// with the same analytics settings and omitted-corner band.
     #[must_use]
     pub fn copy(&self) -> Self {
         let mut new = Self::new(self.base_pt, self.axis, self.angle, self.eps);
         new.base.set_make_analytics(self.base.make_analytics);
-        new.analytic_revolutions = self.analytic_revolutions;
-        new.base.statuses_pass_on = self.base.statuses_pass_on;
+        new.omitted_corner_band = self.omitted_corner_band;
         new
     }
 
-    /// SolidCraft change (tangency-labs/smlib 0b143f7, tangency-labs/solidcore#545):
-    /// with `make_analytics` also set, [`Self::edge_sweep_higher`] gives an edge
-    /// whose curve is a line or circular arc in a plane through the axis its
-    /// cylinder, cone, sphere or torus ([`analytic_revolution`]) in place of the
-    /// B-spline surface of revolution, laid out as that B-spline so that its boundary
-    /// makes the same loop. Off by default, as upstream at `c9c5979`.
-    pub fn set_analytic_revolutions(&mut self, on: bool) {
-        self.analytic_revolutions = on;
+    /// The omitted-corner band of a closed path arc whose radius is `feature_scale`.
+    /// A plain revolve does not call this: on-axis tests stay on `eps`.
+    pub(crate) fn set_omitted_corner_scale(&mut self, feature_scale: f64) {
+        self.omitted_corner_band = Some(omitted_corner_band(feature_scale));
     }
 
-    /// Whether [`Self::set_analytic_revolutions`] is on.
-    #[must_use]
-    pub const fn analytic_revolutions(&self) -> bool {
-        self.analytic_revolutions
+    /// The larger of `eps` and the closed path's corner band. A band below `eps`
+    /// does not narrow the on-axis test. With no band, `eps`.
+    fn axis_reach(&self, eps: f64) -> f64 {
+        match self.omitted_corner_band {
+            Some(band) => smos_max(band, eps),
+            None => eps,
+        }
     }
 
     /// `m_sBasePt`.
@@ -567,9 +683,11 @@ impl RotationalSweepGeometry {
             ret = true;
         }
         if d_repeats * self.angle > 360.0 + EFF_ZERO {
-            return Err(SolidError::sweep_failed(
+            return Err(SolidError::sweep(
                 OP_CLOSED,
-                "the repeated rotation turns more than a full circle",
+                SweepFailure::RotationPastFullTurn {
+                    degrees: d_repeats * self.angle,
+                },
             ));
         }
         Ok(ret)
@@ -636,9 +754,12 @@ impl RotationalSweepGeometry {
         let scaled_zero = EFF_ZERO * (1.0 + pt.max_dimension());
         let len = diff_vec.length();
         if len < scaled_zero {
-            return Err(SolidError::sweep_failed(
+            return Err(SolidError::sweep(
                 OP_START_CS,
-                "the point is on the rotation axis",
+                SweepFailure::PointOnRotationAxis {
+                    distance: len,
+                    least: scaled_zero,
+                },
             ));
         }
 
@@ -646,10 +767,7 @@ impl RotationalSweepGeometry {
 
         let mut cs = Axis2Placement::default();
         // (status not checked upstream; the fork passes it on, c8f6a31)
-        let status = cs.set_canonical(pt, self.axis, diff_vec);
-        if self.base.statuses_pass_on {
-            status?;
-        }
+        cs.set_canonical(pt, self.axis, diff_vec)?;
         Ok(cs)
     }
 
@@ -686,7 +804,8 @@ impl RotationalSweepGeometry {
 
     /// `VertexSweepHigher`: the degree 2 circular arc swept by vertex `v`, with the
     /// vertex tolerance; `None` when the vertex is on the axis (within the larger of
-    /// the sweep and vertex tolerances).
+    /// the sweep and vertex tolerances and, when set, the closed path's corner
+    /// band). A band below that tolerance does not narrow the test.
     ///
     /// # Errors
     ///
@@ -701,7 +820,7 @@ impl RotationalSweepGeometry {
         let eps = smos_max(self.eps, orig_vertex_tolerance);
 
         let mut x_vect = original_pt - rot_center;
-        if x_vect.length() < eps {
+        if x_vect.length() < self.axis_reach(eps) {
             // point lies on axis
             return Ok(None);
         }
@@ -725,10 +844,7 @@ impl RotationalSweepGeometry {
 
         let mut a2p = Axis2Placement::default();
         // (status not checked upstream; the fork passes it on, c8f6a31)
-        let status = a2p.set_canonical(rot_center, x_vect, y_vect);
-        if self.base.statuses_pass_on {
-            status?;
-        }
+        a2p.set_canonical(rot_center, x_vect, y_vect)?;
 
         // degree 2
         let circle = BSplineCurve::create_circle_segment(
@@ -768,9 +884,12 @@ impl RotationalSweepGeometry {
         let di = (copied_pt - point).length();
         if di < tolerance {
             // This is a problem for now
-            return Err(SolidError::sweep_failed(
+            return Err(SolidError::sweep(
                 OP_VERTEX_SAME,
-                "the rotation does not move the vertex",
+                SweepFailure::SweepTooShort {
+                    moved: di,
+                    least: tolerance,
+                },
             ));
         }
 
@@ -800,18 +919,30 @@ impl RotationalSweepGeometry {
         let brep_tol = b.tolerance();
         let eps = smos_max(self.eps, brep_tol);
 
-        // check for input line
+        // check for input line (upstream's sm_CheckEdgeCurveLine first refuses an edge
+        // without curve)
+        let Some(original_edge_curve) = original_edge_curve else {
+            return Err(edge_without_curve(OP_EDGE_HIGHER, e));
+        };
         let is_line = check_edge_curve_line(original_edge_curve, &original_edge_ivl, eps)?;
 
         // check edge on axis
-        let on_edge = check_edge_on_axis(k, self.base_pt, self.axis, b, e, is_line, eps)?;
+        let on_edge = check_edge_on_axis(
+            k,
+            self.base_pt,
+            self.axis,
+            b,
+            e,
+            original_edge_curve,
+            is_line,
+            eps,
+            self.axis_reach(eps),
+        )?;
 
         // no work - edge is on axis and it's not transformed by the rotation
         if on_edge {
             return Ok(out);
         }
-        let original_edge_curve = original_edge_curve
-            .ok_or_else(|| SolidError::sweep_failed(OP_EDGE_HIGHER, "the edge has no curve"))?;
 
         // check to see if the curve will sweep into a valid surface
         let sweep_check = self.check_curve_sweep(
@@ -824,9 +955,9 @@ impl RotationalSweepGeometry {
             self.angle,
         )?;
         if sweep_check != SweepCheckType::Okay {
-            return Err(SolidError::sweep_failed(
+            return Err(SolidError::sweep(
                 OP_EDGE_HIGHER,
-                "the edge's curve cannot be swept about the axis",
+                SweepFailure::EdgeCrossesRotationAxis,
             ));
         }
 
@@ -844,7 +975,15 @@ impl RotationalSweepGeometry {
         let mut trim_ivl = original_edge_ivl;
         copied_orig_edge_curve.trim(k, &mut trim_ivl, TrimMode::Notify)?;
 
-        let on_axis = check_edge_vertices_on_axis(self.base_pt, self.axis, b, e, is_line, eps)?;
+        let on_axis = check_edge_vertices_on_axis(
+            self.base_pt,
+            self.axis,
+            b,
+            e,
+            is_line,
+            eps,
+            self.axis_reach(eps),
+        )?;
 
         // This setting seems to be needed for CreateLinearSweep
         let start_trim_curve_param = SurfParamType::U;
@@ -872,9 +1011,9 @@ impl RotationalSweepGeometry {
             // Remaining on the safe side:
             let discr = (start_v_base_pt - end_v_base_pt).length();
             if discr > eps {
-                return Err(SolidError::sweep_failed(
+                return Err(SolidError::sweep(
                     OP_EDGE_HIGHER,
-                    "the edge's ends lie on different points of the axis",
+                    SweepFailure::NearlyPerpendicularLine { apart: discr, eps },
                 ));
             }
 
@@ -924,7 +1063,7 @@ impl RotationalSweepGeometry {
         // cone, sphere or torus the curve sweeps, in place of the B-spline before its
         // normal is taken (AnalyticSurface precedes it), which CopyAndAddAnalytics
         // does not give
-        let analytic = if self.base.make_analytics && self.analytic_revolutions && !is_plane {
+        let analytic = if self.base.make_analytics && !is_plane {
             analytic_revolution(
                 k,
                 &copied_orig_edge_curve,
@@ -952,9 +1091,9 @@ impl RotationalSweepGeometry {
             let plane_normal = to_trim.evaluate_normal(k, start_param, Side::Left, Side::Left)?;
             let dot = normal.dot(plane_normal);
             if dot.abs() < 0.8 {
-                return Err(SolidError::sweep_failed(
+                return Err(SolidError::sweep(
                     OP_EDGE_HIGHER,
-                    "the swept surface is not near the surface to trim",
+                    SweepFailure::SweptSurfaceNormalsDisagree { dot },
                 ));
             }
             if dot < 0.0 {
@@ -983,18 +1122,18 @@ impl RotationalSweepGeometry {
         let mut a_uv: Vec<Option<Line>> = natural.uv_curves.into_iter().map(Some).collect();
         let mut a_orients = natural.orients;
         if a3d.len() < 4 || a_uv.len() < 4 || a_orients.len() < 4 {
-            return Err(SolidError::sweep_failed(
+            return Err(SolidError::sweep_defect(
                 OP_EDGE_HIGHER,
-                "the swept surface has fewer than four boundary curves",
+                "create_natural_uv_trim_curves gives a surface's four natural boundary curves, with their uv lines and orientations",
             ));
         }
         let mut roles = [Role::Base, Role::Side1, Role::Swept, Role::Side3];
 
         let (curve_start_pt, curve_end_pt) = {
             let ec = a3d.first().and_then(Option::as_ref).ok_or_else(|| {
-                SolidError::sweep_failed(
+                SolidError::sweep_defect(
                     OP_EDGE_HIGHER,
-                    "the swept surface has no first boundary curve",
+                    "the boundary curves were just checked to be at least four, each present",
                 )
             })?;
             let ivl = ec.natural_interval();
@@ -1013,16 +1152,10 @@ impl RotationalSweepGeometry {
         if st_end < st_st {
             swap_start_end = true;
             if st_end > eps || end_st > eps {
-                return Err(SolidError::sweep_failed(
-                    OP_EDGE_HIGHER,
-                    "the swept surface's boundary does not meet the edge's ends",
-                ));
+                return Err(ends_off_curve(st_end.max(end_st), eps));
             }
         } else if end_end > eps || st_st > eps {
-            return Err(SolidError::sweep_failed(
-                OP_EDGE_HIGHER,
-                "the swept surface's boundary does not meet the edge's ends",
-            ));
+            return Err(ends_off_curve(end_end.max(st_st), eps));
         }
 
         // With the purpose to orient the loop correctly, here we invert the
@@ -1048,25 +1181,25 @@ impl RotationalSweepGeometry {
         let mut r_orients: Vec<OrientType> = Vec::new();
         let take = |v: &mut Vec<Option<Curve>>, i: usize| {
             v.get_mut(i).and_then(Option::take).ok_or_else(|| {
-                SolidError::sweep_failed(
+                SolidError::sweep_defect(
                     OP_EDGE_HIGHER,
-                    "a boundary curve of the swept surface is missing",
+                    "each of the first four boundary curves, checked present, is taken once (the side swap keeps them in slots 0 to 3)",
                 )
             })
         };
         let take_uv = |v: &mut Vec<Option<Line>>, i: usize| {
             v.get_mut(i).and_then(Option::take).ok_or_else(|| {
-                SolidError::sweep_failed(
+                SolidError::sweep_defect(
                     OP_EDGE_HIGHER,
-                    "a boundary curve of the swept surface is missing",
+                    "each of the first four uv boundary lines, checked present, is taken once (the side swap keeps them in slots 0 to 3)",
                 )
             })
         };
         let orient_at = |v: &[OrientType], i: usize| {
             v.get(i).copied().ok_or_else(|| {
-                SolidError::sweep_failed(
+                SolidError::sweep_defect(
                     OP_EDGE_HIGHER,
-                    "an orientation of the swept surface's boundary is missing",
+                    "the boundary orientations were checked to be at least four, and only slots 0 to 3 are read",
                 )
             })
         };
@@ -1086,7 +1219,15 @@ impl RotationalSweepGeometry {
         let mut end_vert_curve = None;
         let c = take(&mut a3d, 1)?;
         let uv = take_uv(&mut a_uv, 1)?;
-        let side = if c.is_degenerate(k, out.start_curve_tol, None)? {
+        let drop_tol = side_curve_degeneracy_tol(
+            k,
+            self.base_pt,
+            self.axis,
+            &c,
+            out.start_curve_tol,
+            self.omitted_corner_band,
+        )?;
+        let side = if c.is_degenerate(k, drop_tol, None)? {
             is_degenerate = true;
             None
         } else {
@@ -1122,7 +1263,15 @@ impl RotationalSweepGeometry {
         //----3----- the second side curve (NULL if degenerate)
         let c = take(&mut a3d, 3)?;
         let uv = take_uv(&mut a_uv, 3)?;
-        let side = if c.is_degenerate(k, out.start_curve_tol, None)? {
+        let drop_tol = side_curve_degeneracy_tol(
+            k,
+            self.base_pt,
+            self.axis,
+            &c,
+            out.start_curve_tol,
+            self.omitted_corner_band,
+        )?;
+        let side = if c.is_degenerate(k, drop_tol, None)? {
             is_degenerate = true;
             None
         } else {
@@ -1189,25 +1338,25 @@ impl RotationalSweepGeometry {
         let original_edge_iv = edge::interval(b, e)?;
         let original_edge_tol = edge::tolerance(b, e)?;
         let Some(original_edge_curve) = original_edge_curve else {
-            return Err(SolidError::sweep_failed(
-                OP_EDGE_SAME,
-                "the edge has no curve",
-            ));
+            return Err(edge_without_curve(OP_EDGE_SAME, e));
         };
 
         let brep_tol = b.tolerance();
         let eps = smos_max(self.eps, brep_tol);
 
-        let is_line = check_edge_curve_line(Some(original_edge_curve), &original_edge_iv, eps)?;
+        let is_line = check_edge_curve_line(original_edge_curve, &original_edge_iv, eps)?;
 
+        let edge_eps = smos_max(self.eps, original_edge_tol);
         let edge_on_axis = check_edge_on_axis(
             k,
             self.base_pt,
             self.axis,
             b,
             e,
+            original_edge_curve,
             is_line,
-            smos_max(self.eps, original_edge_tol),
+            edge_eps,
+            self.axis_reach(edge_eps),
         )?;
 
         let mut new_edge_curve = original_edge_curve.copy(k)?;
@@ -1247,8 +1396,9 @@ impl RotationalSweepGeometry {
 
         let orig_face_tol = face::p2::tolerance(b, f)?;
 
-        let original_face_surface = face::p2::surface(b, f)?
-            .ok_or_else(|| SolidError::sweep_missing(OP_FACE_SAME, "the face's surface"))?;
+        let original_face_surface = face::p2::surface(b, f)?.ok_or_else(|| {
+            SolidError::sweep(OP_FACE_SAME, SweepFailure::FaceWithoutSurface { face: f })
+        })?;
 
         // Copy pOriginalFaceSurface, when possible as an analytic surface
         let mut new_face_surf = original_face_surface.copy_and_add_analytics(k)?;
@@ -1293,6 +1443,7 @@ fn remove_first(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::det;
     use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
     use crate::topology::{
         Edge, Edgeuse, EdgeuseId, EdgeuseOwner, Region, Shell, Vertex, Vertexuse, VertexuseOwner,
@@ -1465,7 +1616,7 @@ mod tests {
                 for f in [0.0, 0.2, 0.45, 0.7, 1.0] {
                     let p = rim.evaluate_point(&k, ivl.evaluate(f)).unwrap();
                     assert!(
-                        p.z.abs() <= 1e-12 && (p.x.hypot(p.y) - 1.0).abs() <= 1e-12,
+                        p.z.abs() <= 1e-12 && (det::hypot(p.x, p.y) - 1.0).abs() <= 1e-12,
                         "rim {p:?}"
                     );
                 }
@@ -1537,6 +1688,9 @@ mod tests {
         assert_eq!(s.face_tol, -1.0);
     }
 
+    /// Every line and circular arc swept a part turn is its analytic surface, never
+    /// inside out, laid out so that its boundary makes the loop the B-spline surface of
+    /// revolution (`make_analytics` off) makes (tangency-labs/solidcraft#14425).
     #[test]
     fn analytic_revolutions_keep_the_b_spline_loop() {
         use crate::surface::surface::SurfaceKind;
@@ -1593,11 +1747,10 @@ mod tests {
             ),
         ];
         for (name, (b, e)) in cases {
-            let upstream = RotationalSweepGeometry::new(Vec3::ZERO, Vec3::Z, 90.0, 1e-6);
-            assert!(!upstream.analytic_revolutions());
-            let mut g = upstream.copy();
-            g.set_analytic_revolutions(true);
-            assert!(g.copy().analytic_revolutions());
+            let g = RotationalSweepGeometry::new(Vec3::ZERO, Vec3::Z, 90.0, 1e-6);
+            let mut upstream = g.copy();
+            upstream.base.set_make_analytics(false);
+            assert!(g.copy().base.make_analytics);
             let old = upstream.edge_sweep_higher(&k, &b, e).unwrap();
             let new = g.edge_sweep_higher(&k, &b, e).unwrap();
             let surface = new.surface.as_ref().unwrap();

@@ -11,6 +11,37 @@
 //! | [`fill_n_sided_hole`], [`NSidedFill`]        | `N_FillNSidedHole`     |
 //!
 //! Deviations:
+//! - A piece of a sweep without rails along which the profile's first or last control
+//!   point stays within `MODEL_TOL` (a horn bend: the profile's end on the arc's centre)
+//!   is skinned at the trajectory parameters with C1 derivative constraints. G1
+//!   rescaling by that end's chord length would collapse its cross derivatives. Every
+//!   other piece is skinned as upstream.
+//! - Without `curZ` or an up direction, upstream takes the frame's rate at a piece's end
+//!   sections from a finite difference of the neighbouring z samples. Where a neighbour
+//!   lies past the piece's parameter range, on the next piece, the rate is instead the
+//!   projection normal method's own, `z' = -(z . x') x` from the piece's trajectory
+//!   derivatives ([`ZSource::RotationMinimizing`], #16959): along an arc whose z turns
+//!   (its plane is not square to z) next to a long line, the difference across the joint
+//!   is a fraction of the rate, the cross derivatives of the arc's skin miss the frame's
+//!   turn, and the inner rows of its net run backwards there. A difference within the
+//!   piece is upstream's, and so is one of a closed trajectory whose z vectors were
+//!   corrected to close: they also turn by the spread closing gap, which the method's
+//!   rate omits.
+//! - Not upstream (#18117): a closed trajectory's z vectors are corrected to close by
+//!   spreading the closing angle evenly along it ([`create_b_vectors_closing`]), not by
+//!   upstream's backward averages, which put the whole turn into the last few samples, and
+//!   the end sections of such a closed chain take their rate from the samples on both
+//!   sides of the closure, one central difference for both. Upstream's one-sided ends
+//!   and crowded turn left the swept surface creased across its closure (its normal
+//!   turning by about a degree there along a line swept round a closed 3D spline), so its
+//!   offsets did not meet there.
+//! - Not upstream: a short interior linear piece whose chord tangent is tilted by endpoint
+//!   rounding relative to its longer neighbours' nearly matching tangents (lateral offset
+//!   within the sweep tolerance, while the profile's reach times the kink threatens to fold
+//!   the net) blends its sweep frame tangent smoothly between the two neighbours' tangents
+//!   across the piece instead of jumping onto the tilted chord. This keeps the boundary
+//!   sections identical on both sides of each joint so `join` does not average mismatched
+//!   rows across a short bridge and fold the control net back on itself.
 //! - Out-params become return values (the swept surface; the patches with the center
 //!   point and normal); the `NL_STACKS` arguments have no counterpart. The optional
 //!   arguments of `N_CreateSweepScale` (`curZ`, `curS`, `tflg`, `tc`, `deg`, `dir`,
@@ -23,8 +54,8 @@
 //! - Errors are [`SolidError::Failed`] values (a [`NurbsFailure`] reason) with the upstream `NL_*_ERR` number.
 //! - `N_CreateSweepScale` ignores the status of `ST_GetRotationRateOfChange`; it can
 //!   only fail where upstream's inputs make it unreachable (a `curZ` that cannot be
-//!   differentiated where it was just evaluated, or a single frame sample), and the
-//!   Rust function returns that error. `N_FillNSidedHole` ignores the status of
+//!   differentiated where it was just evaluated, or a single frame sample of a closed
+//!   trajectory's corrected z vectors), and the Rust function returns that error. `N_FillNSidedHole` ignores the status of
 //!   `N_CrvRefine` on the computed derivative curve, as does the Rust function (the
 //!   curve stays unrefined; the refinement fails before modifying it).
 //! - Every array access is bounds checked; where upstream would index outside its
@@ -49,7 +80,8 @@ use crate::nurbs::crv_nurb::LinearSeg;
 use crate::nurbs::crv_tool::p2::make_compatible_adj_knots;
 use crate::nurbs::funcs_basic::CurveFunction;
 use crate::nurbs::geom::{
-    normalize, project_pt_plane, pt_along_vector, transform_matrix_from_axes, Frame, Plane,
+    dist_cpolygon, normalize, project_pt_plane, pt_along_vector, transform_matrix_from_axes, Frame,
+    Plane,
 };
 use crate::nurbs::index::{at, oob, put};
 use crate::nurbs::knots::Side;
@@ -61,9 +93,9 @@ use crate::nurbs::srf_tool::p3::join;
 
 use super::p1::cross_boundary_derivs_vector_field;
 use super::p4::{
-    approx_cross_boundary_derivs, create_b_vectors, create_coons_boundary_crvs,
-    create_cross_boundary_deriv_crv, rotation_rate_of_change, sweep_cross_tangent_crv,
-    CoonsBoundary, Mat3, ZSource,
+    approx_cross_boundary_derivs, create_b_vectors_closing, create_b_vectors_closing_with,
+    create_coons_boundary_crvs, create_cross_boundary_deriv_crv, rotation_rate_of_change,
+    sweep_cross_tangent_crv, CoonsBoundary, Mat3, ZSource,
 };
 use super::p5::{create_skin_srf_boundary_continuity, BoundaryContinuity, SkinBoundaryOptions};
 
@@ -76,6 +108,127 @@ const MAXPTS: usize = 1000;
 /// Not upstream: the least sine of the angle between an upright sweep's trajectory and its up
 /// direction (the controlled sweep's convention, `sweep::stations`' `min_across`).
 pub const MIN_UP_ACROSS: f64 = 1e-3;
+/// Minimum cosine between adjacent tangents for a short interior linear bridge to be
+/// treated as nearly tangent (never a genuine corner).
+const MIN_BRIDGE_DOT: f64 = 0.999;
+
+/// Euclidean length of `c`'s control polygon (exact for a line, strictly positive for any
+/// non-degenerate curved piece including closed arcs).
+fn control_polygon_length(c: &Curve) -> f64 {
+    c.cpts()
+        .windows(2)
+        .map(|w| match w {
+            [a, b] => (b.to_euclid() - a.to_euclid()).length(),
+            _ => 0.0,
+        })
+        .sum()
+}
+
+/// Largest distance of any Euclidean control point of `cur_c` from the origin.
+fn profile_reach(cur_c: &Curve) -> f64 {
+    cur_c
+        .cpts()
+        .iter()
+        .map(|cp| cp.to_euclid().length())
+        .fold(0.0_f64, f64::max)
+}
+
+/// For each trajectory piece, `Some((t_prev, t_next))` when it is a short interior linear
+/// bridge whose chord direction is perturbed by endpoint rounding relative to its longer
+/// neighbours' tangents enough to fold the swept control net across the piece.
+///
+/// When two tangent 3D curves (for example two circular arcs in different planes) nearly
+/// meet and leave a short straight bridge of length `L`, endpoint rounding `eps` tilts the
+/// chord by `ang ~ eps / L`. Placing sections perpendicular to that tilted chord swings a
+/// profile of reach `R` axially by `R * ang`; once `R * ang` approaches `L`, both the
+/// frame jump at the piece ends and `join`'s boundary-row averaging fold the control net
+/// back on itself (`SmBSplineSurface` test #5), even though the bridge stays within `tol`
+/// of the neighbours' common tangent. Blending the frame tangent smoothly from `t_prev` to
+/// `t_next` across the bridge keeps the boundary sections identical on both sides of each
+/// joint and keeps every control column monotone, while leaving curved pieces (including
+/// genuine tight bends) and normal-length segments untouched.
+fn short_linear_bridges(
+    segs: &[Curve],
+    seg_pbnds: &[LinearSeg],
+    cur_c: &Curve,
+    tol: f64,
+) -> Result<Vec<Option<(Vec3, Vec3)>>> {
+    let mut bridges = vec![None; segs.len()];
+    if segs.len() < 3 {
+        return Ok(bridges);
+    }
+    let reach = profile_reach(cur_c);
+    if !reach.is_finite() || reach <= 0.0 {
+        return Ok(bridges);
+    }
+    let lengths: Vec<f64> = segs.iter().map(control_polygon_length).collect();
+    let lat_tol = tol.max(MODEL_TOL);
+    for ii in 1..segs.len() - 1 {
+        let bounds = rf(seg_pbnds, ii, OP_SWEEP)?;
+        if !bounds.linear {
+            continue;
+        }
+        let len = at(&lengths, ii, OP_SWEEP)?;
+        let prev_len = at(&lengths, ii - 1, OP_SWEEP)?;
+        let next_len = at(&lengths, ii + 1, OP_SWEEP)?;
+        // Strict local minimum of length: both neighbours are longer (so their tangents
+        // are better conditioned), and no two adjacent pieces can both be bridged.
+        if !len.is_finite() || len <= 0.0 || prev_len <= len || next_len <= len {
+            continue;
+        }
+        let prev_bounds = rf(seg_pbnds, ii - 1, OP_SWEEP)?;
+        let next_bounds = rf(seg_pbnds, ii + 1, OP_SWEEP)?;
+        let (_, t_prev) = rf(segs, ii - 1, OP_SWEEP)?.eval_tangent(prev_bounds.end, Side::Left)?;
+        let (_, t_l) = rf(segs, ii, OP_SWEEP)?.eval_tangent(bounds.start, Side::Left)?;
+        let (_, t_next) =
+            rf(segs, ii + 1, OP_SWEEP)?.eval_tangent(next_bounds.start, Side::Left)?;
+        if t_prev.dot(t_l) <= MIN_BRIDGE_DOT
+            || t_l.dot(t_next) <= MIN_BRIDGE_DOT
+            || t_prev.dot(t_next) <= MIN_BRIDGE_DOT
+        {
+            continue;
+        }
+        let sin_prev = t_prev.cross(t_l).length();
+        let sin_next = t_l.cross(t_next).length();
+        let sin_span = t_prev.cross(t_next).length();
+        let kink = sin_prev.max(sin_next);
+        if reach * kink < 0.05 * len
+            || len * kink > lat_tol
+            || sin_span >= kink
+            || reach * sin_span >= 0.8 * len
+        {
+            continue;
+        }
+        if let Some(slot) = bridges.get_mut(ii) {
+            *slot = Some((t_prev, t_next));
+        }
+    }
+    Ok(bridges)
+}
+
+/// Unit tangent along a bridged linear piece at fraction `u` in `[0, 1]`.
+fn bridge_tangent(t_prev: Vec3, t_next: Vec3, u: f64) -> Result<Vec3> {
+    if u <= 0.0 {
+        return Ok(t_prev);
+    }
+    if u >= 1.0 {
+        return Ok(t_next);
+    }
+    Ok(normalize(combine2_pts(1.0 - u, t_prev, u, t_next))?.0)
+}
+
+/// Rate of change `[x' | y' | z']` of the bridged rotation-minimizing frame across a linear
+/// piece of parameter length `span`.
+fn bridge_rotation_rate(t_prev: Vec3, t_next: Vec3, span: f64, xl: Vec3, zl: Vec3) -> Mat3 {
+    if !span.is_finite() || span <= 0.0 {
+        return [[0.0; 3]; 3];
+    }
+    let raw_dx = (t_next - t_prev) * (1.0 / span);
+    let dx = raw_dx - xl * raw_dx.dot(xl);
+    let dz = xl * -zl.dot(dx);
+    let dy = dz.cross(xl) + zl.cross(dx);
+    [[dx.x, dy.x, dz.x], [dx.y, dy.y, dz.y], [dx.z, dy.z, dz.z]]
+}
 
 /// Not upstream: the frame's z of an upright sweep at the unit tangent `x`: `up` (unit) made
 /// square to `x`, refused where `x` comes within [`MIN_UP_ACROSS`] of it.
@@ -254,6 +407,24 @@ pub struct SweepTrace {
     pub chain: Vec<f64>,
     /// The unit normal the chain began from.
     pub start_normal: Vec3,
+    /// Per piece of a sweep without rails: whether its skin is interpolated at the
+    /// trajectory parameters (a piece along which an end of the profile stays put),
+    /// rather than at the chord-length parameters of G1 skinning.
+    pub path_parameters: Vec<bool>,
+}
+
+/// Whether the first or the last control point of the placed sections stays within
+/// `MODEL_TOL` along the piece: the chord length G1 skinning rescales by is then no
+/// magnitude (`create_skin_srf_boundary_continuity` measures the same polygons).
+fn profile_end_is_fixed(sections: &[Curve]) -> Result<bool> {
+    let mut first = Vec::new();
+    let mut last = Vec::new();
+    for section in sections {
+        let points = section.cpts();
+        first.push(at(points, 0, OP_SWEEP)?);
+        last.push(at(points, section.n(), OP_SWEEP)?);
+    }
+    Ok(dist_cpolygon(&first) <= MODEL_TOL || dist_cpolygon(&last) <= MODEL_TOL)
 }
 
 /// [`create_sweep_scale`] that also reports its [`SweepTrace`] (and, as
@@ -420,9 +591,21 @@ fn sweep_scale(
         }
     }
 
+    // Short interior linear bridges whose chord tangent is perturbed by endpoint rounding
+    // enough to fold the swept control net blend their frame tangent between their longer
+    // neighbours' tangents so boundary sections match on both sides of each joint.
+    let bridges = if cur_z.is_none() && up.is_none() && cur_s.is_none() && !tflg {
+        short_linear_bridges(&segs, &seg_pbnds, cur_c, e)?
+    } else {
+        vec![None; segs.len()]
+    };
+    let any_bridge = bridges.iter().any(Option::is_some);
+
     // Frame z vectors at (sub-sampled) parameters when curZ is not given.
     let mut tt: Vec<f64> = Vec::new();
     let mut zl_vecs: Vec<Vec3> = Vec::new();
+    // (not upstream, #16959) whether a closed trajectory's z vectors were corrected to close
+    let mut closing = false;
     if cur_z.is_none() && up.is_none() {
         tt.push(at(rf(&seg_pars, 0, OP)?, 0, OP)?);
         for (ii, sp) in seg_pars.iter().enumerate() {
@@ -444,14 +627,36 @@ fn sweep_scale(
                 }
             }
         }
-        zl_vecs = create_b_vectors(cur_t, z0, &tt)?;
+        let (vecs, corrected) = if any_bridge {
+            let mut piece_idx = 0usize;
+            create_b_vectors_closing_with(cur_t, z0, &tt, |par| {
+                while piece_idx + 1 < seg_pbnds.len() && rf(&seg_pbnds, piece_idx, OP)?.end <= par {
+                    piece_idx += 1;
+                }
+                if let Some((t_prev, t_next)) = *rf(&bridges, piece_idx, OP)? {
+                    let piece = rf(&seg_pbnds, piece_idx, OP)?;
+                    let span = piece.end - piece.start;
+                    let u = if span > 0.0 {
+                        ((par - piece.start) / span).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    bridge_tangent(t_prev, t_next, u)
+                } else {
+                    Ok(cur_t.eval_tangent(par, Side::Left)?.1)
+                }
+            })?
+        } else {
+            create_b_vectors_closing(cur_t, z0, &tt)?
+        };
+        zl_vecs = vecs;
+        closing = corrected;
         if let Some(trace) = trace.as_mut() {
             trace.pieces.clone_from(&seg_pars);
             trace.chain.clone_from(&tt);
             trace.start_normal = normalize(z0)?.0;
         }
     }
-    let zl_count = zl_vecs.len();
 
     // Handle trajectory interpolation (rail) and split curC if necessary.
     let mut us = 0.0;
@@ -562,7 +767,20 @@ fn sweep_scale(
                 }
             }
 
-            let (ol, xl) = seg.eval_tangent(par, Side::Left)?;
+            let bridge = *rf(&bridges, ii, OP)?;
+            let (ol, xl) = if let Some((t_prev, t_next)) = bridge {
+                let ol = seg.eval(par, Side::Left)?;
+                let piece = rf(&seg_pbnds, ii, OP)?;
+                let span = piece.end - piece.start;
+                let u = if span > 0.0 {
+                    ((par - piece.start) / span).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (ol, bridge_tangent(t_prev, t_next, u)?)
+            } else {
+                seg.eval_tangent(par, Side::Left)?
+            };
 
             let zl = if let Some(up) = up {
                 upright_z(up, xl)?
@@ -597,29 +815,61 @@ fn sweep_scale(
             placed_at += 1;
 
             if jj == 0 || jj == np {
+                // The finite difference's neighbours in the frame chain. (Not upstream,
+                // #18117) a chain corrected to close ends on its first sample, so across the
+                // closure each end's neighbour is the other end's: both ends take one rate,
+                // and the surface meets itself there as smoothly as along it, where upstream
+                // differences each end on its own side.
+                let wrap = if closing {
+                    let last = zl_vecs.len().checked_sub(1).ok_or_else(|| oob(OP))?;
+                    let period = at(&tt, last, OP)? - at(&tt, 0, OP)?;
+                    Some((last, period))
+                } else {
+                    None
+                };
+                let prev = match (k1.checked_sub(1), wrap) {
+                    (Some(k0), _) => Some((at(&zl_vecs, k0, OP)?, at(&tt, k0, OP)?)),
+                    (None, Some((last, period))) if last > 1 => {
+                        Some((at(&zl_vecs, last - 1, OP)?, at(&tt, last - 1, OP)? - period))
+                    }
+                    (None, _) => None,
+                };
+                let next = match wrap {
+                    _ if k1 + 1 < zl_vecs.len() => {
+                        Some((at(&zl_vecs, k1 + 1, OP)?, at(&tt, k1 + 1, OP)?))
+                    }
+                    Some((last, period)) if last > 1 => {
+                        Some((at(&zl_vecs, 1, OP)?, at(&tt, 1, OP)? + period))
+                    }
+                    _ => None,
+                };
+                // (not upstream, #16959) a neighbour past this piece's parameter range
+                // lies on the next piece, whose frame can turn at another rate: there the
+                // rate is the projection normal method's own, unless the chain was
+                // corrected to close (it then also turns by the spread gap, which only
+                // the difference of the samples sees)
+                let piece = rf(&seg_pbnds, ii, OP)?;
+                let outside = |n: Option<(Vec3, f64)>| {
+                    n.is_some_and(|(_, t)| t < piece.start || t > piece.end)
+                };
+                let across = !closing && (outside(prev) || outside(next));
                 let zsrc = match (up, cur_z) {
                     (Some(up), _) => ZSource::Up(up),
                     (None, Some(cz)) => ZSource::Curve(cz),
-                    (None, None) => ZSource::Samples {
-                        z: zl,
-                        prev: if k1 > 0 {
-                            Some((at(&zl_vecs, k1 - 1, OP)?, at(&tt, k1 - 1, OP)?))
-                        } else {
-                            None
-                        },
-                        next: if k1 + 1 < zl_count {
-                            Some((at(&zl_vecs, k1 + 1, OP)?, at(&tt, k1 + 1, OP)?))
-                        } else {
-                            None
-                        },
-                    },
+                    (None, None) if across => ZSource::RotationMinimizing(zl),
+                    (None, None) => ZSource::Samples { z: zl, prev, next },
+                };
+                let drma = if let Some((t_prev, t_next)) = bridge {
+                    bridge_rotation_rate(t_prev, t_next, piece.end - piece.start, xl, zl)
+                } else {
+                    rotation_rate_of_change(seg, par, zsrc)?
                 };
                 if jj == 0 {
                     rma1 = frame_matrix(xl, yl, zl);
-                    drma1 = rotation_rate_of_change(seg, par, zsrc)?;
+                    drma1 = drma;
                 } else {
                     rma2 = frame_matrix(xl, yl, zl);
-                    drma2 = rotation_rate_of_change(seg, par, zsrc)?;
+                    drma2 = drma;
                 }
             }
 
@@ -708,15 +958,28 @@ fn sweep_scale(
             let de0 =
                 cross_boundary_derivs_vector_field(rf(&sects1, np, OP)?, &ct11, Boundary::Bottom)?;
 
-            let (ts, rail) = if tflg {
+            // Without rails, G1 skinning rescales the cross derivatives by the chord
+            // length of the sections' first and last control points. Where either end
+            // stays within MODEL_TOL (the skinner's coincidence tolerance) over the
+            // piece, as at a horn bend where the profile's end sits on the arc's
+            // centre, that length is no magnitude and the rescaled derivatives collapse.
+            // Such a piece keeps the derivatives as computed, in the trajectory
+            // parameter, and is interpolated at those same parameters (C1).
+            let fixed_end = !tflg && !ruled && profile_end_is_fixed(&sects1)?;
+            if let Some(trace) = trace.as_mut() {
+                trace.path_parameters.push(fixed_end);
+            }
+            let (ts, rail, cnt) = if tflg {
                 let r = if tc == us {
                     [Some(seg.clone()), None]
                 } else {
                     [None, Some(seg.clone())]
                 };
-                (Some(sp.clone()), Some(r))
+                (Some(sp.clone()), Some(r), cnt)
+            } else if fixed_end {
+                (Some(sp.clone()), None, [BoundaryContinuity::C1; 2])
             } else {
-                (None, None)
+                (None, None, cnt)
             };
             // If ruled ignore end derivatives.
             let der = if ruled {
@@ -1610,6 +1873,106 @@ mod tests {
         assert_eq!(p, 2);
         let p0 = s.cpt(0, 0).unwrap().to_euclid();
         assert!(p0.length().is_finite());
+    }
+
+    /// A piece along which the profile's end stays put (a horn bend: profile radius equal
+    /// to the bend's, its seam on the bend's centre) is skinned at the path's parameters,
+    /// including a nonzero origin and a nonunit range; any other piece keeps the chord-length
+    /// parameters of G1 skinning. Either way the certificate compares the right points.
+    #[test]
+    fn only_a_fixed_profile_end_skins_at_the_path_parameter() {
+        use crate::geom::axis2_placement::Axis2Placement;
+        use crate::geom::extent1d::Extent1d;
+        use crate::math::Point2;
+        use crate::nurbs::b_spline_curve::{BSplineCurve, NurbCircleParam};
+        use crate::nurbs::b_spline_surface::BSplineSurface;
+        use crate::surface::procedural_sweep::ProceduralSweep;
+
+        let mut path = BSplineCurve::create_circle_segment(
+            3,
+            &Axis2Placement::IDENTITY,
+            10.0,
+            0.0,
+            90.0,
+            NurbCircleParam::Quadratic,
+        )
+        .unwrap();
+        path.edit_parameterization(&Extent1d::from_min_max(3.0, 11.0))
+            .unwrap();
+        // A circle of the bend's radius passes through the bend's centre (the origin);
+        // only a seam there leaves the profile's end in place. Which seam that is follows
+        // from the sweep's start frame, so read it from the net's own corners.
+        let mut horns = 0;
+        for (radius, start) in [
+            (0.75, 0.0),
+            (10.0, 0.0),
+            (10.0, -90.0),
+            (10.0, -180.0),
+            (10.0, -270.0),
+        ] {
+            let profile = BSplineCurve::create_circle_segment(
+                3,
+                &Axis2Placement::new(Vec3::ZERO, Vec3::Y, Vec3::Z),
+                radius,
+                start,
+                start + 360.0,
+                NurbCircleParam::Quadratic,
+            )
+            .unwrap();
+            let (net, trace) = BSplineSurface::create_sweep_surface_traced(
+                &profile, &path, None, false, 1e-6, None, None,
+            )
+            .unwrap();
+            let trace = trace.unwrap();
+            let domain = net.natural_uv_domain();
+            let horn = [domain.min().x, domain.max().x].iter().all(|&u| {
+                net.evaluate_point(Point2::new(u, domain.min().y))
+                    .unwrap()
+                    .length()
+                    <= 1e-9
+            });
+            assert_eq!(trace.path_parameters, vec![horn]);
+            if radius > 1.0 && !horn {
+                // the profile's interior meets the centre: a pole the face builder splits at
+                continue;
+            }
+            horns += usize::from(horn);
+            let definition = ProceduralSweep::create_path(&profile, &path, &trace, &net).unwrap();
+            let motion = definition.path().unwrap();
+            if horn {
+                assert_eq!(domain.u_interval(), path.natural_interval());
+                assert!(motion.nodes().iter().all(|&(v, t)| v == t));
+            } else {
+                assert_eq!(domain.u_interval(), Extent1d::from_min_max(0.0, 1.0));
+            }
+            let mut radial_error = 0.0_f64;
+            let mut definition_error = 0.0_f64;
+            for i in 0..32 {
+                let fraction = (f64::from(i) + 0.31) / 32.0;
+                let t = path.natural_interval().evaluate(fraction);
+                let u = domain.u_interval().evaluate(fraction);
+                for j in 0..16 {
+                    let v = profile
+                        .natural_interval()
+                        .evaluate((f64::from(j) + 0.27) / 16.0);
+                    let point = net.evaluate_point(Point2::new(u, v)).unwrap();
+                    if horn {
+                        let center = path.evaluate_point(t).unwrap();
+                        radial_error = radial_error.max((point.distance(center) - radius).abs());
+                    }
+                    definition_error = definition_error.max(
+                        point.distance(
+                            definition
+                                .evaluate_definition_point(Point2::new(u, v))
+                                .unwrap(),
+                        ),
+                    );
+                }
+            }
+            assert!(radial_error < 2e-5 * radius, "{radial_error}");
+            assert!(definition_error <= definition.bound(), "{definition_error}");
+        }
+        assert_eq!(horns, 1);
     }
 
     #[test]

@@ -28,7 +28,10 @@
 //!   (`analytic`). A surface of revolution is extended along its generator as asked, on its
 //!   B-spline form row by row: its rows are one generator turned and weighted, every
 //!   construction here commutes with both, so the result is the revolution of the generator
-//!   extended; its side round its axis is left.
+//!   extended; its side round its axis is left. A revolution whose generator is an arc of
+//!   one circle is a torus but for its label: its sides round the axis are extended first,
+//!   as a torus's (`analytic`), and its sides along the generator then as any revolution's,
+//!   along them.
 //!
 //! - **Ball patches as themselves.** A ball patch (the sphere's triangle with a pole) is
 //!   extended by its own net continued Natural (the source bit for bit, every point still on
@@ -38,7 +41,8 @@
 //!
 //! Deviations: none (no upstream counterpart). No recursion.
 
-use super::{Continuity, ExtendRefusal, Extended};
+use super::{Continuity, ExtendRefusal};
+use crate::error::surface::SurfaceFailure;
 use crate::error::{Result, SolidError};
 use crate::geom::extent2d::Extent2d;
 use crate::kernel::Kernel;
@@ -50,15 +54,15 @@ use crate::surface::surface::{Surface, SurfaceKind};
 
 const OP: &str = "surface::extend::Surface::extended_sides";
 
-/// Halvings of an ask whose side was refused naming nothing, to name a distance that works.
-const NAMING_HALVINGS: usize = 60;
+/// Smaller asks checked against all requested sides before naming a distance that works.
+const NAMING_TRIES: usize = 60;
 
 /// What [`Surface::extended_sides`] did at one side of the source's box.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SideExtension {
     /// Not asked.
     NotAsked,
-    /// Extended: the length across it ([`Extended::across`]).
+    /// Extended: the length across it ([`Extended::across`](super::Extended::across)).
     Extended(Across),
     /// Left: the surface closes in the side's direction.
     Closed,
@@ -68,7 +72,8 @@ pub enum SideExtension {
     Unbounded,
     /// Left: a revolution's side round its axis (a closed direction).
     AroundAxis,
-    /// Extended less than asked, up to an apex, pole or full turn: the length across it.
+    /// Extended less than asked, up to an apex, pole or full turn, or round an axis a quarter
+    /// of the turn left open: the length across it.
     UpToLimit(Across),
     /// Left: the distance is below the side's resolution, the shortest extension its knot
     /// can carry proved past it (`super::below_resolution`): no extension, the surface as
@@ -79,7 +84,7 @@ pub enum SideExtension {
 
 /// For a cone, sphere, torus or surface of revolution, whether side `side` runs round its
 /// axis (its NURBS u is the sweep unless swapped); `None` for any other kind.
-pub(super) fn round_the_axis(s: &Surface, side: BoxSide) -> Option<bool> {
+pub(crate) fn round_the_axis(s: &Surface, side: BoxSide) -> Option<bool> {
     let swap = match s.kind() {
         SurfaceKind::Cone(c) => c.rev().swap_uv(),
         SurfaceKind::Sphere(sp) => sp.base.swap_uv,
@@ -98,10 +103,11 @@ pub struct ExtendedSides {
     /// What was done at each side of the source's box, in [`BoxSide::ALL`]'s order.
     pub sides: [SideExtension; 4],
     /// How far the result over the source's box is from the source: the sum of the sides'
-    /// [`Extended::source`], each on the one before.
+    /// [`Extended::source`](super::Extended::source), each on the one before.
     pub source: f64,
-    /// The largest construction bound of the sides' extensions ([`Extended::extension`]):
-    /// each extension is within this of its construction.
+    /// The largest construction bound of the sides' extensions
+    /// ([`Extended::extension`](super::Extended::extension)): each extension is within this of
+    /// its construction.
     pub extension: f64,
 }
 
@@ -180,21 +186,37 @@ impl Surface {
             Err(SolidError::ExtendRefused {
                 operation,
                 refusal: ExtendRefusal::NotExact,
-                distance: None,
-            }) => {
-                let mut tried = distance;
+                distance: reached,
+            }) if reached.is_none() || asked.len() > 1 => {
+                // A reach measured for one side may be too far for a later side. Check the
+                // complete operation, using a shorter certified reach when a side gives one.
+                let mut tried = reached
+                    .filter(|&reach| reach > 0.0 && reach < distance)
+                    .unwrap_or(distance * 0.5);
                 let mut named = None;
-                for _ in 0..NAMING_HALVINGS {
-                    tried *= 0.5;
-                    // a distance works when some side extends at it: one below every side's
-                    // resolution leaves them all unchanged and extends nothing
-                    if let Ok(e) = self.extended_in_turn(k, asked, how, tried) {
-                        if e.sides.iter().any(|s| {
-                            matches!(s, SideExtension::Extended(_) | SideExtension::UpToLimit(_))
-                        }) {
-                            named = Some(tried);
-                        }
+                for _ in 0..NAMING_TRIES {
+                    if tried <= 0.0 {
                         break;
+                    }
+                    match self.extended_in_turn(k, asked, how, tried) {
+                        Ok(e) => {
+                            // Below every side's resolution the operation extends nothing.
+                            if e.sides.iter().any(|s| {
+                                matches!(
+                                    s,
+                                    SideExtension::Extended(_) | SideExtension::UpToLimit(_)
+                                )
+                            }) {
+                                named = Some(tried);
+                            }
+                            break;
+                        }
+                        Err(SolidError::ExtendRefused {
+                            refusal: ExtendRefusal::NotExact,
+                            distance: Some(reach),
+                            ..
+                        }) if reach > 0.0 && reach < tried => tried = reach,
+                        _ => tried *= 0.5,
                     }
                 }
                 Err(SolidError::ExtendRefused {
@@ -216,7 +238,7 @@ impl Surface {
         how: Continuity,
         distance: f64,
     ) -> Result<ExtendedSides> {
-        let mut current: Option<Extended> = None;
+        let mut current: Option<Surface> = None;
         // the face: the source's own box. Every extension keeps the source's net bit for bit,
         // so each side of the face is the source's side whatever the sides before it grew:
         // what a side is (closed, collapsed, unbounded, round an axis) is decided there, on
@@ -230,14 +252,36 @@ impl Surface {
         let mut on = BoxSide::ALL;
         let mut sides = [SideExtension::NotAsked; 4];
         let (mut source, mut extension) = (0.0_f64, 0.0_f64);
+        // a revolution of one circle arc: its sides round the axis as a torus's, first (its
+        // net, parameters and sides kept, so `on` stays), each measured there in closed form
+        let mut turned = [false; 4];
+        if let Some(t) = super::analytic::revolution_turned_on(k, self, asked, distance)? {
+            for ((done, turned), &by) in sides.iter_mut().zip(&mut turned).zip(&t.sides) {
+                if by != SideExtension::NotAsked {
+                    (*done, *turned) = (by, true);
+                }
+            }
+            if t.sides
+                .iter()
+                .any(|s| matches!(s, SideExtension::Extended(_) | SideExtension::UpToLimit(_)))
+            {
+                extension = t.extension;
+                current = Some(t.surface);
+            }
+        }
         for ((&source_side, done), at) in BoxSide::ALL.iter().zip(sides.iter_mut()).zip(0..) {
-            if !asked.contains(&source_side) {
+            if !asked.contains(&source_side) || turned.get(at) == Some(&true) {
                 continue;
             }
             let side = *on.get(at).ok_or_else(|| {
-                SolidError::surface_failed(OP, "the side has no counterpart on the surface")
+                SolidError::surface(
+                    OP,
+                    SurfaceFailure::Defect {
+                        why: "a side of the source's box has no counterpart on the result, though the counterparts are one per side, four, and the loop counts the four sides",
+                    },
+                )
             })?;
-            let surface = current.as_ref().map_or(self, |e| &e.surface);
+            let surface = current.as_ref().unwrap_or(self);
             let dom = surface.natural_uv_domain_with_nurb(k)?;
             let param = if source_side.is_u() {
                 SurfParamType::U
@@ -259,9 +303,10 @@ impl Surface {
                 *done = SideExtension::Unbounded;
                 continue;
             }
-            // a revolution's side round its axis is left; along it, its B-spline form row by
-            // row as asked, which is again a revolution (its rows are one generator turned
-            // and weighted, and every construction commutes with both)
+            // a revolution's side round its axis is left (but for one of a circle arc, above);
+            // along it, its B-spline form row by row as asked, which is again a revolution
+            // (its rows are one generator turned and weighted, and every construction
+            // commutes with both)
             if round_the_axis(own, source_side) == Some(true) {
                 *done = SideExtension::AroundAxis;
                 continue;
@@ -284,27 +329,24 @@ impl Surface {
             source += grown.source;
             extension = extension.max(grown.extension);
             *done = SideExtension::Extended(grown.across);
-            current = Some(grown);
+            current = Some(grown.surface);
         }
         // each side extended is measured again at the face: a side extended after another
         // was measured at the middle of the box the others grew, where the surface may be
         // far larger than at the face; one short of the distance at the face is not met (a
         // blend's net bounds no length of its definition: it keeps its own measure; an
-        // offset surface's is its base's)
+        // offset surface's is its base's; a side turned on as a torus's keeps its closed form)
         if let Some(e) = &current {
             // an offset surface is measured on its base, as its extension was
-            let mut measured = &e.surface;
+            let mut measured = e;
             while let SurfaceKind::OffsetSurface(o) = measured.kind() {
                 measured = o.base_surface();
             }
             if !matches!(measured.kind(), SurfaceKind::ProceduralBlend(_)) {
-                for (done, at) in sides.iter_mut().zip(0..) {
-                    if !matches!(done, SideExtension::Extended(_)) {
+                for ((done, &side), &turned) in sides.iter_mut().zip(on.iter()).zip(&turned) {
+                    if turned || !matches!(done, SideExtension::Extended(_)) {
                         continue;
                     }
-                    let side = *on.get(at).ok_or_else(|| {
-                        SolidError::surface_failed(OP, "the side has no counterpart on the surface")
-                    })?;
                     let across = measured.length_across_side(k, &face, side, super::REL)?;
                     if !across.converged
                         || across.enclosure.lower
@@ -322,8 +364,8 @@ impl Surface {
         }
         let surface = match current {
             // a Natural continuation of the net is still on an exact round's S (#2487)
-            Some(e) if how == Continuity::Natural => self.carry_round_on_continuation(e.surface),
-            Some(e) => e.surface,
+            Some(e) if how == Continuity::Natural => self.carry_round_on_continuation(e),
+            Some(e) => e,
             None => self.copy(k)?,
         };
         Ok(ExtendedSides {

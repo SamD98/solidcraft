@@ -13,6 +13,7 @@
 use solidcore::geom::extent2d::Extent2d;
 use solidcore::geom::tol::USE_DEFAULT;
 use solidcore::geom::vector2d::Point2;
+use solidcore::math::det;
 use solidcore::math::Point3;
 use solidcore::nurbs::b_spline_surface::{BSplineSurface, SurfParamType};
 use solidcore::primitive::api_primitives::{
@@ -93,15 +94,13 @@ fn exact_form(k: &mut Kernel, sheet: &Brep, net: (usize, usize)) {
     assert!(lines.is_empty(), "{lines:?}");
 }
 
-/// A kernel whose loop check compares a seam end projected from its vertex with its
-/// neighbour on the nearest period (`check_loop_projected_seam_ends`, WR-440, the fork's
-/// reference). A sheet made on a closed surface has no UV trims, so the check takes its seam
-/// ends from vertex projections, known only modulo the period; upstream's check reports the
-/// seam of a whole turn as a UV gap of one period (`wr_440_revolved_line_seam_check.rs`).
+/// The kernel the cases run on. Its loop check compares a seam end projected from its
+/// vertex with its neighbour on the nearest period (WR-440, the fork's reference). A sheet
+/// made on a closed surface has no UV trims, so the check takes its seam ends from vertex
+/// projections, known only modulo the period; upstream's check reports the seam of a whole
+/// turn as a UV gap of one period (`wr_440_revolved_line_seam_check.rs`).
 fn kernel() -> Kernel {
-    let mut k = Kernel::default();
-    k.fixes.check_loop_projected_seam_ends = true;
-    k
+    Kernel::default()
 }
 
 fn sheet_copy(k: &mut Kernel, b: &Brep) -> Brep {
@@ -115,7 +114,7 @@ fn a_cylinders_side_is_its_exact_form_with_one_seam_edge() {
     let side = curved_face(&b);
     let sheet = editable_sheet(&mut k, &b, side).unwrap().expect("a sheet");
     exact_form(&mut k, &sheet, (9, 2));
-    on_the_surface(&k, &sheet, |p| p.x.hypot(p.y) - 5.0);
+    on_the_surface(&k, &sheet, |p| det::hypot(p.x, p.y) - 5.0);
     // the seam and the two circles
     assert_eq!(seams(&sheet), 1);
     assert_eq!(sheet.edge_list().len(), 3);
@@ -129,7 +128,9 @@ fn a_cones_side_is_its_exact_form_with_one_seam_edge() {
     let sheet = editable_sheet(&mut k, &b, side).unwrap().expect("a sheet");
     exact_form(&mut k, &sheet, (9, 2));
     // r = 5 (1 - z / 10)
-    on_the_surface(&k, &sheet, |p| p.x.hypot(p.y) - 5.0 * (1.0 - p.z / 10.0));
+    on_the_surface(&k, &sheet, |p| {
+        det::hypot(p.x, p.y) - 5.0 * (1.0 - p.z / 10.0)
+    });
     assert_eq!(seams(&sheet), 1);
 }
 
@@ -140,7 +141,7 @@ fn a_sphere_is_its_exact_form_with_one_seam_edge() {
     let face = *b.face_list().first().unwrap();
     let sheet = editable_sheet(&mut k, &b, face).unwrap().expect("a sheet");
     exact_form(&mut k, &sheet, (9, 5));
-    on_the_surface(&k, &sheet, |p| p.x.hypot(p.y).hypot(p.z) - 5.0);
+    on_the_surface(&k, &sheet, |p| det::hypot(det::hypot(p.x, p.y), p.z) - 5.0);
     // the seam from pole to pole; the poles are points
     assert_eq!(seams(&sheet), 1);
     assert_eq!(sheet.edge_list().len(), 1);
@@ -153,7 +154,9 @@ fn a_torus_is_its_exact_form_with_its_two_seam_edges() {
     let face = *b.face_list().first().unwrap();
     let sheet = editable_sheet(&mut k, &b, face).unwrap().expect("a sheet");
     exact_form(&mut k, &sheet, (9, 9));
-    on_the_surface(&k, &sheet, |p| (p.x.hypot(p.y) - 10.0).hypot(p.z) - 3.0);
+    on_the_surface(&k, &sheet, |p| {
+        det::hypot(det::hypot(p.x, p.y) - 10.0, p.z) - 3.0
+    });
     assert_eq!(seams(&sheet), 2);
     assert_eq!(sheet.edge_list().len(), 2);
 }

@@ -20,7 +20,7 @@ fn schemas_and_the_key_check_agree() {
     assert_keys(input_schema_for::<AutoConstrainParams>(), &AUTO_KEYS);
     assert_keys(input_schema_for::<AutoConstrainDatumParams>(), &AUTO_KEYS);
     assert_keys(input_schema_for::<FinishAutoConstrainParams>(), &AUTO_KEYS);
-    assert_keys(input_schema_for::<ToggleDrivenParams>(), &["constraint", "driven", "sketch"]);
+    assert_keys(input_schema_for::<ToggleDrivenParams>(), &["constraint", "driven", "name", "sketch"]);
     // Snap Inference works in the sketch being edited: it reads no `sketch`.
     assert_keys(input_schema_for::<GlyphsParams>(), &["sketch"]);
     assert_keys(input_schema_for::<SnapParams>(), &["at", "from", "radius"]);
@@ -312,7 +312,7 @@ fn replies_match_the_output_schema() {
     matches(output_schema_for::<GlyphsResult>(), &g);
     assert!(g["glyphs"].as_array().is_some_and(|l| l.len() > 5) && g["glyphs"][0]["at"].is_array(), "{g}");
     assert_eq!(keys(&g["glyphs"][0]), vec!["at", "dimension", "driven", "failing", "id", "name", "param", "redundant", "value"], "{g}");
-    assert_eq!(keys(&g), vec!["conflicts", "dof", "fully_constrained", "glyphs", "sketch"], "{g}");
+    assert_eq!(keys(&g), vec!["conflicts", "dof", "fully_constrained", "glyphs", "planar_dof", "sketch"], "{g}");
     let g = run(&mut s, "sketch.glyphs", json!({"sketch": sketch}));
     matches(output_schema_for::<GlyphsResult>(), &g);
     for p in [

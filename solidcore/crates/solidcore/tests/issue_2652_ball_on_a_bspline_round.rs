@@ -29,6 +29,10 @@
     clippy::panic,
     clippy::indexing_slicing
 )] // test helpers
+use solidcore::math::det;
+
+#[path = "support/solidcraft_fixes.rs"]
+mod solidcraft_fixes;
 
 use solidcore::blend::fillet_executive::api::{create_face_from_surface, fillet_edges};
 use solidcore::blend::fillet_executive::{FitKind, NoRoomReason};
@@ -36,7 +40,6 @@ use solidcore::curve::curve::Curve;
 use solidcore::error::EntityRef;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::geom::tol;
-use solidcore::kernel::UpstreamFixes;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
 use solidcore::math::{Point2, Point3};
 use solidcore::nurbs::b_spline_curve::{BSplineCurve, BSplineCurveForm, CanonicalData, KnotType};
@@ -55,17 +58,10 @@ use solidcore::topology::brep::validation::{check_brep, CheckLevel};
 use solidcore::topology::{edge, vertex, EdgeId, FaceId};
 use solidcore::{Brep, Kernel, SolidError};
 
-/// SolidCraft's fix list (`tests/kernel_cases/fixes.json`).
+/// SolidCraft's fix list (`support/solidcraft_fixes.rs`).
 fn kernel() -> Kernel {
-    let names: Vec<String> = serde_json::from_str(include_str!("kernel_cases/fixes.json")).unwrap();
-    let mut f = UpstreamFixes::default();
-    for name in &names {
-        if let Some(flag) = f.flag_mut(name) {
-            *flag = true;
-        }
-    }
     Kernel {
-        fixes: f,
+        fixes: solidcraft_fixes::solidcraft_fixes(),
         ..Kernel::default()
     }
 }
@@ -332,8 +328,8 @@ fn a_ball_narrower_than_the_bspline_round_rolls_as_on_the_cylinder() {
     let r = reference(&mut kr);
     let (want, _) = round_top_at(&mut kr, r, 1.5).unwrap();
     let torus = |p: Point3| {
-        let rho = ((p.x - 8.0).powi(2) + (p.y - 8.0).powi(2)).sqrt();
-        (((rho - 0.5).powi(2) + (p.z + 1.5).powi(2)).sqrt() - 1.5).abs()
+        let rho = (det::powi(p.x - 8.0, 2) + det::powi(p.y - 8.0, 2)).sqrt();
+        ((det::powi(rho - 0.5, 2) + det::powi(p.z + 1.5, 2)).sqrt() - 1.5).abs()
     };
     let mut slack = 0.0_f64;
     let ids: Vec<FaceId> = b.faces().ids().collect();
@@ -696,6 +692,39 @@ fn a_twisted_side_round_is_its_walls_round_between_sections() {
     }
 }
 
+/// The twisted disc's top round at 1.10 (narrower than the side rounds it meets, which are
+/// only fitted): every edge of the result carries a stored tolerance at least its measured
+/// gap to its faces, and every vertex one whose half bounds its gap, so the level-2 check
+/// reports no edge-use gaps. Only the vertex/face gaps over the intersection tolerance that
+/// the side rounds' fit leaves remain (tangency-labs/solidcraft#13772).
+#[test]
+fn the_twisted_disc_s_top_round_keeps_tolerances_at_least_its_measured_gaps() {
+    let mut k = kernel();
+    let mut b = side_rounded_disc(&mut k, 2);
+    let top = top_edges(&b);
+    fillet_edges(&mut k, &mut b, &top, 1.10, 1, 1, 1.0).unwrap();
+    b.refresh_cached_topology();
+    for e in solidcore::topology::brep::p1::edges(&b, None).unwrap() {
+        let tol = edge::tolerance(&b, e).unwrap();
+        for eu in b.edge(e).unwrap().edgeuses.clone() {
+            if let Some(g) =
+                solidcore::topology::edgeuse::p1::max_edge_face_gap(&k, &mut b, eu, true).unwrap()
+            {
+                assert!(
+                    g.gap_3d <= tol,
+                    "edge {e:?}: tolerance {tol:e} under its gap {:e}",
+                    g.gap_3d
+                );
+            }
+        }
+    }
+    let lines = check_brep(&mut k, &mut b, CheckLevel::Level2)
+        .unwrap()
+        .lines();
+    let edge_use: Vec<_> = lines.iter().filter(|l| l.contains("SmEdgeuse")).collect();
+    assert!(edge_use.is_empty(), "edge-use gaps: {edge_use:#?}");
+}
+
 // ---- helpers (as `issue_2648_twisted_disc_top_round.rs`'s) -----------------------------
 
 /// The disc's radius, height and twist (degrees over the height).
@@ -704,7 +733,7 @@ const HEIGHT: f64 = 15.0;
 const TWIST: f64 = 30.0;
 
 fn rotate(p: Point3, a: f64) -> Point3 {
-    let (s, c) = a.sin_cos();
+    let (s, c) = det::sin_cos(a);
     Point3::new(c * p.x - s * p.y, s * p.x + c * p.y, p.z)
 }
 
@@ -735,8 +764,8 @@ fn profile(n: usize) -> Vec<Piece> {
         pieces.push(line(c, d));
         // the outer arc from this slot's right wall to the next slot's left wall (clockwise)
         let next = slots[(k + n - 1) % n][0];
-        let ad = d.y.atan2(d.x);
-        let an = next.y.atan2(next.x);
+        let ad = det::atan2(d.y, d.x);
+        let an = det::atan2(next.y, next.x);
         let mut an = an;
         while an > ad {
             an -= std::f64::consts::TAU;
@@ -896,8 +925,8 @@ fn arc(c: Point3, r: f64, a0: f64, a1: f64, start: Point3, end: Point3) -> Piece
         .ceil()
         .max(1.0) as usize;
     let d = (a1 - a0) / n as f64;
-    let w = (0.5 * d).cos();
-    let at = |a: f64, rr: f64| Point3::new(c.x + rr * a.cos(), c.y + rr * a.sin(), 0.0);
+    let w = det::cos(0.5 * d);
+    let at = |a: f64, rr: f64| Point3::new(c.x + rr * det::cos(a), c.y + rr * det::sin(a), 0.0);
     let mut points = vec![start];
     let mut weights = vec![1.0];
     let mut knots = vec![0.0];

@@ -25,6 +25,7 @@ use solidcore::boolean::api_brep::boolean_difference;
 use solidcore::curve::curve::Curve;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3};
 use solidcore::nurbs::b_spline_curve_n_lib::TrimMode;
 use solidcore::primitive::api_curves::create_line_segment;
@@ -38,7 +39,7 @@ use solidcore::{Brep, Kernel};
 
 /// The floor's side at z = 25.
 fn floor_side() -> f64 {
-    60.0 - 30.0 * 10f64.to_radians().tan()
+    60.0 - 30.0 * det::tan(10f64.to_radians())
 }
 
 /// The area one corner round takes from the floor's square (the issue's closed form).
@@ -109,9 +110,7 @@ fn rounded_pocket(k: &mut Kernel) -> Brep {
         .collect();
     let refs: Vec<Option<&Curve>> = square.iter().map(Some).collect();
     // the walls meet at corner edges (WR-521), as a drafted pocket's do
-    k.fixes.taper_tangent_corner_planes = true;
     let tool = create_taper_extrude(k, &refs, 20.0, -10.0, 3, false).unwrap();
-    k.fixes.taper_tangent_corner_planes = false;
     let mut pocketed = boolean_difference(k, block, tool).unwrap();
 
     // R3 on the rim edges (z = 40) and the slanted corner edges of the pocket

@@ -110,6 +110,7 @@ use crate::curve::curve::p2::Curve;
 use crate::curve::curve::p4::has_plane_crossings;
 use crate::curve::curve::p6::calculate_bounding_box_base;
 use crate::curve::line::Line;
+use crate::error::surface::SurfaceFailure;
 use crate::error::{ignored, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -124,6 +125,7 @@ use crate::geom::transform::Transform;
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::{Point3, Vec3};
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{
     max2, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_DEG, EFF_ZERO_RAD, EFF_ZERO_SQ, INFINITE_PARAMETER,
     UNDEF_DOUBLE,
@@ -133,7 +135,7 @@ use crate::nurbs::knots::Side;
 use crate::surface::plane::p1::Plane;
 use crate::surface::surface::p2::Surface;
 use crate::surface::volume::p1::{
-    concat_evals_opt_in, is_kind_of as volume_is_kind_of, EvalOptions, Volume, VolumeKind,
+    concat_evals, is_kind_of as volume_is_kind_of, EvalOptions, Volume, VolumeKind,
 };
 use crate::surface::volume::p2::ignore_read;
 use crate::topology::database_io::{DatabaseReader, DatabaseWriter, FileType};
@@ -359,7 +361,7 @@ impl UnbendVolume {
         let dr2 = du * du + dv * dv; // (u**2 + v**2)
         let dr1 = dr2.sqrt(); // (u**2 + v**2)**(1/2)
 
-        let datan = dv.atan2(du);
+        let datan = det::atan2(dv, du);
 
         let mid = volume.unbend_mid_dir();
         let bin = volume.unbend_binormal();
@@ -451,12 +453,7 @@ impl UnbendVolume {
                 };
                 let next_derivs = next.map(position, n, &map_opts)?;
                 // Concatenate Evaluate(ParamPoint) = Next(Mid(ParamPoint))
-                concat_evals_opt_in(
-                    n,
-                    &d,
-                    &next_derivs,
-                    opts.fixes.volume_lift_third_derivative_terms,
-                )
+                concat_evals(n, &d, &next_derivs)
             }
             _ => Ok(d),
         }
@@ -489,7 +486,7 @@ impl UnbendVolume {
         let dr2 = du * du + dv * dv; // (u**2 + v**2)
         let dr1 = dr2.sqrt(); // (u**2 + v**2)**(1/2)
 
-        let datan = dv.atan2(du);
+        let datan = det::atan2(dv, du);
 
         // init output array
         let mut d = vec![Vec3::ZERO; eval_size(n)];
@@ -742,8 +739,8 @@ impl UnbendVolume {
         let theta = proj_point.y / dd;
 
         // the inverse map from ProjSpace to ParamSpace
-        let du = dr * theta.cos();
-        let dv = dr * theta.sin();
+        let du = dr * det::cos(theta);
+        let dv = dr * det::sin(theta);
         let dw = proj_point.z;
         Vec3::new(du, dv, dw)
     }
@@ -773,17 +770,21 @@ impl UnbendVolume {
 
         // check - crProjPoint must be in a valid domain
         if !volume.is_point_in_param_domain(proj_point, true)? {
-            return Err(SolidError::surface_failed(
+            return Err(SolidError::surface(
                 OP_GLOBAL,
-                "the point is outside the volume's parameter domain",
+                SurfaceFailure::PointOutsideVolumeDomain {
+                    point: [proj_point.x, proj_point.y, proj_point.z],
+                },
             ));
         }
 
         // check - crProjPoint must be in OptParamDomain
         if param_domain.is_some_and(|d| !d.contains_point(proj_point, EFF_ZERO)) {
-            return Err(SolidError::surface_failed(
+            return Err(SolidError::surface(
                 OP_GLOBAL,
-                "the point is outside the given parameter domain",
+                SurfaceFailure::PointOutsideGivenDomain {
+                    point: [proj_point.x, proj_point.y, proj_point.z],
+                },
             ));
         }
 
@@ -1160,8 +1161,8 @@ impl UnbendVolume {
             // check orientation of surface (positive = SrfNormals pt in CCW direction about
             // UnbendAxis
             let inspace_ang_rad = mid_dir_ang_rad_range.mid();
-            positive = (inspace_ang_rad.cos() * input_binormal
-                - inspace_ang_rad.sin() * input_mid_dir)
+            positive = (det::cos(inspace_ang_rad) * input_binormal
+                - det::sin(inspace_ang_rad) * input_mid_dir)
                 .dot(input_surface_normal)
                 > 0.0;
 

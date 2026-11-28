@@ -1,4 +1,5 @@
 use super::*;
+use crate::browser_links::LinkState;
 use crate::scenario::{Harness, handle_at, rect_of};
 use crate::semantic_content::{self, ContentOwner, ContentRequest};
 use crate::ui_kit::{LayoutMode, SHELL_GAP};
@@ -42,6 +43,21 @@ fn clicked_browser_folders_toggle_visibility_with_v() {
             h.step(&json!({"click":{"handle":format!("row:{label}")}})).unwrap();
         }
     }
+}
+
+/// #14554: V on the Origin row of the Browser shows or hides the whole Origin, as it does for a folder.
+#[test]
+fn v_on_the_clicked_origin_row_hides_the_origin() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"operation":"new_body","body_name":"One"})).unwrap();
+    h.settle();
+    assert!(h.app.origin_shown());
+    h.step(&json!({"click":{"handle":"row:Origin"}})).unwrap();
+    h.step(&json!({"key":"V"})).unwrap();
+    assert!(!h.app.origin_shown(), "V hides the Origin picked in the Browser");
+    h.step(&json!({"key":"V"})).unwrap();
+    assert!(h.app.origin_shown(), "V shows it again");
 }
 
 /// #10526: New Group from the root's context menu in a design with no bodies yet makes a group
@@ -110,7 +126,7 @@ fn f2_on_a_clicked_browser_group_renames_the_group() {
 }
 
 /// #10654: a refused inline rename keeps the editor open and says why, instead of closing
-/// silently and leaving the old name.
+/// silently and leaving the old name; the name can then be corrected without a click.
 #[test]
 fn a_refused_inline_rename_keeps_the_editor_and_shows_the_error() {
     let mut h = Harness::new();
@@ -131,6 +147,36 @@ fn a_refused_inline_rename_keeps_the_editor_and_shows_the_error() {
     let (text, _, error) = h.app.status.clone().expect("the refusal is shown");
     assert!(error && text.contains("another body is called"), "{text}");
     assert!(h.app.session.world_state().unwrap().body("B").is_some(), "the body keeps its name");
+    h.step(&json!({"text":"C"})).unwrap();
+    h.step(&json!({"key":"Enter"})).unwrap();
+    h.frames(2);
+    assert!(h.app.session.world_state().unwrap().body("C").is_some(), "the name can be corrected at once; status {:?}", h.app.status);
+}
+
+/// A Browser group's inline editor keeps a refused name too, with the reason, and takes the
+/// corrected one.
+#[test]
+fn a_refused_inline_group_rename_keeps_the_editor() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"body_name":"A"})).unwrap();
+    let group = h.app.run("browser.group", json!({"folder":"bodies","items":["A"],"name":"Held"})).unwrap()["group"].as_u64().unwrap();
+    h.app.preferences.browser_bodies_folders = crate::prefs::BodiesFolders::Always;
+    h.settle();
+    h.step(&json!({"click":{"handle":"row:Held (1)"}})).unwrap();
+    h.frames(30);
+    h.step(&json!({"click":{"handle":"row:Held (1)"}})).unwrap();
+    h.frames(30);
+    assert!(h.app.menu.rename.as_ref().is_some_and(|r| r.inline), "the group's row is being renamed");
+    h.step(&json!({"text":"x".repeat(200)})).unwrap();
+    h.step(&json!({"key":"Enter"})).unwrap();
+    h.frames(2);
+    assert!(h.app.menu.rename.is_some(), "the editor stays open after a refused rename");
+    let (text, _, error) = h.app.status.clone().expect("the refusal is shown");
+    assert!(error && text.contains("1…128 characters"), "{text}");
+    h.step(&json!({"text":"Kept"})).unwrap();
+    h.step(&json!({"key":"Enter"})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.session.doc.browser_group(group).map(|g| g.name.as_str()), Some("Kept"));
 }
 
 /// Renaming a component to a name another component has takes the next free number; a name
@@ -151,6 +197,7 @@ fn a_component_renamed_to_a_taken_name_takes_the_next_number() {
             focused: false,
             inline: true,
             inline_id: None,
+            session: h.app.session.uid,
         };
         crate::context_menu::commit_rename(&mut h.app, &r).unwrap();
     };
@@ -434,6 +481,39 @@ fn browser_card_shrinks_and_scrolls_without_covering_history() {
     h.app.tree.collapsed.insert("c0".into());
     h.settle();
     assert!(rect_of("browser:card").unwrap().height() < short.height());
+}
+
+/// In the compact layout, a Browser holding the History fills the window's height; the floating layout,
+/// a folded Browser and a Browser beside a bottom History still hug their rows (#14566).
+#[test]
+fn compact_browser_holding_the_history_fills_the_window_height() {
+    let mut h = Harness::new();
+    h.call("ui.resize", json!({"width":1400,"height":900}));
+    h.app.run("view.history_layout", json!({"dock":"browser"})).unwrap();
+    h.settle();
+    assert!(h.app.preferences.history_in_browser);
+    let floating = rect_of("browser:card").unwrap();
+    let viewport = h.app.viewport.rect.unwrap();
+    assert!(floating.bottom() < viewport.bottom() - 100.0, "the floating card still hugs its rows: {floating:?} in {viewport:?}");
+
+    h.call("ui.set", json!({"layout":"docked"}));
+    h.settle();
+    let compact = rect_of("browser:card").unwrap();
+    assert!(compact.height() > floating.height() + 100.0, "{compact:?} {floating:?}");
+    let foot = viewport.bottom() - compact.bottom();
+    assert!((-0.5..=SHELL_GAP + 0.5).contains(&foot), "{compact:?} reaches the window's foot {viewport:?}");
+
+    set_browser_collapsed(&mut h, true);
+    h.settle();
+    let folded = rect_of("browser:card").unwrap();
+    assert!(folded.height() < floating.height(), "a folded Browser keeps only its header: {folded:?}");
+    set_browser_collapsed(&mut h, false);
+    h.settle();
+    assert_eq!(rect_of("browser:card").unwrap(), compact, "unfolded, it fills the column again");
+
+    h.app.run("view.history_layout", json!({"dock":"bottom"})).unwrap();
+    h.settle();
+    assert!(rect_of("browser:card").unwrap().height() < compact.height() - 100.0, "History at the bottom: the Browser hugs its rows again");
 }
 
 #[test]
@@ -1489,16 +1569,12 @@ fn browser_editors_have_one_app_owned_host_when_both_presentations_are_hidden() 
     let (mut h, _, occurrence) = crate::test_support::component_box();
     h.app.ui.show_browser = false;
     h.app.ui.show_timeline = false;
-    h.app.tree.occurrence_move = Some(OccMove::new(occurrence));
+    h.app.run("occurrence.move", json!({"occurrence": occurrence, "translate": [10, 0, 0], "capture": false})).unwrap();
+    h.app.start("sketch.create");
     h.frames(4);
     assert!(drawn_rows().is_empty());
-    let fields = crate::scenario::handles("occurrence-move:distance:0");
-    assert_eq!(
-        fields.iter().filter(|(name, _)| name == "occurrence-move:distance:0").count(),
-        1,
-        "the editor is hosted once despite both panels being hidden"
-    );
-    assert!(h.app.tree.occurrence_move.as_ref().unwrap().baseline.is_some());
+    assert_eq!(h.app.tree.capture_prompt.as_deref(), Some("sketch.create"));
+    assert!(h.widget("Capture Position").is_some(), "the Capture Position question is hosted despite both panels being hidden");
 }
 
 #[test]
@@ -1901,6 +1977,7 @@ fn reveal_browser_at_height(h: &mut Harness, height: f32) {
 fn assert_no_pending_reveals(h: &Harness) {
     assert!(h.app.tree.reveal.is_none());
     assert!(h.app.tree.reveal_source.is_none());
+    assert!(h.app.tree.reveal_occurrence.is_none());
     assert!(h.app.tree.reveal_feature.is_none());
     assert!(h.app.tree.timeline_reveal.is_none());
     assert!(h.app.tree.view_pick.is_none());
@@ -2100,7 +2177,7 @@ fn unpresented_app_requests_have_provenance_before_a_direct_session_replacement(
     let mut h = Harness::new();
     three_bodies(&mut h);
     let document = (*h.app.session.doc).clone();
-    h.app = crate::SolveApp::new(solidcraft_engine::Session::new(document.clone()), crate::Services::default());
+    *h.app = crate::SolveApp::new(solidcraft_engine::Session::new(document.clone()), crate::Services::default());
     // Existing callers can set the public request fields before the first UI frame.
     h.app.tree.reveal = Some("Three".into());
     h.app.tree.timeline_reveal = Some(document.features[2].id);
@@ -2169,4 +2246,275 @@ fn the_browser_lists_one_body_per_placement() {
     let rows = drawn_rows();
     let body_rows = rows.iter().filter(|(label, ..)| label == "Body1").count();
     assert_eq!(body_rows, 2, "a body row per placement: {rows:?}");
+}
+
+/// Frames until the link badges' answer is back.
+fn link_answer(h: &mut Harness) {
+    h.frames(1);
+    for _ in 0..2000 {
+        if !h.app.tree.links.busy() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.frames(1);
+    }
+    h.frames(1);
+    assert!(!h.app.tree.links.busy(), "the answer never came");
+}
+
+/// #14024: a linked component's row says which file it comes from and how that file is, asked
+/// beside the window: once for a design, and again when the window comes back to the front.
+#[test]
+fn a_linked_components_row_shows_the_state_of_its_file() {
+    fn back_to_the_front(h: &mut Harness) {
+        h.app.synthetic.push(egui::Event::WindowFocused(true));
+        link_answer(h);
+    }
+    let mut h = Harness::new();
+    h.frames(2);
+    assert!(!h.app.tree.links.busy(), "nothing is asked without a link");
+    let part = h.dir.join("part.solidcraft");
+    let mut source = solidcraft_engine::Session::default();
+    source.execute("solid.box", &json!({"length": 10, "width": 20, "height": 30})).unwrap();
+    source.execute("file.save", &json!({"path": part})).unwrap();
+    let component = h.app.run("component.insert_design", json!({"path": part})).unwrap()["component"].as_u64().unwrap();
+    // The frame asks, whichever layout paints the Browser, or none.
+    let ctx = h.ctx.clone();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| h.app.logic(ui.ctx()));
+    assert!(h.app.tree.links.busy(), "asked without painting the Browser");
+    link_answer(&mut h);
+
+    let link = h.app.tree.links.get(component).expect("the link's badge").clone();
+    assert_eq!((link.state, link.note), (LinkState::Linked, None));
+    assert!(link.tooltip().contains("part.solidcraft"), "{}", link.tooltip());
+    assert_eq!(link.icon_badge().glyph, "link");
+    h.frames(5);
+    assert!(!h.app.tree.links.busy(), "the files are not read again every frame");
+
+    source.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5})).unwrap();
+    source.execute("file.save", &json!({"path": part})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.tree.links.get(component).unwrap().note, None, "not looked at until the window returns");
+    back_to_the_front(&mut h);
+    let changed = h.app.tree.links.get(component).unwrap();
+    assert_eq!((changed.state, changed.note), (LinkState::Changed, Some("ui.link_changed")));
+
+    std::fs::remove_file(&part).unwrap();
+    back_to_the_front(&mut h);
+    let missing = h.app.tree.links.get(component).unwrap();
+    assert_eq!((missing.state, missing.note), (LinkState::Missing, Some("ui.link_missing")));
+    assert_eq!(missing.icon_badge().glyph, "link_broken", "a file that is not there breaks the chain");
+
+    // A file that was not looked at may be fine: an outlined badge, and the note says why.
+    let not_allowed = json!({"component": 7, "file": "//server/share/a.solidcraft", "found": null, "host": "server", "reason": "not allowed"});
+    let (id, network) = crate::browser_links::badge_of(&not_allowed).unwrap();
+    assert_eq!((id, network.state, network.note), (7, LinkState::Unchecked, Some("ui.link_not_checked_network")));
+    let device = json!({"component": 8, "file": "CON", "found": null, "reason": "names a device, not a file"});
+    let (_, device) = crate::browser_links::badge_of(&device).unwrap();
+    assert_eq!((device.state, device.note), (LinkState::Unchecked, Some("ui.link_not_checked")));
+    assert!(device.icon_badge().outlined, "an unchecked state says nothing, so it is only outlined");
+
+    h.app.run("component.break_link", json!({"component": component})).unwrap();
+    h.frames(2);
+    assert!(h.app.tree.links.get(component).is_none(), "a design with no links shows no badge");
+}
+
+/// A KiCad board's link, which names no importer plugin, gets the same badges as any other: the
+/// badge is only looked at again when the window returns to the front, like every link's.
+#[test]
+fn a_changed_kicad_boards_link_gets_the_changed_badge() {
+    let mut h = Harness::new();
+    h.frames(2);
+    let board = h.dir.join("board.kicad_pcb");
+    let write = |width: &str| {
+        std::fs::write(&board, format!("(kicad_pcb (general (thickness 1.6)) (gr_rect (start 0 0) (end {width} 10) (layer \"Edge.Cuts\")))"))
+            .unwrap();
+    };
+    write("20");
+    let component = h.app.run("doc.open", json!({"path": board})).unwrap()["component"].as_u64().unwrap();
+    let ctx = h.ctx.clone();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| h.app.logic(ui.ctx()));
+    link_answer(&mut h);
+    let badge = h.app.tree.links.get(component).expect("the board's badge");
+    assert_eq!((badge.state, badge.note), (LinkState::Linked, None));
+
+    write("30.5");
+    h.frames(2);
+    assert_eq!(h.app.tree.links.get(component).unwrap().note, None, "not looked at until the window returns");
+    h.app.synthetic.push(egui::Event::WindowFocused(true));
+    link_answer(&mut h);
+    let changed = h.app.tree.links.get(component).unwrap();
+    assert_eq!((changed.state, changed.note), (LinkState::Changed, Some("ui.link_changed")));
+}
+
+/// A design opened from its file reads its link next to that file, and asks once.
+#[test]
+fn a_saved_designs_linked_component_shows_its_badge() {
+    let mut h = Harness::new();
+    let part = h.dir.join("part.solidcraft");
+    let mut source = solidcraft_engine::Session::default();
+    source.execute("solid.box", &json!({"length": 10, "width": 20, "height": 30})).unwrap();
+    source.execute("file.save", &json!({"path": part})).unwrap();
+    let component = h.app.run("component.insert_design", json!({"path": part})).unwrap()["component"].as_u64().unwrap();
+    let host = h.dir.join("host.solidcraft");
+    h.app.run("file.save", json!({"path": host})).unwrap();
+    h.app.run("doc.open", json!({"path": host})).unwrap();
+    assert_eq!(h.app.session.design().links[&component].path, "part.solidcraft", "the file keeps the link relative");
+
+    link_answer(&mut h);
+    let link = h.app.tree.links.get(component).expect("the link's badge");
+    assert_eq!((link.state, link.note), (LinkState::Linked, None));
+    h.frames(5);
+    assert!(!h.app.tree.links.busy(), "one answer, no asking again every frame");
+}
+
+/// The option is a ticked or unticked row in the View section of the Browser panel's ⋯ menu,
+/// and a click on the row turns the saved setting over.
+#[test]
+fn the_hide_folder_options_are_rows_of_the_browser_menu() {
+    let mut h = Harness::new();
+    assert!(!h.app.preferences.browser_hide_sketches_folder, "off by default");
+    assert!(
+        crate::browser::menu_toggles(&h.app).contains(&("hide-sketches-folder", "prefs.browser_hide_sketches_folder", false)),
+        "a row of the menu, unticked"
+    );
+    crate::browser::menu_action(&mut h.app, "hide-sketches-folder").unwrap();
+    assert!(h.app.preferences.browser_hide_sketches_folder, "a click turns it on");
+    assert!(crate::browser::menu_toggles(&h.app).contains(&("hide-sketches-folder", "prefs.browser_hide_sketches_folder", true)), "ticked");
+    crate::browser::menu_action(&mut h.app, "hide-sketches-folder").unwrap();
+    assert!(!h.app.preferences.browser_hide_sketches_folder, "a second click turns it off");
+    assert!(!h.app.preferences.browser_hide_construction_folder, "off by default");
+    assert!(
+        crate::browser::menu_toggles(&h.app).contains(&("hide-construction-folder", "prefs.browser_hide_construction_folder", false)),
+        "a row of the menu, unticked"
+    );
+    crate::browser::menu_action(&mut h.app, "hide-construction-folder").unwrap();
+    assert!(h.app.preferences.browser_hide_construction_folder, "a click turns it on");
+    assert!(crate::browser::menu_toggles(&h.app).contains(&("hide-construction-folder", "prefs.browser_hide_construction_folder", true)), "ticked");
+    crate::browser::menu_action(&mut h.app, "hide-construction-folder").unwrap();
+    assert!(!h.app.preferences.browser_hide_construction_folder, "a second click turns it off");
+}
+
+/// "Hide the Sketches folder": the History lists the sketches, so the Browser leaves its Sketches
+/// folder out, except while searching.
+#[test]
+fn the_sketches_folder_hides_when_the_preference_is_on() {
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY", "name":"Outline"})).unwrap();
+    h.app.run("sketch.circle.center", json!({"center":[0,0],"radius":5})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.settle();
+    assert!(handle_at("row:Sketches").is_some(), "off by default: the folder is there");
+    h.app.preferences.browser_hide_sketches_folder = true;
+    h.settle();
+    assert!(handle_at("row:Sketches").is_none(), "on: no Sketches folder");
+    assert!(handle_at("row:Bodies").is_some() || handle_at("row:Origin").is_some(), "the rest of the tree still draws");
+    h.app.tree.search.show();
+    h.app.tree.search.text = "Outline".to_string();
+    h.frames(2);
+    assert!(handle_at("row:Sketches").is_some(), "a search still finds sketches in their folder");
+}
+
+/// "Hide the Construction folder": the History lists the construction planes, axes and points, so
+/// the Browser leaves its Construction folder out, except while searching.
+#[test]
+fn the_construction_folder_hides_when_the_preference_is_on() {
+    let mut h = Harness::new();
+    h.app.run("construct.plane.offset", json!({"base":"XY","offset":20,"name":"Lid plane"})).unwrap();
+    h.settle();
+    assert!(handle_at("row:Construction").is_some(), "off by default: the folder is there");
+    h.app.preferences.browser_hide_construction_folder = true;
+    h.settle();
+    assert!(handle_at("row:Construction").is_none(), "on: no Construction folder");
+    h.app.tree.search.show();
+    h.app.tree.search.text = "Lid plane".to_string();
+    h.frames(2);
+    assert!(handle_at("row:Construction").is_some(), "a search still finds the plane in its folder");
+}
+
+/// With the Construction folder hidden, Find in Browser on a plane goes to its History row instead
+/// of waiting for a folder that is not drawn, with the History in the Browser or in its own panel;
+/// and a Construction folder hidden by its own eye stays listed, so that eye can show its planes again.
+#[test]
+fn a_hidden_construction_folder_leaves_find_and_its_eye_working() {
+    let mut h = Harness::new();
+    let plane = h.app.run("construct.plane.offset", json!({"base":"XY","offset":20,"name":"Lid plane"})).unwrap()["feature"].as_u64().unwrap();
+    h.app.preferences.browser_hide_construction_folder = true;
+    for dock in ["left", "browser"] {
+        h.app.run("view.history_layout", json!({ "dock": dock })).unwrap();
+        h.settle();
+        reveal_construction(&mut h.app, plane);
+        assert!(h.app.tree.reveal_construction.is_none(), "{dock}: no request left waiting for the hidden folder");
+        h.frames(8);
+        assert!(h.app.tree.reveal_feature.is_none(), "{dock}: the plane's History row in the Browser was reached");
+        assert!(h.app.tree.timeline_reveal.is_none(), "{dock}: the plane's History row was reached");
+    }
+
+    h.app.run("browser.visibility", json!({"tree_folders": ["c0/construction"], "visible": false})).unwrap();
+    h.settle();
+    assert!(handle_at("row:Construction").is_some(), "hidden by its eye, the folder stays listed");
+    h.app.run("browser.visibility", json!({"tree_folders": ["c0/construction"], "visible": true})).unwrap();
+    h.settle();
+    assert!(handle_at("row:Construction").is_none(), "shown again, the option hides it");
+}
+
+/// The option is a ticked or unticked row in the View section of the Browser panel's ⋯ menu,
+/// and a click on the row turns the saved setting over.
+#[test]
+fn the_fold_option_is_a_row_of_the_browser_menu() {
+    let mut h = Harness::new();
+    assert!(!h.app.preferences.browser_fold_other_components, "off by default");
+    assert!(
+        crate::browser::menu_toggles(&h.app).contains(&("fold-other-components", "prefs.browser_fold_other_components", false)),
+        "a row of the menu, unticked"
+    );
+    crate::browser::menu_action(&mut h.app, "fold-other-components").unwrap();
+    assert!(h.app.preferences.browser_fold_other_components, "a click turns it on");
+    assert!(crate::browser::menu_toggles(&h.app).contains(&("fold-other-components", "prefs.browser_fold_other_components", true)), "ticked");
+    crate::browser::menu_action(&mut h.app, "fold-other-components").unwrap();
+    assert!(!h.app.preferences.browser_fold_other_components, "a second click turns it off");
+}
+
+/// "Fold other components on activate": activating one component folds every other placement's
+/// row and opens the active one's; off, activating leaves the rows as they are.
+#[test]
+fn activating_a_component_folds_the_others_when_the_preference_is_on() {
+    let mut h = Harness::new();
+    let made = |h: &mut Harness, name: &str, x: f64| {
+        let reply = h.app.run("component.create", json!({"name": name})).unwrap();
+        h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"corner":[x,0,0],"body_name":name})).unwrap();
+        h.app.run("component.activate", json!({"component":0})).unwrap();
+        (reply["component"].as_u64().unwrap(), reply["occurrence"].as_u64().unwrap())
+    };
+    let (a, a_at) = made(&mut h, "A", 0.0);
+    let (b, b_at) = made(&mut h, "B", 20.0);
+    let (a_key, b_key) = (occurrence_key(&[a_at]), occurrence_key(&[b_at]));
+    let open_both = |h: &mut Harness| {
+        h.app.tree.open_row(&a_key);
+        h.app.tree.open_row(&b_key);
+        h.settle();
+        assert!(fold_open(&h.app, &a_key, true) && fold_open(&h.app, &b_key, true));
+    };
+    open_both(&mut h);
+    h.app.run("component.activate", json!({"component":a})).unwrap();
+    h.settle();
+    assert!(fold_open(&h.app, &a_key, true) && fold_open(&h.app, &b_key, true), "off by default: the rows stay as they were");
+
+    h.app.preferences.browser_fold_other_components = true;
+    h.app.run("component.activate", json!({"component":b})).unwrap();
+    h.settle();
+    assert!(!fold_open(&h.app, &a_key, true), "the component left folds");
+    assert!(fold_open(&h.app, &b_key, true), "the active one stays open");
+    h.app.run("component.activate", json!({"component":a})).unwrap();
+    h.settle();
+    assert!(fold_open(&h.app, &a_key, true) && !fold_open(&h.app, &b_key, true), "activating opens the one made active");
+    // The design itself active: every placement folds.
+    open_both(&mut h);
+    h.app.run("component.activate", json!({"component":0})).unwrap();
+    h.settle();
+    assert!(!fold_open(&h.app, &a_key, true) && !fold_open(&h.app, &b_key, true));
+    // A row opened by hand afterwards stays open until the next activation.
+    open_both(&mut h);
+    h.frames(3);
+    assert!(fold_open(&h.app, &a_key, true) && fold_open(&h.app, &b_key, true));
 }

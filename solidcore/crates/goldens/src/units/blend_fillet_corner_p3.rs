@@ -37,7 +37,8 @@
 //! make upstream dereference null or free the harness's objects. To tell a default patch
 //! that reaches `MakeFaceBrep` from one that returns a status before it, the shim runs
 //! `MakeAnalyticCornerSurface`'s fits and the Coons patch's `CreateCornerBlend` on
-//! copies first. Its `SER` / `NER` exits (read as `TRUE`) add no surface, so the
+//! copies first. Its `SER` / `NER` exits (upstream reads them as `TRUE`; the port as
+//! `FALSE`, so it builds the Coons patch, WR-254) add no surface, so upstream's
 //! `MakeFaceBrep` after them copies the edges' curves only when the corner already had one
 //! surface (a planar corner's exit leaves the edge it was recomputing without a curve).
 //! Every refused case was checked by running the C++ natively with the pre-check bypassed,
@@ -83,6 +84,7 @@ use crate::cases::blend;
 use crate::runner::default_cases;
 use crate::util::flag;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// The corner operation run by [`corner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1293,7 +1295,7 @@ fn gen_solver(rng: &mut Rng, linear: bool) -> SolverIn {
         1 => 1e-5,
         2 => 1e-6,
         3 => 0.0,
-        _ => 10f64.powf(rng.uniform(-9.0, -1.0)),
+        _ => det::powf(10f64, rng.uniform(-9.0, -1.0)),
     };
     let tang = match rng.below(5) {
         0 => 0.01,
@@ -1683,7 +1685,7 @@ fn gen_corner_model(rng: &mut Rng) -> Inputs {
         1 => 1e-6 * scale,
         2 => 0.0,
         3 => 1e-12,
-        _ => scale * 10f64.powf(rng.uniform(-9.0, -2.0)),
+        _ => scale * det::powf(10f64, rng.uniform(-9.0, -2.0)),
     };
     let tan = rng.uniform(1e-4, 0.2);
     let op = *rng
@@ -1985,6 +1987,25 @@ mod tests {
             let c = gen_create(&mut rng);
             let v = serde_json::to_value(&c).unwrap();
             let _: Inputs = serde_json::from_value(v).unwrap();
+        }
+    }
+
+    /// The eight cases whose status went from 0 to 1006 when a failing analytic corner
+    /// exit started to read as `FALSE` (WR-254): each corner has an edge with no 3D curve
+    /// in its input model, so no Coons patch can be bounded there.
+    #[test]
+    fn analytic_exit_cases_have_a_curveless_corner_edge() {
+        for idx in [60usize, 89, 104, 145, 170, 189, 282, 326] {
+            let seed = CaseContext::seed_for("blend.fillet_corner_p3", idx);
+            let v = Runner.generate(&mut Rng::new(seed)).unwrap();
+            let i: Inputs = serde_json::from_value(v).unwrap();
+            let Inputs::Corner { model, corner, .. } = &i else {
+                panic!("gen{idx:04} is not a corner case");
+            };
+            assert!(
+                corner.edges.iter().any(|&e| model.edges[e].curve.is_none()),
+                "gen{idx:04}: every corner edge has a curve"
+            );
         }
     }
 }

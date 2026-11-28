@@ -29,7 +29,7 @@
 //! | [`BSplineSurface::number_natural_knots`]          | `GetNumberNaturalKnots`                          |
 //! | [`BSplineSurface::number_control_points`]         | `GetNumberControlPoints`                         |
 //! | [`BSplineSurface::is_degenerate_curve`]           | `IsDegenerateCurve`                              |
-//! | [`BSplineSurface::is_parallel_to_vector`], [`BSplineSurface::is_parallel_to_vector_opt_in`], [`BSplineSurface::is_parallel_to_vector_with_kernel`] | `IsParallelToVector` |
+//! | [`BSplineSurface::is_parallel_to_vector`]         | `IsParallelToVector`                             |
 //! | [`BSplineSurface::is_rational`]                   | `IsRational`                                     |
 //! | [`BSplineSurface::greville_abscissa`]             | `GetGrevilleAbscissa`                            |
 //! | [`BSplineSurface::degree`]                        | `GetDegree`                                      |
@@ -99,15 +99,10 @@
 //!   row (u index slowest).
 //! - **`IsParallelToVector`** returns its `SER(sTestVec.Unitize())` status
 //!   (`SM_ERR_INVALID_INPUT`, nonzero) as the boolean for a zero vector, so upstream
-//!   callers see `TRUE`; the port returns `Ok(true)` there by default. Its line
-//!   distance test passes the second line point as the *direction* of the line
+//!   callers see `TRUE`; the port returns `Ok(false)`. Its line distance test passes
+//!   the second line point as the *direction* of the line
 //!   (`smgu_LinePointDistance(LinePnt, LineEnd, Pnt, ..)` binds the `SmVector3d`
-//!   overload); the port keeps that by default, with an opt-in fix
-//!   `Kernel::fixes.surface_parallel_to_vector_checks` (WR-39, #2145) via
-//!   [`BSplineSurface::is_parallel_to_vector_opt_in`] and
-//!   [`BSplineSurface::is_parallel_to_vector_with_kernel`] that returns `Ok(false)` for
-//!   a zero vector and passes the unitised chord direction `line_vec` instead of
-//!   `line_end`.
+//!   overload); the port passes the unitised chord direction `line_vec` (WR-39, #2145).
 //! - **`CreateLinearSweep`** extrudes the curve's own NURB, which NLib makes 3D in
 //!   place for a 2D curve (upstream casts away `const`); the port takes the curve
 //!   mutably for that reason.
@@ -132,10 +127,11 @@
 //!   wrapped as a `Surface` (without owner).
 
 use crate::error::nurbs::BSplineFailure;
+use crate::surface::surface_point_solve::cell_index::CellIndex;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::error::{Result, SolidError};
+use crate::error::{Result, SolidError, SM_ERR_NULL_POINTER};
 use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -433,6 +429,13 @@ pub struct BSplineSurface {
     /// as upstream's `SmTemporaryChangeValue` does on a `const` one (no copy of the
     /// surface).
     pub(crate) out_of_bounds_enabled: AtomicBool,
+    /// Not upstream (#16735; adapted from #15946 by @bherbruck): within the mass
+    /// integration's scope alone, the face integration's evaluation
+    /// ([`BSplineSurface::evaluate_simple_first_into`]) continues past the natural domain
+    /// instead of clamping, as upstream's `EvaluateSimple` clamps whatever
+    /// `m_bOutOfBoundsEnabled` says. Interior-mutable as that flag is; never copied (a
+    /// scope's, not the surface's); integrations of one surface must not overlap.
+    pub(crate) continues_past_domain: AtomicBool,
     /// `m_eKnotType`.
     pub(crate) knot_type: KnotType,
     /// `m_eBSplineSurfaceForm`.
@@ -456,12 +459,40 @@ pub struct BSplineSurface {
 /// too. Every `&mut` access detaches a shared cell first (copy on write), so an edit of
 /// one never reaches the other.
 #[derive(Debug, Default)]
-pub(crate) struct NurbSlot(Arc<OnceLock<Surface>>);
+pub(crate) struct NurbSlot(Arc<NurbData>);
+
+/// What a [`NurbSlot`] holds: the NURB and the cell index built from it (the index is
+/// not part of the NURB and an edit drops it).
+#[derive(Default)]
+pub(crate) struct NurbData {
+    value: OnceLock<Surface>,
+    cells: OnceLock<Option<Box<CellIndex>>>,
+}
+
+// Surface diagnostics describe the NURB itself, regardless of whether a query has built the index.
+impl std::fmt::Debug for NurbData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.value, f)
+    }
+}
+
+// A detached editing copy starts with an empty index.
+impl Clone for NurbData {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            cells: OnceLock::new(),
+        }
+    }
+}
+
+/// A [`NurbSlot`]'s cell, as a cache keeps it ([`NurbSlot::cell`]).
+pub(crate) type NurbCell = Arc<NurbData>;
 
 impl NurbSlot {
     /// No NURB (`NULL`).
     pub(crate) fn none() -> Self {
-        Self(Arc::new(OnceLock::new()))
+        Self::default()
     }
 
     /// The same cell (for an evaluation copy that stands for the same surface object).
@@ -469,29 +500,60 @@ impl NurbSlot {
         Self(Arc::clone(&self.0))
     }
 
+    /// Whether `cell` is this slot's own cell ([`NurbSlot::cell`]).
+    pub(crate) fn is_cell(&self, cell: &NurbCell) -> bool {
+        Arc::ptr_eq(&self.0, cell)
+    }
+
+    /// The cell itself, for a cache that keeps what was read from the NURB it holds: while
+    /// the cache holds it, every edit through a slot sharing it detaches first
+    /// ([`Arc::make_mut`]), so the NURB in the cell is never changed, only filled once.
+    pub(crate) fn cell(&self) -> NurbCell {
+        Arc::clone(&self.0)
+    }
+
     /// The NURB, if any.
     pub(crate) fn as_ref(&self) -> Option<&Surface> {
-        self.0.get()
+        self.0.value.get()
     }
 
     /// The NURB, mutable, if any (detaches a shared cell first).
     pub(crate) fn as_mut(&mut self) -> Option<&mut Surface> {
-        Arc::make_mut(&mut self.0).get_mut()
+        self.for_edit().value.get_mut()
+    }
+
+    fn for_edit(&mut self) -> &mut NurbData {
+        let data = Arc::make_mut(&mut self.0);
+        data.cells.take();
+        data
+    }
+
+    /// Bounds and spacing from this NURB only. Concurrent first readers may build
+    /// independently; both observe the same immutable net and share the stored result.
+    pub(crate) fn cell_index(
+        &self,
+        build: impl FnOnce() -> Result<Option<CellIndex>>,
+    ) -> Result<Option<&CellIndex>> {
+        if let Some(index) = self.0.cells.get() {
+            return Ok(index.as_deref());
+        }
+        let index = build()?.map(Box::new);
+        Ok(self.0.cells.get_or_init(|| index).as_deref())
     }
 
     /// Whether there is no NURB.
     pub(crate) fn is_none(&self) -> bool {
-        self.0.get().is_none()
+        self.0.value.get().is_none()
     }
 
     /// Whether there is a NURB.
     pub(crate) fn is_some(&self) -> bool {
-        self.0.get().is_some()
+        self.0.value.get().is_some()
     }
 
     /// Takes the NURB out, leaving none (detaches a shared cell first).
     pub(crate) fn take(&mut self) -> Option<Surface> {
-        Arc::make_mut(&mut self.0).take()
+        self.for_edit().value.take()
     }
 
     /// Detaches a shared cell, so that what is made through this surface from now on
@@ -503,13 +565,16 @@ impl NurbSlot {
     /// Stores `made` when there is no NURB yet (the first fill wins, as upstream's
     /// `GetOrCreateGwNurbPointer` makes once) and returns the stored NURB.
     pub(crate) fn fill(&self, made: Surface) -> &Surface {
-        self.0.get_or_init(|| made)
+        self.0.value.get_or_init(|| made)
     }
 }
 
 impl From<Option<Surface>> for NurbSlot {
     fn from(nurb: Option<Surface>) -> Self {
-        Self(Arc::new(nurb.map_or_else(OnceLock::new, OnceLock::from)))
+        Self(Arc::new(NurbData {
+            value: nurb.map_or_else(OnceLock::new, OnceLock::from),
+            cells: OnceLock::new(),
+        }))
     }
 }
 
@@ -756,6 +821,7 @@ impl BSplineSurface {
             nurb: NurbSlot::none(),
             nurb_is_borrowed: false,
             out_of_bounds_enabled: AtomicBool::new(false),
+            continues_past_domain: AtomicBool::new(false),
             knot_type: KnotType::Unspecified,
             form: BSplineSurfaceForm::Unspecified,
         }
@@ -861,6 +927,7 @@ impl BSplineSurface {
             out_of_bounds_enabled: AtomicBool::new(
                 self.out_of_bounds_enabled.load(Ordering::Relaxed),
             ),
+            continues_past_domain: AtomicBool::new(false),
             knot_type: self.knot_type,
             form: self.form,
         }
@@ -896,6 +963,7 @@ impl BSplineSurface {
             out_of_bounds_enabled: AtomicBool::new(
                 self.out_of_bounds_enabled.load(Ordering::Relaxed),
             ),
+            continues_past_domain: AtomicBool::new(false),
             knot_type: self.knot_type,
             form: self.form,
         }
@@ -924,28 +992,14 @@ impl BSplineSurface {
         self.nurb.as_ref()
     }
 
-    /// Certified boxes covering the whole surface, one per knot span
-    /// ([`crate::nurbs::nurbs_srf::srf_span_boxes`]); `None`, meaning no certified
-    /// cover, without a NURB, when the weights or knots cannot be read as a cover, or
-    /// while evaluation beyond the natural domain is enabled (the extension leaves the
-    /// convex hull). Not upstream.
+    /// A box that holds the surface over `uv_domain` alone: that of the control points of
+    /// the piece over it ([`crate::nurbs::nurbs_srf::srf_piece_box`]). `None` without a
+    /// NURB or when no such piece is certain (a weight not positive, knots not clamped,
+    /// `uv_domain` empty or outside the natural domain). Not upstream.
     #[must_use]
-    pub fn span_boxes(&self) -> Option<Vec<Extent3d>> {
-        if self.is_out_of_bounds_enabled() {
-            return None;
-        }
-        crate::nurbs::nurbs_srf::srf_span_boxes(self.gw_nurb()?)
-    }
-
-    /// The refinable certified cover ([`crate::nurbs::nurbs_srf::SurfaceCover`]), refined
-    /// `depth` times; `None` under the conditions of [`BSplineSurface::span_boxes`].
-    /// Not upstream.
-    #[must_use]
-    pub fn cover(&self, depth: usize) -> Option<crate::nurbs::nurbs_srf::SurfaceCover> {
-        if self.is_out_of_bounds_enabled() {
-            return None;
-        }
-        crate::nurbs::nurbs_srf::SurfaceCover::new(self.gw_nurb()?, depth)
+    pub fn piece_box(&self, uv_domain: &Extent2d) -> Option<Extent3d> {
+        let (lo, hi) = (uv_domain.min(), uv_domain.max());
+        crate::nurbs::nurbs_srf::srf_piece_box(self.gw_nurb()?, (lo.x, hi.x), (lo.y, hi.y))
     }
 
     /// The NURB, made first if missing (`GetOrCreateGwNurbPointer`).
@@ -1005,6 +1059,19 @@ impl BSplineSurface {
     /// `GetOutOfBoundsEnabled()` of a `const` surface).
     pub(crate) fn set_out_of_bounds_enabled_in_place(&self, enabled: bool) {
         self.out_of_bounds_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the face integration's evaluation continues past the natural domain (not
+    /// upstream, #16735; adapted from #15946: the mass integration's scope).
+    #[must_use]
+    pub(crate) fn continues_past_domain(&self) -> bool {
+        self.continues_past_domain.load(Ordering::Relaxed)
+    }
+
+    /// Sets [`BSplineSurface::continues_past_domain`] through a shared reference, for a
+    /// scope that restores it (not upstream, #16735; adapted from #15946).
+    pub(crate) fn set_continues_past_domain_in_place(&self, on: bool) {
+        self.continues_past_domain.store(on, Ordering::Relaxed);
     }
 
     /// Whether the NURB is borrowed (`IsNurbBorrowed`).
@@ -1207,7 +1274,11 @@ impl BSplineSurface {
     /// `SM_ERR_NULL_POINTER` without NURB.
     pub fn canonical(&self) -> Result<SurfaceCanonical> {
         let sur = self.nurb_ref().ok_or_else(|| {
-            SolidError::b_spline(OP_GET_CANON, BSplineFailure::Missing("the NURBS form"))
+            SolidError::b_spline_with_status(
+                OP_GET_CANON,
+                BSplineFailure::NoNurbsForm,
+                SM_ERR_NULL_POINTER,
+            )
         })?;
         let (knu, knv) = sur.knot_vectors()?;
         let (u_knots, u_multiplicities) = get_knots(&knu, None);
@@ -1276,7 +1347,8 @@ impl BSplineSurface {
 
     /// Whether the surface is parallel to `vector`: all control points of every u row
     /// (or of every v column) lie on a line parallel to it (`IsParallelToVector`).
-    /// `false` without NURB; `true` for a zero vector (see the module docs).
+    /// `false` without NURB and for a vector that cannot be unitised (see the module
+    /// docs).
     ///
     /// The `SmPlane` branch is
     /// [`crate::surface::plane::Plane::is_parallel_to_vector`].
@@ -1285,30 +1357,10 @@ impl BSplineSurface {
     ///
     /// None (the `Result` is kept for the derived surfaces).
     pub fn is_parallel_to_vector(&self, vector: Vec3) -> Result<bool> {
-        self.is_parallel_to_vector_opt_in(vector, false)
-    }
-
-    /// [`BSplineSurface::is_parallel_to_vector`] with kernel opt-in fixes applied
-    /// (`IsParallelToVector`).
-    ///
-    /// # Errors
-    ///
-    /// None (the `Result` is kept for the derived surfaces).
-    pub fn is_parallel_to_vector_with_kernel(&self, k: &Kernel, vector: Vec3) -> Result<bool> {
-        self.is_parallel_to_vector_opt_in(vector, k.fixes.surface_parallel_to_vector_checks)
-    }
-
-    /// [`BSplineSurface::is_parallel_to_vector`], optionally returning `false` for a
-    /// zero `vector` and testing subsequent control points against the chord direction
-    /// rather than `line_end` when `fix_checks` is `true` (WR-39).
-    ///
-    /// # Errors
-    ///
-    /// None (the `Result` is kept for the derived surfaces).
-    pub fn is_parallel_to_vector_opt_in(&self, vector: Vec3, fix_checks: bool) -> Result<bool> {
         let Ok(test_vec) = vector.unitize() else {
-            // SER(sTestVec.Unitize()): SM_ERR_INVALID_INPUT returned as the boolean
-            return Ok(!fix_checks);
+            // (upstream: SER(sTestVec.Unitize()), SM_ERR_INVALID_INPUT returned as the
+            // boolean TRUE; WR-39)
+            return Ok(false);
         };
 
         // the SmPlane branch (|Z . v| < SM_EFF_ZERO * (1 + |origin|max)) is
@@ -1334,11 +1386,10 @@ impl BSplineSurface {
             if line_vec.dot(test_vec).abs() < 1.0 - tol {
                 return Ok(false);
             }
-            let dir = if fix_checks { line_vec } else { line_end };
             for pnt in rest {
                 // smgu_LinePointDistance(LinePnt, LineEnd, ..): LineEnd is the direction
-                // upstream; line_vec under WR-39 opt-in.
-                let (distance, _) = line_point_distance(line_pnt, dir, pnt?);
+                // upstream; the chord direction line_vec here (WR-39).
+                let (distance, _) = line_point_distance(line_pnt, line_vec, pnt?);
                 if distance > tol {
                     return Ok(false);
                 }
@@ -2209,7 +2260,7 @@ impl BSplineSurface {
         let Some(&uv) = solutions.first() else {
             return Err(SolidError::b_spline(
                 OP_STEP_INV,
-                BSplineFailure::Failed("the point is not close enough to the surface"),
+                BSplineFailure::NoFootWithinTolerance { tolerance: tol_3d },
             ));
         };
 
@@ -2469,6 +2520,7 @@ impl BSplineSurface {
             nurb: Some(sur).into(),
             nurb_is_borrowed: false,
             out_of_bounds_enabled: AtomicBool::new(false),
+            continues_past_domain: AtomicBool::new(false),
             knot_type,
             form,
         })
@@ -2560,12 +2612,38 @@ fn polar_guess_basis(g: &PolarBox) -> Vec3 {
     }
 }
 
+/// Not upstream: the content digest ([`crate::geom::content`]). The NURB is written when
+/// present. Whether it is borrowed decides no evaluation, and the two out-of-bounds flags
+/// are a solve's scope on a shared surface, not the surface: they are left out.
+impl crate::geom::content::Content for BSplineSurface {
+    fn content(&self, d: &mut crate::geom::content::Digest) -> Option<()> {
+        let Self {
+            nurb,
+            nurb_is_borrowed: _,
+            out_of_bounds_enabled: _,
+            continues_past_domain: _,
+            knot_type,
+            form,
+        } = self;
+        d.tag(0xB55);
+        match nurb.as_ref() {
+            Some(n) => {
+                d.bool(true);
+                n.content(d)?;
+            }
+            None => d.bool(false),
+        }
+        d.hashed(knot_type);
+        d.hashed(form);
+        Some(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::curve::curve::Curve;
     use crate::error::nurbs::NurbsFailure;
-    use crate::kernel::UpstreamFixes;
     use crate::nurbs::b_spline_curve::{BSplineCurveForm, CanonicalData};
     use crate::surface::plane::Plane;
     use crate::surface::surf_of_extrusion::SurfOfExtrusion;
@@ -2579,6 +2657,28 @@ mod tests {
             Point3::new(10.0, 10.0, 0.0),
         )
         .unwrap()
+    }
+
+    /// A point 10 off the plane has no foot within the tolerance: the inversion names
+    /// the tolerance it searched within, class not within tolerance, status `SM_ERR`.
+    #[test]
+    fn step_inversion_of_a_point_off_the_surface_names_its_tolerance() {
+        let k = Kernel::default();
+        let s = bilinear();
+        let dom = s.natural_uv_domain();
+        let e = s
+            .step_inversion(&k, &dom, Point3::new(5.0, 5.0, 10.0), 1e-6, None)
+            .unwrap_err();
+        assert_eq!(
+            e.nurbs_failure(),
+            Some(&NurbsFailure::BSpline(
+                BSplineFailure::NoFootWithinTolerance { tolerance: 1e-6 }
+            )),
+            "{e:?}"
+        );
+        assert_eq!(e.kind(), crate::error::ErrorKind::NotWithinTolerance);
+        assert_eq!(e.upstream_status(), Some(crate::error::SM_ERR));
+        assert!(!e.is_defect() && !e.is_refusal(), "{e:?}");
     }
 
     #[test]
@@ -2613,7 +2713,7 @@ mod tests {
             s.canonical(),
             Err(e) if e.sm_status() == Some(1006)
                 && e.nurbs_failure()
-                    == Some(&NurbsFailure::BSpline(BSplineFailure::Missing("the NURBS form")))
+                    == Some(&NurbsFailure::BSpline(BSplineFailure::NoNurbsForm))
         ));
         assert!(s.copy().gw_nurb().is_none());
         assert!(s.approx_eq(&BSplineSurface::new()));
@@ -2740,7 +2840,8 @@ mod tests {
         assert!(s
             .calculate_bounding_box(k, &s.natural_uv_domain(), &req)
             .is_ok());
-        assert!(s.is_parallel_to_vector(Vec3::new(0.0, 0.0, 0.0)).unwrap());
+        // a vector with no direction: no surface is parallel to it (WR-39)
+        assert!(!s.is_parallel_to_vector(Vec3::new(0.0, 0.0, 0.0)).unwrap());
     }
 
     #[test]
@@ -2828,20 +2929,18 @@ mod tests {
         .unwrap()
     }
 
-    fn parallel(s: &BSplineSurface, k: &Kernel, v: Vec3) -> bool {
-        s.is_parallel_to_vector_with_kernel(k, v).unwrap()
+    fn parallel(s: &BSplineSurface, v: Vec3) -> bool {
+        s.is_parallel_to_vector(v).unwrap()
     }
 
     fn srf_parallel(s: &SmSurface, k: &Kernel, v: Vec3) -> bool {
         s.is_parallel_to_vector(k, v).unwrap()
     }
 
+    /// WR-39: a vector that cannot be unitised has no direction, so no surface is
+    /// parallel to it (upstream returned the failed `Unitize` status, read as `TRUE`).
     #[test]
-    fn wr39_zero_vector_returns_false_when_opted_in() {
-        let k_def = Kernel::default();
-        let mut k_fix = Kernel::default();
-        k_fix.fixes.surface_parallel_to_vector_checks = true;
-
+    fn wr39_zero_vector_is_never_parallel() {
         let srf = bilinear();
         let empty = BSplineSurface::new();
         let axis = Axis2Placement::default();
@@ -2849,31 +2948,21 @@ mod tests {
         let tiny = Vec3::new(1.0e-15, 0.0, 0.0);
 
         for v in [Vec3::ZERO, tiny] {
-            assert!(srf.is_parallel_to_vector(v).unwrap());
-            assert!(parallel(&srf, &k_def, v));
-            assert!(!parallel(&srf, &k_fix, v));
-            assert!(!srf.is_parallel_to_vector_opt_in(v, true).unwrap());
-
-            assert!(empty.is_parallel_to_vector(v).unwrap());
-            assert!(!empty.is_parallel_to_vector_opt_in(v, true).unwrap());
-
-            assert!(plane.is_parallel_to_vector(v));
-            assert!(plane.is_parallel_to_vector_with_kernel(&k_def, v));
-            assert!(!plane.is_parallel_to_vector_with_kernel(&k_fix, v));
-            assert!(!plane.is_parallel_to_vector_opt_in(v, true));
+            assert!(!parallel(&srf, v));
+            assert!(!parallel(&empty, v));
+            assert!(!plane.is_parallel_to_vector(v));
         }
 
-        assert!(plane.is_parallel_to_vector_with_kernel(&k_fix, Vec3::X));
-        assert!(!plane.is_parallel_to_vector_with_kernel(&k_fix, Vec3::Z));
-        assert!(!empty.is_parallel_to_vector_opt_in(Vec3::X, true).unwrap());
+        assert!(plane.is_parallel_to_vector(Vec3::X));
+        assert!(!plane.is_parallel_to_vector(Vec3::Z));
+        assert!(!parallel(&empty, Vec3::X));
     }
 
+    /// WR-39: the rows' points are tested against the chord direction, so rulings
+    /// parallel to the vector away from the origin are found (upstream passed the second
+    /// point as the line's direction and missed each of these).
     #[test]
     fn wr39_translated_quadratic_extruded_surfaces_u_and_v_directions() {
-        let k_def = Kernel::default();
-        let mut k_fix = Kernel::default();
-        k_fix.fixes.surface_parallel_to_vector_checks = true;
-
         // Constant-U rulings parallel to +Z, translated near (10, 20, 5).
         let u_extruded = quadratic_patch(&[
             Point3::new(10.0, 20.0, 5.0),
@@ -2886,10 +2975,9 @@ mod tests {
             Point3::new(12.0, 20.0, 7.0),
             Point3::new(12.0, 20.0, 9.0),
         ]);
-        assert!(!parallel(&u_extruded, &k_def, Vec3::Z));
-        assert!(parallel(&u_extruded, &k_fix, Vec3::Z));
-        assert!(parallel(&u_extruded, &k_fix, Vec3::new(0.0, 0.0, -3.0)));
-        assert!(!parallel(&u_extruded, &k_fix, Vec3::X));
+        assert!(parallel(&u_extruded, Vec3::Z));
+        assert!(parallel(&u_extruded, Vec3::new(0.0, 0.0, -3.0)));
+        assert!(!parallel(&u_extruded, Vec3::X));
 
         // Constant-V rulings parallel to +X, translated near (10, 20, 5).
         let v_extruded = quadratic_patch(&[
@@ -2903,9 +2991,8 @@ mod tests {
             Point3::new(16.0, 21.0, 6.0),
             Point3::new(16.0, 22.0, 5.0),
         ]);
-        assert!(!parallel(&v_extruded, &k_def, Vec3::X));
-        assert!(parallel(&v_extruded, &k_fix, Vec3::X));
-        assert!(!parallel(&v_extruded, &k_fix, Vec3::Y));
+        assert!(parallel(&v_extruded, Vec3::X));
+        assert!(!parallel(&v_extruded, Vec3::Y));
 
         // Ruling whose second control point lands at (0, 0, 0) while non-degenerate.
         let through_origin = quadratic_patch(&[
@@ -2919,16 +3006,13 @@ mod tests {
             Point3::new(2.0, 1.0, 0.0),
             Point3::new(2.0, 1.0, 1.0),
         ]);
-        assert!(!parallel(&through_origin, &k_def, Vec3::Z));
-        assert!(parallel(&through_origin, &k_fix, Vec3::Z));
+        assert!(parallel(&through_origin, Vec3::Z));
     }
 
+    /// WR-39: points off the ruling's line are caught (upstream measured them against
+    /// the wrong line and called both surfaces parallel).
     #[test]
     fn wr39_bent_non_parallel_surface_false_positive_rejected() {
-        let k_def = Kernel::default();
-        let mut k_fix = Kernel::default();
-        k_fix.fixes.surface_parallel_to_vector_checks = true;
-
         // Each i_u row has P[i_u][1] - P[i_u][0] = (0, 0, 2) parallel to +Z, while
         // P[i_u][2] = P[i_u][0] + 0.5 * P[i_u][1] bends >11 units off the +Z line yet
         // lies on the wrong line P[i_u][0] + t * P[i_u][1].
@@ -2943,8 +3027,7 @@ mod tests {
             Point3::new(12.0, 20.0, 7.0),
             Point3::new(18.0, 30.0, 8.5),
         ]);
-        assert!(parallel(&bent_u, &k_def, Vec3::Z));
-        assert!(!parallel(&bent_u, &k_fix, Vec3::Z));
+        assert!(!parallel(&bent_u, Vec3::Z));
 
         // Same false-positive pattern in the V-constant loop along +X.
         let bent_v = quadratic_patch(&[
@@ -2958,27 +3041,21 @@ mod tests {
             Point3::new(16.0, 31.5, 7.5),
             Point3::new(16.0, 33.0, 9.0),
         ]);
-        assert!(parallel(&bent_v, &k_def, Vec3::X));
-        assert!(!parallel(&bent_v, &k_fix, Vec3::X));
+        assert!(!parallel(&bent_v, Vec3::X));
     }
 
+    /// WR-39 through [`SmSurface::is_parallel_to_vector`]'s dispatch: a plane, a B-spline
+    /// and a surface of extrusion.
     #[test]
-    fn wr39_surface_dispatch_and_flag_mut() {
-        assert!(UpstreamFixes::NAMES.contains(&"surface_parallel_to_vector_checks"));
-        let k_def = Kernel::default();
-        let mut k_fix = Kernel::default();
-        let slot = k_fix.fixes.flag_mut("surface_parallel_to_vector_checks");
-        assert_eq!(slot.as_deref(), Some(&false));
-        *slot.unwrap() = true;
-        assert!(k_fix.fixes.surface_parallel_to_vector_checks);
+    fn wr39_surface_dispatch() {
+        let k = Kernel::default();
 
         let axis = Axis2Placement::default();
         let plane = Plane::create_canonical(&axis).unwrap();
         let s_plane = SmSurface::from(plane);
-        assert!(srf_parallel(&s_plane, &k_def, Vec3::ZERO));
-        assert!(!srf_parallel(&s_plane, &k_fix, Vec3::ZERO));
-        assert!(srf_parallel(&s_plane, &k_fix, Vec3::Y));
-        assert!(!srf_parallel(&s_plane, &k_fix, Vec3::Z));
+        assert!(!srf_parallel(&s_plane, &k, Vec3::ZERO));
+        assert!(srf_parallel(&s_plane, &k, Vec3::Y));
+        assert!(!srf_parallel(&s_plane, &k, Vec3::Z));
 
         let patch = quadratic_patch(&[
             Point3::new(10.0, 20.0, 5.0),
@@ -2992,10 +3069,8 @@ mod tests {
             Point3::new(12.0, 20.0, 9.0),
         ]);
         let s_bspline = SmSurface::from(patch);
-        assert!(srf_parallel(&s_bspline, &k_def, Vec3::ZERO));
-        assert!(!srf_parallel(&s_bspline, &k_fix, Vec3::ZERO));
-        assert!(!srf_parallel(&s_bspline, &k_def, Vec3::Z));
-        assert!(srf_parallel(&s_bspline, &k_fix, Vec3::Z));
+        assert!(!srf_parallel(&s_bspline, &k, Vec3::ZERO));
+        assert!(srf_parallel(&s_bspline, &k, Vec3::Z));
 
         let gen_pts = [
             Point3::new(10.0, 20.0, 5.0),
@@ -3015,7 +3090,7 @@ mod tests {
         })
         .unwrap();
         let ext = SurfOfExtrusion::new(
-            &k_def,
+            &k,
             Curve::from(gen_bs),
             Point3::new(10.0, 20.0, 5.0),
             Vec3::Z,
@@ -3024,12 +3099,9 @@ mod tests {
         )
         .unwrap();
         let s_ext = SmSurface::from(ext);
-        assert!(srf_parallel(&s_ext, &k_def, Vec3::ZERO));
-        assert!(!srf_parallel(&s_ext, &k_fix, Vec3::ZERO));
-        assert!(srf_parallel(&s_ext, &k_def, Vec3::Z));
-        assert!(srf_parallel(&s_ext, &k_fix, Vec3::Z));
-        assert!(!srf_parallel(&s_ext, &k_def, Vec3::X));
-        assert!(srf_parallel(&s_ext, &k_fix, Vec3::X));
-        assert!(!srf_parallel(&s_ext, &k_fix, Vec3::Y));
+        assert!(!srf_parallel(&s_ext, &k, Vec3::ZERO));
+        assert!(srf_parallel(&s_ext, &k, Vec3::Z));
+        assert!(srf_parallel(&s_ext, &k, Vec3::X));
+        assert!(!srf_parallel(&s_ext, &k, Vec3::Y));
     }
 }

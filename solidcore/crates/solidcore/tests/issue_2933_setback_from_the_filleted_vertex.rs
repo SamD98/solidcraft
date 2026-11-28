@@ -11,6 +11,7 @@
 
 use solidcore::blend::fillet_executive::session::FilletSession;
 use solidcore::mass::integrator::properties::brep_volume_default;
+use solidcore::math::det;
 use solidcore::math::Point3;
 use solidcore::nurbs::knots::Side;
 use solidcore::primitive::api_primitives::create_box;
@@ -157,7 +158,7 @@ fn max_seam_angle(k: &Kernel, b: &Brep, patch: &[FaceId]) -> f64 {
                 s.evaluate_normal(k, uv, Side::Left, Side::Left).unwrap()
             };
             let (n1, n2) = (normal(s1), normal(s2));
-            worst = worst.max(n1.cross(n2).length().atan2(n1.dot(n2).abs()).to_degrees());
+            worst = worst.max(det::atan2(n1.cross(n2).length(), n1.dot(n2).abs()).to_degrees());
         }
     }
     worst
@@ -181,13 +182,12 @@ fn the_patch_meets_the_rounds_tangentially_within_tolerance() {
     assert!(tol <= 4.0e-5 * (1.0 + 1e-9), "edge tolerance {tol}");
 }
 
-/// With the rounds as their definitions (`fillet_round_as_definition`), the six patch faces
+/// With the rounds as their definitions, the six patch faces
 /// are the Setback's fill: each keeps the Setback's definition (`procedural_blend`), which the
 /// N x N patch has not.
 #[test]
 fn with_round_definitions_the_six_patches_are_the_setback_fill() {
-    let mut k = Kernel::default();
-    k.fixes.fillet_round_as_definition = true;
+    let k = Kernel::default();
     let (_, b) = build_with(k);
     let setback = b
         .face_list()

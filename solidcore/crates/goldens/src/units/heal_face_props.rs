@@ -75,6 +75,7 @@ use solidcore::topology::{
 use crate::case::{CaseContext, CaseSource};
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Generated cases per run, whatever `--seeds` says (it can only raise this).
 pub const MIN_GENERATED: usize = 1500;
@@ -1609,7 +1610,7 @@ fn gen_polygon(rng: &mut Rng, c: [f64; 3], radius: f64, ccw: bool) -> Vec<[f64; 
         .map(|i| {
             let a = std::f64::consts::TAU * (i as f64 + rng.uniform(0.0, 0.4)) / n as f64;
             let r = radius * rng.uniform(0.8, 1.0);
-            [c[0] + r * a.cos(), c[1] + r * a.sin(), c[2]]
+            [c[0] + r * det::cos(a), c[1] + r * det::sin(a), c[2]]
         })
         .collect();
     if !ccw {
@@ -1802,7 +1803,7 @@ fn gen_plane_loops(rng: &mut Rng, z0: f64) -> LoopsIn {
     let mut specs: Vec<([f64; 3], f64, bool)> = Vec::new();
     for i in 0..n {
         let (centre, radius) = if nested {
-            (c, 3.0 * 0.6_f64.powi(i as i32) * rng.uniform(0.9, 1.0))
+            (c, 3.0 * det::powi(0.6_f64, i as i32) * rng.uniform(0.9, 1.0))
         } else {
             ([c[0] - 2.25 + 1.5 * i as f64, c[1], z0], 0.6)
         };
@@ -1876,7 +1877,7 @@ fn gen_revolution_circles(rng: &mut Rng) -> (SurfIn, LoopsIn) {
                 .iter()
                 .map(|t| {
                     let phi = (-80.0 + 160.0 * t).to_radians();
-                    ([0.0, 0.0, r * phi.sin()], r * phi.cos())
+                    ([0.0, 0.0, r * det::sin(phi)], r * det::cos(phi))
                 })
                 .collect();
             let d = *rng
@@ -2059,5 +2060,96 @@ impl UnitDiff for Runner {
 
     fn run_rust(&self, case: &Case) -> Result<Output, HarnessError> {
         rust(&case.parse()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #21326 (WR-647 part B): a sphere of radius 1 with two circle loops of radius
+    /// 0.866 at z = +-0.5 and face tolerance 1 (fixture `stage3_sph_two_tol1`) passes
+    /// `SetProps_Stage3`. A classification input on a loop edge ends inside an interval
+    /// whose rest stays within the edge's tolerance (its midpoint 0.58 from the edge,
+    /// tolerance 1.00001); splitting it there left that rest unlabelled and the face was
+    /// refused (`SM_ERR_NOTYET_HEAL_FACE`, 1040, no loop tree root).
+    #[test]
+    fn sphere_two_loops_at_tolerance_one_passes_stage3() {
+        let ctx = CaseContext {
+            root: crate::case::repo_root(),
+            seeds: 0,
+        };
+        let case = ctx
+            .fixture_cases(Runner.id())
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "stage3_sph_two_tol1")
+            .unwrap();
+        let v = rust(&case.parse().unwrap()).unwrap().values.get("v").cloned().unwrap();
+        // the Stage 3 classification status (1040 = NoLoopTreeRoot before the fix)
+        assert_eq!(v.first(), Some(&1000.0));
+    }
+
+    /// The values of the Stage 3 script of generated case `s3gen{i}`.
+    fn stage3_values(i: usize) -> Vec<f64> {
+        let seed = CaseContext::seed_for("heal.face_props/stage3", i);
+        let c = gen_stage3(&mut Rng::new(seed));
+        let out = rust(&c).unwrap();
+        out.values.get("v").cloned().unwrap()
+    }
+
+    /// #18342: a plane face 8 x 8 with one circle loop of radius 0.6 (`s3gen0225`, zone
+    /// tolerance 0.1) passes `SetProps_Stage3` with one outer loop. The bisector's crossings
+    /// of the circle, far from its ends in 3D but within the face's UV tolerance of its
+    /// start in the bisector's own parameter, were taken as touches on the bisector's start
+    /// and the face was refused (`SM_ERR_NOTYET_HEAL_FACE`, 1040).
+    #[test]
+    fn plane_with_one_circle_passes_stage3_with_one_outer_loop() {
+        let v = stage3_values(225);
+        // op 0's status and snapshot, then op 6 (Stage 3): its status, then its snapshot
+        let stage3 = 1 + SNAP_LEN;
+        assert_eq!(v.get(stage3), Some(&1000.0), "status");
+        // snapshot field 34: outer_loop_cnt
+        assert_eq!(v.get(stage3 + 1 + 34), Some(&1.0), "outer loops");
+    }
+
+    /// #18342: four concentric circles on a plane face (`s3gen0275`, radii 2.90, 1.66,
+    /// 1.07 and 0.63, the second and fourth clockwise as holes must be, the first
+    /// clockwise too) nest as one chain: one outer loop, one loop of the wrong
+    /// orientation (the outermost) and two nested loops (the two inside the first hole).
+    #[test]
+    fn concentric_circles_nest_as_one_chain_in_stage3() {
+        let v = stage3_values(275);
+        assert_eq!(v.first(), Some(&1000.0), "status");
+        // snapshot fields 34, 37 and 39: outer_loop_cnt, bad_orient_loop_cnt,
+        // bad_nested_loop_cnt
+        assert_eq!(v.get(1 + 34), Some(&1.0), "outer loops");
+        assert_eq!(v.get(1 + 37), Some(&1.0), "wrongly oriented loops");
+        assert_eq!(v.get(1 + 39), Some(&2.0), "nested loops");
+    }
+
+    /// #18647: a plane face 8 x 8 (zone tolerance 1, intersection tolerance 2) with one
+    /// counter-clockwise quadrilateral loop (`s3gen0009`: signed area 11.2, every vertex at
+    /// least 1.54 inside the domain) is its own outer loop, so `SetProps_Stage3` passes
+    /// with one outer loop and no problem loop. The bisector's two crossings of the loop
+    /// lie 2.39 and 2.32 from its nearer end in 3D, more than the tolerance from both
+    /// ends, but its parameter interval [0, 1] is within the UV tolerance of both ends:
+    /// they were typed `Both` and dropped, and the face was refused as crossed nowhere
+    /// (`SM_ERR_NOTYET_HEAL_FACE`, 1040, `NoClassifyZeroCrosscnt`).
+    #[test]
+    fn plane_with_one_quadrilateral_passes_stage3_through_both_typed_crossings() {
+        let v = stage3_values(9);
+        // op 6 (Stage 3) first: its status, then its snapshot
+        assert_eq!(v.first(), Some(&1000.0), "status");
+        // snapshot fields 1, 33, 34, 37, 38, 39 and 44: not_yet_face_type,
+        // closed_loop_cnt, outer_loop_cnt, bad_orient_loop_cnt, bad_no_area_loop_cnt,
+        // bad_nested_loop_cnt and the number of loop props
+        assert_eq!(v.get(1 + 1), Some(&0.0), "no classify failure");
+        assert_eq!(v.get(1 + 33), Some(&1.0), "closed loops");
+        assert_eq!(v.get(1 + 34), Some(&1.0), "outer loops");
+        assert_eq!(v.get(1 + 37), Some(&0.0), "wrongly oriented loops");
+        assert_eq!(v.get(1 + 38), Some(&0.0), "no-area loops");
+        assert_eq!(v.get(1 + 39), Some(&0.0), "nested loops");
+        assert_eq!(v.get(1 + 44), Some(&1.0), "loop props");
     }
 }

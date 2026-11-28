@@ -16,6 +16,7 @@ use solidcore::curve::ellipse::Ellipse;
 use solidcore::error::SolidError;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3};
 use solidcore::primitive::api_curves::{create_circle, create_line_segment};
 use solidcore::sweep::cornered::cornered_sweep;
@@ -48,7 +49,7 @@ fn square(a: f64) -> Vec<Curve> {
 /// toward `x` by `turn`.
 fn ell(turn: f64) -> (Path, Vec3) {
     let c = Point3::new(0.0, 0.0, L1);
-    let t1 = Vec3::new(turn.sin(), 0.0, turn.cos());
+    let t1 = Vec3::new(det::sin(turn), 0.0, det::cos(turn));
     let path = Path {
         pieces: vec![
             Piece::Line {
@@ -125,7 +126,7 @@ fn a_square_along_an_l_keeps_its_area_times_the_length() {
             .map(|(i, j)| corner[i].distance(corner[j]))
             .collect();
         sides.sort_by(f64::total_cmp);
-        let stretched = A / (turn / 2.0).cos();
+        let stretched = A / det::cos(turn / 2.0);
         assert!((sides[0] - A).abs() <= 1e-12 * L1 && (sides[1] - A).abs() <= 1e-12 * L1);
         assert!((sides[2] - stretched).abs() <= 1e-12 * L1, "{sides:?}");
         assert!((sides[3] - stretched).abs() <= 1e-12 * L1, "{sides:?}");
@@ -357,11 +358,9 @@ fn circle_round_the_bend(circle: &[Curve]) -> Vec<String> {
 
 /// The kernel's analytic circle round the bend: the bend's wall is a torus, the straight wall
 /// before it a cylinder (the kernel files a cylinder as its `Cone` class:
-/// `surface/cone.rs`, "Cones and cylinders"). Known gap: the rotational sweep classes an
-/// analytic circle's wall as a `Torus` only for a whole turn; a part turn (the bend's quarter)
-/// is a `SurfOfRevolution` (measured: 360 degrees a `Torus`, 90 a `SurfOfRevolution`).
+/// `surface/cone.rs`, "Cones and cylinders"). A part turn of the rotational sweep (the bend's
+/// quarter) makes the circle's torus as a whole turn does (tangency-labs/solidcraft#14425).
 #[test]
-#[ignore = "known gap: a part turn of the rotational sweep is no Torus (tangency-labs/solidcraft#14425)"]
 fn an_analytic_circle_round_a_bend_and_a_corner_turns_a_torus() {
     let k = Kernel::default();
     let kinds = circle_round_the_bend(&analytic_circle(&k, 2.0));
@@ -369,14 +368,21 @@ fn an_analytic_circle_round_a_bend_and_a_corner_turns_a_torus() {
     assert_eq!((count("Torus("), count("Cone(")), (1, 1), "{kinds:?}");
 }
 
-/// A B-spline circle (`create_circle`) round the bend, a separate case: its bend's wall is the
-/// circle's exact surface of revolution, not recognised as a torus.
+/// A B-spline circle (`create_circle`, the exact rational circle) round the bend: the
+/// rotational sweep recognises the profile as a circle in the plane of the turn axis, so the
+/// bend's wall is that circle's revolution, a torus, as for the analytic circle
+/// (tangency-labs/solidcraft#14425). The volume check in `circle_round_the_bend` is the
+/// closed form `pi rho^2` times the path's length, unchanged by the wall's class.
 #[test]
-fn a_b_spline_circle_round_a_bend_turns_an_exact_surface_of_revolution() {
+fn a_b_spline_circle_round_a_bend_turns_a_torus() {
     let circle = vec![Curve::from(create_circle(Point3::ZERO, 2.0).unwrap())];
     let kinds = circle_round_the_bend(&circle);
     let count = |name: &str| kinds.iter().filter(|s| s.starts_with(name)).count();
-    assert_eq!(count("SurfOfRevolution("), 1, "{kinds:?}");
+    assert_eq!(
+        (count("Torus("), count("SurfOfRevolution(")),
+        (1, 0),
+        "{kinds:?}"
+    );
 }
 
 /// A corner straight after a bend, and a helix, are refused by name.

@@ -55,6 +55,7 @@ use solidcore::SolidError;
 use crate::case::CaseContext;
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// Generated cases per run, whatever `--seeds` says (it can only raise this).
 pub const MIN_GENERATED: usize = 400;
@@ -786,7 +787,7 @@ fn translate(c: &InlineCrv, d: Vec3) -> InlineCrv {
 /// (`e_b` up): arc 1 of radius `r1` about `P1 = (0, r1)` swept `alpha`, arc 2 of
 /// radius `r2` swept `beta` more.
 fn tower_2d(r1: f64, r2: f64, alpha: f64, beta: f64) -> [[f64; 2]; 3] {
-    let u = |t: f64| [t.sin(), -t.cos()];
+    let u = |t: f64| [det::sin(t), -det::cos(t)];
     let p1 = [0.0, r1];
     let ua = u(alpha);
     let c2 = [p1[0] + (r1 - r2) * ua[0], p1[1] + (r1 - r2) * ua[1]];
@@ -1236,6 +1237,69 @@ mod tests {
                 kind: Kind::Secant, ..
             } => "InitSecant",
         }
+    }
+
+    /// The bits of a curve's dump (`dump_curve`), so equal means bit for bit.
+    fn bits(c: &BSplineCurve) -> Vec<u64> {
+        let mut o = Vec::new();
+        dump_curve(&mut o, c);
+        o.into_iter().map(f64::to_bits).collect()
+    }
+
+    /// WR-661 `adv_arc_and_line_rails`: 1001 on main and now, and the rails it leaves
+    /// have a closed-form state. The first rail has two unique knots (0 and 1), so the
+    /// start and end knot mids `create_surface` inserts are both 0.5: each rail is asked
+    /// for 0.5 twice. The degree-2 arc takes it twice; the degree-1 second rail takes it
+    /// once, and the second insert (multiplicity 2 above degree 1) fails. The call
+    /// returns that typed failure where it fails (the fork's `SER`), so the rails are
+    /// exactly the inputs with those inserts done, bit for bit. Main went on past the
+    /// failure and edited the second rail further (degree 2, five points).
+    #[test]
+    fn adv_arc_and_line_rails_returns_the_second_rails_failed_insert() {
+        let i: Inputs = crate::case::regression_case(&Runner, "adv_arc_and_line_rails")
+            .parse()
+            .unwrap();
+        let Inputs::Create {
+            tol,
+            rail1,
+            rail2,
+            points,
+        } = &i
+        else {
+            panic!("a create case")
+        };
+        let k = Kernel::default();
+        let mut r1 = curve_of(rail1).unwrap();
+        let mut r2 = curve_of(rail2).unwrap();
+        assert_eq!(r1.knots(None).unwrap().0, [0.0, 1.0]);
+        assert_eq!(r2.gw_nurb().unwrap().degree(), 1);
+        // the expected rails: the inputs with the inserts made before the failing one
+        let mut want1 = curve_of(rail1).unwrap();
+        let mut want2 = curve_of(rail2).unwrap();
+        want1.insert_one_knot(0.5, 1).unwrap();
+        want2.insert_one_knot(0.5, 1).unwrap();
+        want1.insert_one_knot(0.5, 1).unwrap();
+        let failed = want2.clone().insert_one_knot(0.5, 1).unwrap_err();
+        let pts: Vec<TsectPnt> = points
+            .iter()
+            .map(|[a, b]| {
+                let mut t = TsectPnt::new();
+                *t.srf_pos_mut(SrfIndex::First) = Vec3::new(a[0], a[1], a[2]);
+                *t.srf_pos_mut(SrfIndex::Second) = Vec3::new(b[0], b[1], b[2]);
+                t
+            })
+            .collect();
+        let error = EiffelTowerCrossSectionFsg::new()
+            .create_surface(&k, *tol, &mut r1, &mut r2, &pts)
+            .unwrap_err();
+        assert_eq!(error, failed);
+        assert_eq!(
+            error.operation(),
+            "nurbs::b_spline_curve_n_lib::BSplineCurve::insert_one_knot"
+        );
+        assert_eq!(status(&error), 1001.0);
+        assert_eq!(bits(&r1), bits(&want1), "the first rail");
+        assert_eq!(bits(&r2), bits(&want2), "the second rail");
     }
 
     /// The generators reach success and failure of `create` on the Rust side, and

@@ -40,13 +40,14 @@ use solidcore::geom::extent1d::Extent1d;
 use solidcore::geom::vector2d::Point2;
 use solidcore::kernel::{KernelOptions, UpstreamFixes};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+use solidcore::math::det;
 use solidcore::math::{Point3, Vec3, PI};
 use solidcore::nurbs::b_spline_curve::p1::{
     BSplineCurve, BSplineCurveForm, CanonicalData, KnotType,
 };
 use solidcore::primitive::api_primitives::{create_box, create_cylinder};
 use solidcore::query::api_queries::edge_closest_point;
-use solidcore::surface::surface::Surface;
+use solidcore::surface::surface::{Surface, SurfaceKind};
 use solidcore::topology::brep::p5::{stitch_and_orient, StitchAndOrientOptions};
 use solidcore::topology::brep::validation::{check_brep, CheckLevel};
 use solidcore::topology::edge;
@@ -61,7 +62,7 @@ type P2 = [f64; 2];
 /// The G^n section in a section's plane: `c1[k]`, `c2[k]` (k = 0..n) the faces' jets at the
 /// contacts, `T_i(u) = sum_k c_ik (u - 1)^k`.
 fn gn_section(n: usize, w: f64, c1: &[P2], c2: &[P2], t: f64) -> P2 {
-    let (a, b) = ((1.0 - t).powi(n as i32 + 1), t.powi(n as i32 + 1));
+    let (a, b) = (det::powi(1.0 - t, n as i32 + 1), det::powi(t, n as i32 + 1));
     let f = a / (a + b);
     let u1 = -t / (1.0 - w + w * t);
     let u2 = (t - 1.0) / (1.0 - w * t);
@@ -330,7 +331,7 @@ fn pipe_faces() -> Vec<Quadric> {
 }
 
 fn rho_z(x: Point3) -> P2 {
-    [(x.x - 30.0).hypot(x.y - 20.0), x.z]
+    [det::hypot(x.x - 30.0, x.y - 20.0), x.z]
 }
 
 /// The fork's cases that have a kernel to run on today, with the fork's figures.
@@ -406,7 +407,7 @@ fn running_cases() -> Vec<Case> {
             "box_edge_round",
             Blend::Round(3.0),
             1.0 - PI / 4.0,
-            Box::new(|x| ((x.y - 27.0).hypot(x.z - 17.0) - 3.0).abs()),
+            Box::new(|x| (det::hypot(x.y - 27.0, x.z - 17.0) - 3.0).abs()),
             1,
         ),
         boss_case(
@@ -427,7 +428,7 @@ fn running_cases() -> Vec<Case> {
             26056.1770421533,
             Box::new(|x| {
                 let q = rho_z(x);
-                ((q[0] - 10.0).hypot(q[1] - 12.0) - 2.0).abs()
+                (det::hypot(q[0] - 10.0, q[1] - 12.0) - 2.0).abs()
             }),
             1,
         ),
@@ -447,7 +448,9 @@ fn running_cases() -> Vec<Case> {
             "pipe_on_plate_round",
             Blend::Round(2.0),
             40300.8060669181,
-            Box::new(move |x| ((x.y - 20.0 - pipe_g).hypot(x.z - 10.0 - pipe_d) - pipe_d).abs()),
+            Box::new(move |x| {
+                (det::hypot(x.y - 20.0 - pipe_g, x.z - 10.0 - pipe_d) - pipe_d).abs()
+            }),
             1,
         ),
         Case {
@@ -645,7 +648,7 @@ fn grade(case: &Case, k: &mut Kernel) -> Graded {
             .push(format!("{} failed validity tests", lines.len()));
     }
     let tight = [1e-9, 1e-7, 1e-5, 1e-3];
-    let loose = [1f64.to_radians().tan(), 0.01, 0.001, 0.0001];
+    let loose = [det::tan(1f64.to_radians()), 0.01, 0.001, 0.0001];
     let (mut blends, mut seams) = (0, 0);
     let ids: Vec<FaceId> = b.faces().ids().collect();
     let edges: Vec<EdgeId> = b.edge_list().to_vec();
@@ -757,9 +760,7 @@ fn solidcraft_kernel() -> Kernel {
     let mut k = Kernel::new(&KernelOptions::default());
     let mut f = UpstreamFixes::default();
     for &name in UpstreamFixes::NAMES {
-        if name != "geometric_g2_continuity" {
-            *f.flag_mut(name).unwrap() = true;
-        }
+        *f.flag_mut(name).unwrap() = true;
     }
     k.fixes = f;
     k
@@ -820,14 +821,41 @@ fn on_the_default_kernel_the_variable_round_lies_on_its_cone() {
 }
 
 /// Upstream traces a chord round a circle: 3.07e-5 off the cone it should lie on, where the
-/// fork builds the cone (`fillet_chamfer_cone_on_arc`).
+/// fork builds the cone (`fillet_chamfer_cone_on_arc`). The default kernel builds the chord
+/// as its definition: each station's chord runs between the feet on the plane and on the
+/// boss, at the same offsets all round the circle, so it is a ruling of that cone and the
+/// chamfer passes the case's grade (on the cone to 1e-9, its volume and seams).
 #[test]
-fn the_boss_root_s_chord_is_exact_only_with_the_cone_on_the_arc() {
+fn the_boss_root_s_chord_is_exact_as_its_definition_and_with_the_cone_on_the_arc() {
     let case = named(BOSS_CHAMFER);
-    let g = grade(&case, &mut Kernel::default());
-    println!("{BOSS_CHAMFER}: {g:?}");
-    assert!((g.off - 3.07e-5).abs() <= 0.01 * 3.07e-5, "{g:?}");
-    assert_eq!(g.problems.len(), 1, "{g:?}");
+    assert_passes(&case, &mut Kernel::default());
+    // the chamfer face is a chamfer by its definition, its net proved within its bound
+    let mut k = Kernel::default();
+    let mut b = (case.build)(&mut k).unwrap();
+    let before = b.face_list().to_vec();
+    let e = pick(&k, &b, case.pick);
+    let Blend::Chord(d) = case.blend else {
+        panic!("the boss root's chamfer is a chord")
+    };
+    chord(&mut k, &mut b, e, d).unwrap();
+    let mut chamfers = 0;
+    for &f in b.face_list() {
+        if before.contains(&f) {
+            continue;
+        }
+        let s = b.face(f).unwrap().surface.clone().unwrap();
+        if let SurfaceKind::ProceduralBlend(pb) = s.kind() {
+            assert!(pb.chamfer().is_some(), "{f:?} is not a chamfer");
+            let proved = pb.recertify(&k).unwrap();
+            assert!(
+                proved <= pb.bound(),
+                "{f:?}: {proved:e} past {:e}",
+                pb.bound()
+            );
+            chamfers += 1;
+        }
+    }
+    assert!(chamfers >= 1, "no chamfer by its definition");
     let mut k = Kernel::default();
     k.fixes.fillet_chamfer_cone_on_arc = true;
     assert_passes(&case, &mut k);
@@ -846,7 +874,7 @@ fn the_grading_refuses_a_wrong_volume_blend_and_order() {
     let volume = refused(&|c| c.volume *= 1.000_001);
     assert!(volume[0].contains("volume"), "{volume:?}");
     let blend = refused(&|c| {
-        c.off = Box::new(|x| ((x.y - 27.0).hypot(x.z - 17.0) - 3.000_001).abs());
+        c.off = Box::new(|x| (det::hypot(x.y - 27.0, x.z - 17.0) - 3.000_001).abs());
     });
     assert!(blend[0].contains("off the exact blend"), "{blend:?}");
     for order in [0, 2] {
@@ -927,12 +955,12 @@ fn the_sections_give_the_fork_s_volumes_on_the_pipe() {
         let mut pts = section(n, w, &plate, &pipe);
         // the pipe's arc back from its contact to the edge (28, 10), the plate's line after it
         let (a0, a1) = (
-            (pts[pts.len() - 1][1] - 16.0).atan2(pts[pts.len() - 1][0] - 20.0),
-            (10.0f64 - 16.0).atan2(8.0),
+            det::atan2(pts[pts.len() - 1][1] - 16.0, pts[pts.len() - 1][0] - 20.0),
+            det::atan2(10.0f64 - 16.0, 8.0),
         );
         for i in 1..=20_000 {
             let a = a0 + (a1 - a0) * f64::from(i) / 20_000.0;
-            pts.push([20.0 + 10.0 * a.cos(), 16.0 + 10.0 * a.sin()]);
+            pts.push([20.0 + 10.0 * det::cos(a), 16.0 + 10.0 * det::sin(a)]);
         }
         area_and_moment(&pts, 0.0).0.abs()
     };
@@ -1201,7 +1229,7 @@ fn balls_envelope_volume(law: &BSplineCurve) -> f64 {
     // the top of the union of the balls' discs in the plane `y` at `x`
     let top = |x: f64, y: f64| -> f64 {
         let disc = |s: f64, r: f64| {
-            let h2 = r * r - (y - 20.0 * s).powi(2) - (x - 10.0 + r).powi(2);
+            let h2 = r * r - det::powi(y - 20.0 * s, 2) - det::powi(x - 10.0 + r, 2);
             if h2 < 0.0 {
                 f64::NEG_INFINITY
             } else {
@@ -1241,9 +1269,9 @@ fn balls_envelope_volume(law: &BSplineCurve) -> f64 {
                 let a0 = PI / 2.0 * f64::from(q) / 8.0;
                 let a1 = PI / 2.0 * f64::from(q + 1) / 8.0;
                 for (th, wt) in nodes(a0, a1) {
-                    let x = 10.0 - r + r * th.sin();
+                    let x = 10.0 - r + r * det::sin(th);
                     let z = top(x, y).clamp(30.0 - r, 30.0);
-                    area += (30.0 - z) * r * th.cos() * wt;
+                    area += (30.0 - z) * r * det::cos(th) * wt;
                 }
             }
             removed += area * wy;
@@ -1282,16 +1310,14 @@ fn holds_case() -> Case {
 /// balls, passes `Level2`, has the volume of its balls' envelope ([`HOLDS_VOLUME`]), and is G1
 /// along both seams; its exact circles take one arc count and its end point their weights
 /// (WR-711). Its exact circles are skinned between the trace's stations, so the round stays
-/// on its balls only where the stations follow the law (`fillet_variable_span_follows_fillet`,
-/// the fork's 4438859): without it the default kernel's round is 5.0e-4 off them and its volume
-/// 1.2e-7 over the envelope's (upstream's approximated arcs, which a round no longer takes,
-/// were within the grade there).
+/// on its balls only where the stations follow the law (WR-646, the fork's 4438859, now the
+/// only path): without it the round was 5.0e-4 off them and its volume 1.2e-7 over the
+/// envelope's (upstream's approximated arcs, which a round no longer takes, were within the
+/// grade there).
 #[test]
 fn the_progressive_cubic_variable_round_lies_on_its_balls_union_and_is_g1() {
     let case = holds_case();
-    let mut k = Kernel::default();
-    k.fixes.fillet_variable_span_follows_fillet = true;
-    assert_passes(&case, &mut k);
+    assert_passes(&case, &mut Kernel::default());
     assert_passes(&case, &mut solidcraft_kernel());
 }
 
@@ -1312,6 +1338,293 @@ fn wr711_exact_circles_of_one_arc_count_keep_the_progressive_round_on_its_balls(
         (g_on.volume - HOLDS_VOLUME).abs() < 3e-8 * HOLDS_VOLUME,
         "{g_on:?}"
     );
+}
+
+/// The largest distance from a variable round's skin to the union of its balls, sampled
+/// on a 400 x 33 grid of the round's face where the edge runs (`y` in [2, 18], clear of the
+/// ends, where the surface runs on past the balls of `s` in [0, 1]), and the solver's
+/// approximation tolerance there (4 x the edge's tolerance, `TOL_FACTOR`). The round's
+/// faces and the points measured are counted, so a result with no round, or with every point
+/// filtered away, fails rather than measuring nothing.
+fn skin_off_balls(law: [f64; 5]) -> (f64, f64) {
+    let mut k = solidcraft_kernel();
+    let mut b = box_10_20_30(&mut k).unwrap();
+    let e = pick(&k, &b, [10.0, 10.0, 30.0]);
+    let tol = 4.0 * edge::tolerance(&b, e).unwrap();
+    spline_round(&mut k, &mut b, e, law).unwrap();
+    let curve = greville_cubic_curve(law);
+    let planes = box_planes(10.0, 20.0, 30.0);
+    let ids: Vec<FaceId> = b.faces().ids().collect();
+    let mut off: f64 = 0.0;
+    let (mut rounds, mut measured) = (0usize, 0usize);
+    for f in ids {
+        let srf = face::surface(&b, f).unwrap().unwrap().clone();
+        if planes.iter().any(|&q| on_face(&k, &srf, q)) {
+            continue;
+        }
+        rounds += 1;
+        let dom = face::uv_domain(&b, f).unwrap();
+        for a in 0..=400 {
+            for c in 0..=32 {
+                let uv = Point2::new(
+                    dom.min().x + (dom.max().x - dom.min().x) * f64::from(a) / 400.0,
+                    dom.min().y + (dom.max().y - dom.min().y) * f64::from(c) / 32.0,
+                );
+                let x = srf.evaluate_point(&k, uv).unwrap();
+                if (2.0..=18.0).contains(&x.y) {
+                    off = off.max(distance_to_balls_union(&curve, x));
+                    measured += 1;
+                }
+            }
+        }
+    }
+    // one round face, and the edge's middle 16 of 20 is most of its 401 x 33 grid
+    assert_eq!(rounds, 1, "law {law:?}: {rounds} round faces");
+    assert!(
+        measured > 401 * 33 / 2,
+        "law {law:?}: {measured} points measured"
+    );
+    (off, tol)
+}
+
+/// #15256: a variable round's skin, not only its rails, lies within the solver's
+/// approximation tolerance of its balls between the trace's stations. Before, the stations
+/// were accepted on the rails alone and the skin between them was unbounded: the
+/// progressive law 8.7e-5 off (2.2 times the 4e-5 tolerance), `[2, 4, 2, 4, 2]` 4.1e-4
+/// (10.2 times) and `[3, 3, 3, 3, 1]` 3.2e-4 (7.9 times).
+#[test]
+fn a_variable_round_s_skin_lies_within_its_tolerance_of_its_balls() {
+    for law in [
+        HOLDS_LAW,
+        [2.0, 2.0, 6.0, 3.0, 1.0],
+        [1.0, 3.0, 5.0, 3.0, 1.0],
+        [2.0, 4.0, 2.0, 4.0, 2.0],
+        [3.0, 3.0, 3.0, 3.0, 1.0],
+    ] {
+        let (off, tol) = skin_off_balls(law);
+        println!("law {law:?}: skin {off:.3e} off its balls, tolerance {tol:e}");
+        assert!(
+            off <= tol,
+            "law {law:?}: skin {off:e} off its balls, past {tol:e}"
+        );
+    }
+}
+
+/// A variable round pinched to zero radius at one end (#15257 review; the shape of the rig's
+/// `ladder/07-fillets/006-variable-r5-to-zero`): the linear law 4 -> 0 and 0 -> 4 along the
+/// box's top edge (the cubic law with Greville values `[4, 3, 2, 1, 0]` is exactly linear).
+/// Built with SolidCraft's fixes, as the app builds it (the round as its definition
+/// declines a round whose rails meet at an end, so this one is a B-spline skin the check
+/// measures): it builds, refused by none of the check's refusals, and the skin lies within
+/// the solver's tolerance of its balls (sampled, clear of the ends).
+#[test]
+fn a_variable_round_pinched_to_zero_keeps_its_skin_on_its_balls() {
+    for law in [[4.0, 3.0, 2.0, 1.0, 0.0], [0.0, 1.0, 2.0, 3.0, 4.0]] {
+        let (off, tol) = skin_off_balls(law);
+        println!("law {law:?}: skin {off:.3e} off its balls, tolerance {tol:e}");
+        assert!(
+            off <= tol,
+            "law {law:?}: skin {off:e} off its balls, past {tol:e}"
+        );
+    }
+}
+
+/// A constant-distance round whose ball varies (#15257 review): a solid cylinder of radius
+/// `R` = 10 cut by a plane tilted `tilt` degrees about the y axis through (0, 0, 20). Along
+/// the elliptical edge the angle between the faces changes, so a ball whose feet are a
+/// constant chord `l` apart changes its radius. At the angle `phi` around the axis, with `u`
+/// the radial direction and `n` the plane's outward normal, the ball touching both faces from
+/// inside has its centre `R - r` from the axis and `r` below the plane, and its feet `r u`
+/// and `r n` from its centre, so `l = r |u - n|`: `r(phi) = l / sqrt(2 - 2 n.u)`. Returns the
+/// largest distance from the round faces to that family's envelope (a 1-D search over
+/// `phi` per point), the solver's tolerance (4 x the edge's), and the radius range.
+fn constant_distance_round_on_an_oblique_cylinder(tilt: f64, l: f64) -> (f64, f64, f64, f64) {
+    use solidcore::boolean::api_brep::boolean_intersection;
+    use solidcore::topology::proto_topology::p1::api_transform::{api_rotate, TransformObject};
+    const R: f64 = 10.0;
+    let mut k = Kernel::default();
+    let cylinder = create_cylinder(&mut k, Point3::new(0.0, 0.0, 0.0), R, 40.0).unwrap();
+    let mut slab =
+        create_box(&mut k, Point3::new(-50.0, -50.0, -60.0), 100.0, 100.0, 80.0).unwrap();
+    let p0 = Point3::new(0.0, 0.0, 20.0);
+    api_rotate(
+        &mut k,
+        Some(TransformObject::Brep(&mut slab)),
+        p0,
+        Vec3::new(0.0, 1.0, 0.0),
+        tilt,
+    )
+    .unwrap();
+    let mut b = boolean_intersection(&mut k, cylinder, slab).unwrap();
+    // the elliptical edge (the bottom circle is at z = 0)
+    let top: Vec<EdgeId> = b
+        .edges()
+        .ids()
+        .filter(|&e| {
+            let ivl = edge::interval(&b, e).unwrap();
+            let c = edge::curve(&b, e).unwrap().unwrap();
+            let x = c.evaluate_point(&k, ivl.evaluate(0.25)).unwrap();
+            let y = c.evaluate_point(&k, ivl.evaluate(0.75)).unwrap();
+            // (not the bottom circle, and not the cylinder's vertical seam)
+            x.z > 5.0 && det::hypot(x.x - y.x, x.y - y.y) > 1e-6
+        })
+        .collect();
+    assert!(!top.is_empty(), "no top edge");
+    // the rotated top's normal: its x sign is the one the edge lies on
+    let a = tilt.to_radians();
+    let x_far = {
+        let e = top[0];
+        let c = edge::curve(&b, e).unwrap().unwrap();
+        let ivl = edge::interval(&b, e).unwrap();
+        (0..=64)
+            .map(|i| {
+                c.evaluate_point(&k, ivl.evaluate(f64::from(i) / 64.0))
+                    .unwrap()
+            })
+            .fold(p0, |m, x| if x.x.abs() > m.x.abs() { x } else { m })
+    };
+    let n = [1.0, -1.0]
+        .into_iter()
+        .map(|sx| Vec3::new(sx * det::sin(a), 0.0, det::cos(a)))
+        .min_by(|p, q| {
+            (x_far - p0)
+                .dot(*p)
+                .abs()
+                .total_cmp(&(x_far - p0).dot(*q).abs())
+        })
+        .unwrap();
+    let on_plane = |x: Point3| (x - p0).dot(n);
+    for &e in &top {
+        let ivl = edge::interval(&b, e).unwrap();
+        let c = edge::curve(&b, e).unwrap().unwrap();
+        for f in [0.1, 0.5, 0.9] {
+            let x = c.evaluate_point(&k, ivl.evaluate(f)).unwrap();
+            assert!(
+                on_plane(x).abs() < 1e-7,
+                "the edge is off the tilted plane: {}",
+                on_plane(x)
+            );
+            assert!(
+                ((x.x * x.x + x.y * x.y).sqrt() - R).abs() < 1e-7,
+                "the edge is off the cylinder"
+            );
+        }
+    }
+    let tol = 4.0
+        * top
+            .iter()
+            .map(|&e| edge::tolerance(&b, e).unwrap())
+            .fold(0.0, f64::max);
+    let mut session = FilletSession::new(&mut k, &mut b).unwrap();
+    session
+        .prepare_per_edge_constant_distance(
+            &mut k,
+            &top,
+            &[l],
+            &[FilletSurfaceGeneratorType::Circular],
+            2,
+            0.0,
+        )
+        .unwrap();
+    session.do_fillet(&mut k).unwrap();
+    drop(session);
+    let lines = check_brep(&mut k, &mut b, CheckLevel::Level2)
+        .unwrap()
+        .lines();
+    assert!(
+        lines.is_empty(),
+        "the result fails {} validity tests",
+        lines.len()
+    );
+    // the closed-form balls
+    let ball = |phi: f64| {
+        let u = Vec3::new(det::cos(phi), det::sin(phi), 0.0);
+        let r = l / (2.0 - 2.0 * n.dot(u)).sqrt();
+        // `n.c = n.p0 - r`, `c = (R - r) u + z e_z`
+        let z = (n.dot(p0) - r - (R - r) * n.dot(u)) / n.z;
+        (u * (R - r) + Vec3::new(0.0, 0.0, z), r)
+    };
+    let off_balls = |x: Point3| {
+        let signed = |phi: f64| {
+            let (c, r) = ball(phi);
+            x.distance(c) - r
+        };
+        let m = 4096;
+        let step = 2.0 * PI / f64::from(m);
+        let (mut best, mut bd) = (0.0, f64::INFINITY);
+        for i in 0..m {
+            let phi = f64::from(i) * step;
+            let d = signed(phi);
+            if d < bd {
+                (best, bd) = (phi, d);
+            }
+        }
+        let (mut lo, mut hi) = (best - step, best + step);
+        let g = (5f64.sqrt() - 1.0) / 2.0;
+        for _ in 0..80 {
+            let (s1, s2) = (hi - g * (hi - lo), lo + g * (hi - lo));
+            if signed(s1) < signed(s2) {
+                hi = s2;
+            } else {
+                lo = s1;
+            }
+        }
+        signed(0.5 * (lo + hi)).abs()
+    };
+    // the round faces: neither the cylinder, the bottom nor the tilted plane
+    let (mut off, mut rounds, mut measured) = (0.0_f64, 0usize, 0usize);
+    let ids: Vec<FaceId> = b.faces().ids().collect();
+    for f in ids {
+        let srf = face::surface(&b, f).unwrap().unwrap().clone();
+        let dom = face::uv_domain(&b, f).unwrap();
+        let at = |a: f64, c: f64| {
+            let uv = Point2::new(
+                dom.min().x + (dom.max().x - dom.min().x) * a,
+                dom.min().y + (dom.max().y - dom.min().y) * c,
+            );
+            srf.evaluate_point(&k, uv).unwrap()
+        };
+        let probes = [at(0.3, 0.4), at(0.6, 0.7), at(0.5, 0.5)];
+        let original = probes
+            .iter()
+            .all(|x| ((x.x * x.x + x.y * x.y).sqrt() - R).abs() < 1e-9)
+            || probes.iter().all(|x| x.z.abs() < 1e-9)
+            || probes.iter().all(|&x| on_plane(x).abs() < 1e-9);
+        if original {
+            continue;
+        }
+        rounds += 1;
+        for i in 0..=400 {
+            for j in 0..=32 {
+                off = off.max(off_balls(at(f64::from(i) / 400.0, f64::from(j) / 32.0)));
+                measured += 1;
+            }
+        }
+    }
+    assert!(rounds >= 1, "no round face");
+    assert_eq!(measured, rounds * 401 * 33, "every point measured");
+    let (r_lo, r_hi) = (
+        l / (2.0 + 2.0 * det::sin(a)).sqrt(),
+        l / (2.0 - 2.0 * det::sin(a)).sqrt(),
+    );
+    (off, tol, r_lo, r_hi)
+}
+
+/// #15257 review: `ball_radius_varies` turns the skin check on for a constant-distance round
+/// too. Here its ball really varies (from 1.22 to 1.74 at 20 degrees with a 2 mm chord): the
+/// round builds, valid, and its skin lies within the solver's tolerance of the balls' closed-form
+/// envelope (sampled, 401 x 33 points per round face).
+#[test]
+fn a_constant_distance_round_whose_ball_varies_keeps_its_skin_on_its_balls() {
+    for tilt in [20.0, 35.0] {
+        let (off, tol, r_lo, r_hi) = constant_distance_round_on_an_oblique_cylinder(tilt, 2.0);
+        println!("tilt {tilt}: radius {r_lo:.4} to {r_hi:.4}; skin {off:.3e} off its balls, tolerance {tol:e}");
+        assert!(r_hi - r_lo > 0.3, "the ball does not vary");
+        assert!(
+            off <= tol,
+            "tilt {tilt}: skin {off:e} off its balls, past {tol:e}"
+        );
+    }
 }
 
 /// `cf1c08b` + `0389af2`: the folded cubic law `[2, 2, 40, 3, 2]` is refused (the great

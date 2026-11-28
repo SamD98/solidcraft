@@ -4,6 +4,10 @@
 
 #![allow(clippy::disallowed_methods)] // closed-form oracle, not ops geometry
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test
+use solidcore::math::det;
+
+#[path = "../../solidcore/tests/support/solidcraft_fixes.rs"]
+mod solidcraft_fixes;
 
 mod common;
 
@@ -17,11 +21,7 @@ use solidcore_ops::{make_box, make_cylinder, session, Body, BooleanOp, CheckLeve
 /// The box 30 x 20 x 20 with its vertical edge at the origin rounded R5, joined with the r2
 /// cylinder 6 long along +x through (x0, 0, 15).
 fn operand(x0: f64) -> Result<Body, Error> {
-    let fixes: Vec<String> = serde_json::from_str(include_str!(
-        "../../solidcore/tests/kernel_cases/fixes.json"
-    ))
-    .unwrap();
-    session::set_thread_fixes(fixes.iter().map(String::as_str)).unwrap();
+    session::set_thread_fixes(solidcraft_fixes::solidcraft_fix_names()).unwrap();
     let b = make_box([0.0; 3], [30.0, 20.0, 20.0]).unwrap();
     let e = edge_at(&b, [0.0, 0.0, 10.0]);
     blend(&b, Blend::Round, &[e], &[5.0], &[], Corners::Filled).unwrap();
@@ -52,8 +52,8 @@ fn blended(x0: f64, kind: Blend) -> f64 {
 #[test]
 fn the_round_ends_on_the_end_disc() {
     let quad = 0.212_372_435_695_794_78;
-    let segment = 2.0 * (0.2_f64.asin() - 0.2);
-    let sector = 0.2_f64.acos() / 8.0;
+    let segment = 2.0 * (det::asin(0.2_f64) - 0.2);
+    let sector = det::acos(0.2_f64) / 8.0;
     let area = quad - segment - sector;
     let expected = 12000.0 - 500.0 * (1.0 - PI / 4.0) + 12.0 * PI + 6.0 * area;
     let v = blended(5.0, Blend::Round);
